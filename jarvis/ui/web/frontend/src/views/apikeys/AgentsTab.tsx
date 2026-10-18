@@ -180,7 +180,13 @@ export function AgentsTab({
   // for beats a metered key), this computer last.
   const listed = useMemo(() => {
     const rank = (f: ProviderFamily) => (f.local ? 2 : f.subscription ? 0 : 1);
-    return (families ?? [])
+    const pool = families ?? [];
+    if (!mapping.length) {
+      return pool
+        .filter((f) => (f.agent_ids?.length > 0 || Boolean(f.subscription) || Boolean(f.key_slot) || f.local))
+        .sort((a, b) => rank(a) - rank(b));
+    }
+    return pool
       .filter((f) => mapping.some((row) => f.agent_ids.includes(row.jarvis)) && (f.subscription || f.key_slot || f.local))
       .sort((a, b) => rank(a) - rank(b));
   }, [families, mapping]);
@@ -204,6 +210,14 @@ export function AgentsTab({
     },
     [families],
   );
+
+  if (data.loading && !families) {
+    return (
+      <div className="flex h-64 items-center justify-center" data-testid="agents-loading">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-10" data-testid="apikeys-agents">

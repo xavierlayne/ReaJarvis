@@ -57,8 +57,8 @@ function initialTab(): Tab {
  */
 export function ApiKeysView() {
   const t = useT();
-  // The page's own strings load with it; nothing paints raw keys meanwhile.
-  const stringsReady = useLocaleChunk("providers");
+  // The page's own strings load in background; fallback strings are used if delayed.
+  useLocaleChunk("providers");
   const { providers, refetch } = useProviders();
   const families = useProviderFamilies();
   const { health } = useSectionHealth();
@@ -79,14 +79,6 @@ export function ApiKeysView() {
     window.addEventListener(APIKEYS_TAB_EVENT, onRequest);
     return () => window.removeEventListener(APIKEYS_TAB_EVENT, onRequest);
   }, []);
-
-  if (!stringsReady) {
-    return (
-      <div role="status" aria-busy="true" className="flex h-full items-center justify-center">
-        <Loader2 aria-hidden="true" className="h-5 w-5 animate-spin text-muted-foreground" />
-      </div>
-    );
-  }
 
   return (
     <div className="flex h-full min-h-0 flex-col" data-tour="apikeys-page">
@@ -125,6 +117,14 @@ export function ApiKeysView() {
           {tab === "agents" &&
             (families.error === "restart_required" ? (
               <RestartNeeded />
+            ) : families.error === "families_unavailable" ? (
+              <div className="flex flex-col items-center justify-center p-12 text-center text-muted-foreground">
+                <p className="text-sm">{t("providers_page.load_error")}</p>
+                <Button variant="outline" size="sm" className="mt-4" onClick={() => void families.reload()}>
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  {t("providers_page.test")}
+                </Button>
+              </div>
             ) : (
               <AgentsTab data={families} providers={providers} health={health} onProvidersChanged={refetch} />
             ))}
