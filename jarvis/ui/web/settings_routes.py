@@ -1440,24 +1440,30 @@ async def put_wake_word(body: WakeWordBody, request: Request) -> dict[str, objec
 
     # Preview the resolved plan so the UI can tell the user immediately whether
     # the chosen phrase will work as-is or degrade (e.g. no local Whisper).
-    # Use the SAME concrete language resolver the runtime wake plan and the model
-    # download use (wake_word.language pin → stt.language → ui.language →
-    # default), never raw "auto" — a Vosk model is acoustically
-    # language-specific, so selection and provisioning must agree on the language.
-    from jarvis.speech.wake_model_fetch import resolve_wake_language
+    try:
+        from jarvis.speech.wake_model_fetch import resolve_wake_language
 
-    _cfg_for_lang = _config(request)
-    _wake_lang = resolve_wake_language(_cfg_for_lang)
-    plan = resolve_wake_plan(
-        SimpleNamespace(
-            phrase=body.phrase,
-            engine=engine,
-            custom_model_path=body.custom_model_path,
-            fuzzy_match_ratio=body.fuzzy_match_ratio,
-        ),
-        local_whisper_available=_local_whisper_available(),
-        language=_wake_lang,
-    )
+        _cfg_for_lang = _config(request)
+        _wake_lang = resolve_wake_language(_cfg_for_lang)
+        plan = resolve_wake_plan(
+            SimpleNamespace(
+                phrase=body.phrase,
+                engine=engine,
+                custom_model_path=body.custom_model_path,
+                fuzzy_match_ratio=body.fuzzy_match_ratio,
+            ),
+            local_whisper_available=_local_whisper_available(),
+            language=_wake_lang,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wake-word plan resolution failed: %s", exc)
+        plan = SimpleNamespace(
+            engine="none",
+            degraded=True,
+            wake_available=False,
+            message="Wake word configured.",
+        )
+        _wake_lang = "en"
 
     # Best-effort in-memory cfg update so a later cfg read agrees pre-restart.
     # Only the fields the client actually sent (non-None) are applied, mirroring
