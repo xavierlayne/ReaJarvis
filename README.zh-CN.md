@@ -1,7 +1,8 @@
-<h1 align="center">Personal Jarvis</h1>
+<h1 align="center">ReaJarvis</h1>
 
 <p align="center">
-  <a href="https://github.com/PersonalJarvis/PersonalJarvis/blob/main/README.md">English</a> ·
+  <a href="README.md">English</a> ·
+  <a href="README.tr.md">Türkçe</a> ·
   <strong>简体中文</strong>
 </p>
 
@@ -11,18 +12,14 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/personal-jarvis/"><img alt="PyPI" src="https://img.shields.io/pypi/v/personal-jarvis?labelColor=0A0A0A&amp;color=F7F7F4" /></a>
-  <a href="https://github.com/PersonalJarvis/PersonalJarvis/blob/main/LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-F7F7F4?labelColor=0A0A0A" /></a>
-  <a href="https://github.com/PersonalJarvis/PersonalJarvis/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/PersonalJarvis/PersonalJarvis/actions/workflows/ci.yml/badge.svg" /></a>
-  <a href="https://discord.gg/x7USduHxbc"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-F7F7F4?labelColor=0A0A0A&amp;logo=discord&amp;logoColor=white" /></a>
+  <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-F7F7F4?labelColor=0A0A0A" /></a>
+  <a href="https://github.com/xavierlayne"><img alt="Maintainer @xavierlayne" src="https://img.shields.io/badge/Maintainer-%40xavierlayne-blue?labelColor=0A0A0A" /></a>
 </p>
 
 <p align="center">
   <a href="#安装">安装</a> ·
-  <a href="https://personaljarvis.ai">官网</a> ·
-  <a href="https://github.com/PersonalJarvis/PersonalJarvis/blob/main/docs/product/start-here/welcome-to-personal-jarvis.md">文档</a> ·
-  <a href="https://discord.gg/x7USduHxbc">Discord</a> ·
-  <a href="https://x.com/PersonalJarvis">X</a>
+  <a href="docs/">文档</a> ·
+  <a href="https://github.com/xavierlayne">@xavierlayne 个人主页</a>
 </p>
 
 https://github.com/user-attachments/assets/42afcb9f-323b-4a57-9b6d-17aa7a2585b2

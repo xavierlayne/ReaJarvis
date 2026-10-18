@@ -12,10 +12,16 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> ·
+  <a href="README.tr.md">Türkçe</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="#whats-inside">What's Inside</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="docs/">Documentation</a> ·
-  <a href="https://github.com/xavierlayne">Developer Profile</a>
+  <a href="https://github.com/xavierlayne">@xavierlayne Profile</a>
 </p>
 
 https://github.com/user-attachments/assets/42afcb9f-323b-4a57-9b6d-17aa7a2585b2
