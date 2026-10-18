@@ -1,0 +1,597 @@
+"""A window that shows nothing must heal itself, or say why it cannot.
+
+The page's own watchdog (``frontend/index.html``) covers the case where a page
+loaded and then the app above it died. This one covers the case underneath: a
+window in which NO page ever arrived, where there is no script left to notice
+anything. The maintainer hit it repeatedly on 2026-08-18…20 — a titled window
+filled with the theme's ground colour and nothing else.
+
+Three ways in, all reproduced in the logs of a single day:
+
+* the single asyncio loop froze inside a native call (``Pa_CloseStream``,
+  188.3 s measured) — the socket still accepted, nothing was answered, and the
+  navigation received no bytes and no error;
+* the backend thread died after the port was already up (a lost ``click``
+  dependency mid-boot, 13:45);
+* the web view never navigated at all.
+
+The first is recoverable and must heal without the user doing anything; the
+second never heals and must be said out loud; the third is worth one reload
+before it is said. These tests pin all three, plus the loops that must NOT
+happen (an explanation re-rendered every second, a reload storm).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from jarvis.ui.window_watchdog import (
+    Action,
+    BlankReason,
+    BlankWindowPolicy,
+    BlankWindowWatchdog,
+    Observation,
+    render_notice,
+)
+
+GRACE = 20.0
+SETTLE = 20.0
+PATIENCE = 40.0
+HUNG = 45.0
+
+
+def _policy(**kw: Any) -> BlankWindowPolicy:
+    return BlankWindowPolicy(
+        grace_s=kw.pop("grace_s", GRACE),
+        settle_s=kw.pop("settle_s", SETTLE),
+        reload_budget=kw.pop("reload_budget", 3),
+        silent_patience_s=kw.pop("silent_patience_s", PATIENCE),
+        hung_patience_s=kw.pop("hung_patience_s", HUNG),
+    )
+
+
+def _obs(
+    now: float,
+    *,
+    page: str = "blank",
+    alive: bool = True,
+    healthy: bool = True,
+    warming: bool = False,
+) -> Observation:
+    return Observation(
+        page=page,  # type: ignore[arg-type]
+        backend_alive=alive,
+        server_healthy=healthy,
+        now=now,
+        server_warming=warming,
+    )
+
+
+# --- a healthy window is left alone ----------------------------------------
+
+
+def test_a_loading_window_is_given_its_grace() -> None:
+    """A cold WebView paints nothing for a few seconds — that is not a failure."""
+    p = _policy()
+    for t in (0.0, 5.0, 19.0):
+        assert p.decide(_obs(t)).action is Action.WAIT
+
+
+def test_a_live_page_is_never_touched() -> None:
+    """Once our document is there, the page's own watchdog owns the problem."""
+    p = _policy()
+    for t in (0.0, 30.0, 300.0):
+        assert p.decide(_obs(t, page="up")).action is Action.WAIT
+
+
+def test_a_page_that_dies_later_gets_a_full_budget_again() -> None:
+    """A window blanking after an hour of use is a new incident, not a used-up one."""
+    p = _policy()
+    p.decide(_obs(0.0, page="up"))
+    for _ in range(3):
+        p.decide(_obs(0.0, page="up"))
+    # It goes blank at t=100 and the grace runs from there, not from boot.
+    assert p.decide(_obs(100.0)).action is Action.WAIT
+    assert p.decide(_obs(100.0 + GRACE + 1)).action is Action.RELOAD
+
+
+def test_a_healthy_page_is_not_reloaded_when_webview_stops_answering_probes() -> None:
+    """A busy WebView can miss several probes while the painted app stays live."""
+    p = _policy()
+    assert p.decide(_obs(0.0, page="up")).action is Action.WAIT
+    for t in (10.0, GRACE + 1, HUNG - 1):
+        assert p.decide(_obs(t, page="unknown")).action is Action.WAIT
+    assert p.decide(_obs(HUNG + 1, page="up")).action is Action.WAIT
+    # The silence ended: a fresh one gets the full patience again.
+    assert p.decide(_obs(HUNG + 2, page="unknown")).action is Action.WAIT
+    assert p.decide(_obs(2 * HUNG, page="unknown")).action is Action.WAIT
+    assert p.decide(_obs(2 * HUNG + 1, page="blank")).action is Action.WAIT
+    assert p.decide(_obs(2 * HUNG + GRACE + 2, page="blank")).action is Action.RELOAD
+
+
+def test_a_page_that_stays_silent_is_hung_and_recovered() -> None:
+    """Live 2026-10-02: the renderer spun a core for seven minutes, unhealed.
+
+    Silence that outlasts the patience while the server answers is not a busy
+    page any more — it is reloaded, flagged so the renderer is ended first.
+    """
+    p = _policy()
+    p.decide(_obs(0.0, page="up"))
+    assert p.decide(_obs(5.0, page="unknown")).action is Action.WAIT
+    verdict = p.decide(_obs(5.0 + HUNG, page="unknown"))
+    assert verdict.action is Action.RELOAD
+    assert verdict.hung is True
+    assert verdict.after_up is True
+    # The next attempt waits a full patience again, not one tick.
+    assert p.decide(_obs(10.0 + HUNG, page="unknown")).action is Action.WAIT
+    assert p.decide(_obs(5.0 + 2 * HUNG, page="unknown")).action is Action.RELOAD
+
+
+def test_hung_recoveries_are_budgeted() -> None:
+    """A page that hangs again after every reload must not be reloaded forever."""
+    p = _policy(reload_budget=2)
+    p.decide(_obs(0.0, page="up"))
+    p.decide(_obs(1.0, page="unknown"))
+    actions = [p.decide(_obs(1.0 + i * HUNG, page="unknown")).action for i in range(1, 6)]
+    assert actions.count(Action.RELOAD) == 2
+
+
+def test_a_silent_page_behind_a_silent_server_is_not_called_hung() -> None:
+    """The page may only be waiting on a blocked backend; reloading cannot help."""
+    p = _policy()
+    p.decide(_obs(0.0, page="up"))
+    for t in (5.0, HUNG, 3 * HUNG):
+        assert p.decide(_obs(t, page="unknown", healthy=False)).action is Action.WAIT
+
+
+def test_confirmed_late_blank_recovers_even_when_later_probes_time_out() -> None:
+    """A known empty view must not be stuck by subsequent probe timeouts."""
+    window = _FakeWindow()
+    wd = _watchdog(window, policy=_policy())
+    assert wd._policy.decide(_obs(0.0, page="up")).action is Action.WAIT
+    assert wd._policy.decide(_obs(10.0, page="blank")).action is Action.WAIT
+    verdict = wd._policy.decide(_obs(10.0 + GRACE + 1, page="unknown"))
+    assert verdict.action is Action.RELOAD
+    assert verdict.after_up is True
+    assert wd._apply(window, verdict)
+    assert window.loaded_urls == ["http://127.0.0.1:47821?jarvis_recovery=1"]
+
+
+def test_late_recovery_preserves_existing_url_query() -> None:
+    window = _FakeWindow()
+    wd = _watchdog(window, url="http://127.0.0.1:47821/?dev=1", policy=_policy())
+    wd._policy.decide(_obs(0.0, page="up"))
+    wd._policy.decide(_obs(10.0, page="blank"))
+    verdict = wd._policy.decide(_obs(10.0 + GRACE + 1, page="blank"))
+    assert wd._apply(window, verdict)
+    assert window.loaded_urls == ["http://127.0.0.1:47821/?dev=1&jarvis_recovery=1"]
+
+
+# --- the recoverable freeze -------------------------------------------------
+
+
+def test_a_frozen_server_is_waited_out_not_reloaded() -> None:
+    """Reloading into a frozen loop only wastes the budget — wait for the answer."""
+    p = _policy()
+    v = p.decide(_obs(GRACE + 1, healthy=False))
+    assert v.action is Action.WAIT
+
+
+def test_the_window_reloads_itself_when_the_server_answers_again() -> None:
+    """The 188 s freeze: the user does nothing and the UI comes back by itself."""
+    p = _policy()
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(30.0, healthy=False)).action is Action.WAIT
+    assert p.decide(_obs(190.0, healthy=True)).action is Action.RELOAD
+
+
+def test_a_long_freeze_is_explained_before_it_ends() -> None:
+    """Silence has a limit: the window says what is happening rather than nothing."""
+    p = _policy()
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(PATIENCE - 1, healthy=False)).action is Action.WAIT
+    v = p.decide(_obs(PATIENCE + 1, healthy=False))
+    assert v.action is Action.EXPLAIN
+    assert v.reason is BlankReason.BACKEND_SILENT
+
+
+def test_the_explanation_gives_way_to_the_real_ui_when_the_server_returns() -> None:
+    """The notice is a stand-in, not a dead end — recovery still wins."""
+    p = _policy()
+    p.decide(_obs(0.0))
+    v = p.decide(_obs(PATIENCE + 1, healthy=False))
+    assert v.action is Action.EXPLAIN
+    # The notice is up now, and the server comes back.
+    assert p.decide(_obs(PATIENCE + 3, page="notice", healthy=False)).action is Action.WAIT
+    assert p.decide(_obs(PATIENCE + 9, page="notice", healthy=True)).action is Action.RELOAD
+
+
+def test_a_reload_that_did_not_take_is_tried_again() -> None:
+    """Found live: ``load_url`` can be accepted and change nothing.
+
+    If one attempt were the whole recovery, the user would sit on the
+    explanation page with a healthy server behind it.
+    """
+    p = _policy(reload_budget=3)
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(GRACE + 1, healthy=False)).action is Action.WAIT
+    # Server returns, first reload fires and does not take: still "notice".
+    assert p.decide(_obs(50.0, page="notice", healthy=True)).action is Action.RELOAD
+    assert p.decide(_obs(50.0 + SETTLE + 1, page="notice")).action is Action.RELOAD
+
+
+def test_a_recovery_buys_an_attempt_even_with_an_empty_budget() -> None:
+    """A freeze that outlasted the budget must not cost the window its recovery."""
+    p = _policy(reload_budget=1)
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(GRACE + 1)).action is Action.RELOAD  # budget spent
+    v = p.decide(_obs(100.0, page="notice", healthy=False))
+    assert v.action is Action.WAIT
+    assert p.decide(_obs(101.0, page="notice", healthy=True)).action is Action.RELOAD
+
+
+def test_the_notice_is_written_once_not_every_second() -> None:
+    """Re-rendering each tick would fight the cursor and hide that nothing changed."""
+    p = _policy()
+    first = p.decide(_obs(0.0, alive=False))
+    assert first.action is Action.EXPLAIN
+    for t in (1.0, 2.0, 3.0, 60.0):
+        assert p.decide(_obs(t, page="notice", alive=False)).action is Action.WAIT
+
+
+# --- the unrecoverable death ------------------------------------------------
+
+
+def test_a_dead_backend_thread_is_said_immediately_not_reloaded() -> None:
+    """Nothing will serve this window again; a reload would only refill it empty."""
+    p = _policy()
+    v = p.decide(_obs(0.0, alive=False))
+    assert v.action is Action.EXPLAIN
+    assert v.reason is BlankReason.BACKEND_DEAD
+
+
+def test_a_dead_backend_is_reported_even_during_the_grace_period() -> None:
+    """Waiting out a grace for a thread that is already gone only delays the truth."""
+    p = _policy()
+    assert p.decide(_obs(1.0, alive=False)).reason is BlankReason.BACKEND_DEAD
+
+
+# --- the empty view ---------------------------------------------------------
+
+
+def test_a_healthy_server_and_an_empty_window_earns_a_reload() -> None:
+    p = _policy()
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(GRACE + 1)).action is Action.RELOAD
+
+
+def test_reloads_are_budgeted_then_the_window_explains_itself() -> None:
+    """No reload storm: three tries, then words."""
+    p = _policy(reload_budget=2)
+    t = 0.0
+    p.decide(_obs(t))
+    actions = []
+    for _ in range(3):
+        # The settle escalates per used reload (1x, 2x, ...), so the clock
+        # jumps far enough to clear every deadline on the way.
+        t += GRACE + SETTLE * 4
+        v = p.decide(_obs(t))
+        actions.append(v)
+        t += 0.1
+    assert [a.action for a in actions[:2]] == [Action.RELOAD, Action.RELOAD]
+    assert actions[2].action is Action.EXPLAIN
+    assert actions[2].reason is BlankReason.VIEW_EMPTY
+
+
+def test_a_reload_is_given_time_to_settle_before_the_next_one() -> None:
+    """Back-to-back reloads would out-race the browser they are trying to fix."""
+    p = _policy()
+    p.decide(_obs(0.0))
+    assert p.decide(_obs(GRACE + 1)).action is Action.RELOAD
+    assert p.decide(_obs(GRACE + 2)).action is Action.WAIT
+    assert p.decide(_obs(GRACE + SETTLE + 2)).action is Action.RELOAD
+
+
+def test_each_further_reload_waits_twice_as_long() -> None:
+    """A window that did not come back after one reload is loading slowly, not
+    broken — hammering it at a fixed cadence piled cold WebView starts onto a
+    machine already too busy to paint (the 2026-08-30 cold-boot thrash)."""
+    p = _policy()
+    p.decide(_obs(0.0))
+    t1 = GRACE + 1
+    assert p.decide(_obs(t1)).action is Action.RELOAD  # settle 1x from here
+    assert p.decide(_obs(t1 + SETTLE + 1)).action is Action.RELOAD  # settle 2x
+    assert p.decide(_obs(t1 + SETTLE + 1 + SETTLE + 2)).action is Action.WAIT
+    assert p.decide(_obs(t1 + SETTLE + 1 + SETTLE * 2 + 2)).action is Action.RELOAD
+
+
+# --- the warming boot --------------------------------------------------------
+
+
+def test_a_warming_backend_is_never_reloaded_no_matter_how_long() -> None:
+    """The bootstrap answers health with warming: a blank window is the
+    EXPECTED picture then, and every reload only restarts a cold WebView."""
+    p = _policy()
+    for t in (0.0, GRACE + 1, GRACE * 10, GRACE * 100):
+        assert p.decide(_obs(t, warming=True)).action is Action.WAIT
+
+
+def test_grace_starts_fresh_when_warming_ends() -> None:
+    p = _policy()
+    p.decide(_obs(0.0, warming=True))
+    p.decide(_obs(60.0, warming=True))
+    # Warming ended at t=60; the window still gets its full grace from there.
+    assert p.decide(_obs(60.0 + GRACE - 1)).action is Action.WAIT
+    assert p.decide(_obs(60.0 + GRACE + 2)).action is Action.RELOAD
+
+
+def test_a_dead_backend_wins_over_a_stale_warming_flag() -> None:
+    v = _policy().decide(_obs(GRACE + 1, alive=False, warming=True))
+    assert v.action is Action.EXPLAIN
+    assert v.reason is BlankReason.BACKEND_DEAD
+
+
+# --- the explanation page ---------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", list(BlankReason))
+def test_every_reason_renders_a_page_that_can_leave_itself(reason: BlankReason) -> None:
+    html = render_notice(reason=reason, url="http://127.0.0.1:47821", theme="dark")
+    # The marker the watchdog reads back, so its own page is never mistaken for
+    # a blank one and reloaded in a loop.
+    assert "__jarvisWatchdogNotice" in html
+    # The way out, and the reason, both present without a bundle.
+    assert "http://127.0.0.1:47821" in html
+    assert reason.value in html
+
+
+def test_the_page_brings_itself_back_without_being_clicked() -> None:
+    """The reliable half of the recovery, found the hard way.
+
+    ``load_url`` from the watchdog is accepted and then does nothing on a window
+    whose first navigation hung (measured live 2026-08-20). Navigating from
+    INSIDE the document works, so the page polls the server and returns by
+    itself; the button is for the impatient, not the mechanism.
+    """
+    html = render_notice(reason=BlankReason.BACKEND_SILENT, url="http://127.0.0.1:47821")
+    assert "setInterval" in html
+    assert "fetch(" in html
+    # no-cors: a page written straight into the view has no origin the server
+    # would grant CORS to, and an opaque response still proves it answers.
+    assert "no-cors" in html
+    assert "location.href=U" in html
+    # Bounded, so a machine left alone overnight is not polling forever.
+    assert "tries++>" in html
+
+
+def test_the_page_carries_the_users_theme_not_a_hardcoded_dark() -> None:
+    """A black rectangle inside a paper-white frame is its own bug report."""
+    from jarvis.ui.theme import WINDOW_BACKGROUND
+
+    light = render_notice(reason=BlankReason.VIEW_EMPTY, url="http://x", theme="light")
+    assert WINDOW_BACKGROUND["light"] in light
+    assert WINDOW_BACKGROUND["dark"] not in light
+
+
+def test_the_page_speaks_german_and_spanish_too() -> None:
+    """It cannot reach the bundle's i18n — the bundle is what failed to load."""
+    html = render_notice(reason=BlankReason.BACKEND_SILENT, url="http://x")
+    assert "Das Fenster ist leer geblieben." in html
+    assert "La ventana se quedó vacía." in html
+    assert "navigator.language" in html
+
+
+def test_a_detail_string_cannot_break_out_of_the_page() -> None:
+    """The detail comes from an exception message — it is data, not markup."""
+    html = render_notice(
+        reason=BlankReason.BACKEND_DEAD,
+        url="http://x",
+        detail='</script><script>alert("x")</script>',
+    )
+    assert "</script><script>alert" not in html
+
+
+# --- the thread around the policy -------------------------------------------
+
+
+class _FakeWindow:
+    def __init__(self, state: str = "blank") -> None:
+        self.state = state
+        self.loaded_urls: list[str] = []
+        self.loaded_html: list[str] = []
+        self.raise_on_eval = False
+
+    def evaluate_js(self, _js: str) -> str:
+        if self.raise_on_eval:
+            raise RuntimeError("no document")
+        return self.state
+
+    def load_url(self, url: str) -> None:
+        self.loaded_urls.append(url)
+
+    def load_html(self, html: str) -> None:
+        self.loaded_html.append(html)
+        self.state = "notice"
+
+
+def _watchdog(window: _FakeWindow, **kw: Any) -> BlankWindowWatchdog:
+    return BlankWindowWatchdog(
+        window=window,
+        url=kw.pop("url", "http://127.0.0.1:47821"),
+        health_probe=kw.pop("health_probe", lambda: True),
+        backend_alive=kw.pop("backend_alive", lambda: True),
+        failure_detail=kw.pop("failure_detail", lambda: ""),
+        theme=kw.pop("theme", lambda: "dark"),
+        **kw,
+    )
+
+
+def test_an_unanswerable_window_is_unknown() -> None:
+    """A timed-out probe cannot establish whether the painted page is blank."""
+    window = _FakeWindow()
+    window.raise_on_eval = True
+    wd = _watchdog(window)
+    assert wd._page_state(window) == "unknown"
+    # Before first paint a never-navigated view still receives recovery.
+    p = _policy()
+    p.decide(_obs(0.0, page="unknown"))
+    assert p.decide(_obs(GRACE + 1, page="unknown")).action is Action.RELOAD
+
+
+def test_the_watchdog_reloads_the_configured_url() -> None:
+    window = _FakeWindow()
+    wd = _watchdog(window, url="http://127.0.0.1:1234")
+    wd._apply(window, wd._policy.decide(_obs(0.0)))  # WAIT, still in grace
+    assert window.loaded_urls == []
+    from jarvis.ui.window_watchdog import Verdict
+
+    wd._apply(window, Verdict(Action.RELOAD))
+    assert window.loaded_urls == ["http://127.0.0.1:1234"]
+
+
+def test_a_hung_reload_ends_the_renderer_first_and_gets_a_fresh_probe() -> None:
+    """A same-origin reload is committed to the busy renderer and never lands."""
+    from jarvis.ui.window_watchdog import Verdict
+
+    window = _FakeWindow()
+    calls: list[str] = []
+
+    def _end() -> list[int]:
+        calls.append(f"end:{len(window.loaded_urls)}")
+        return [4242]
+
+    wd = _watchdog(window, end_hung_renderer=_end)
+    old_caller = wd._caller
+    assert wd._apply(window, Verdict(Action.RELOAD, after_up=True, hung=True))
+    assert calls == ["end:0"], "the renderer must be ended BEFORE the reload"
+    assert window.loaded_urls == ["http://127.0.0.1:47821?jarvis_recovery=1"]
+    assert wd._caller is not old_caller
+
+
+def test_an_ordinary_reload_never_ends_a_renderer() -> None:
+    from jarvis.ui.window_watchdog import Verdict
+
+    window = _FakeWindow()
+    calls: list[int] = []
+    wd = _watchdog(window, end_hung_renderer=lambda: calls.append(1) or [])
+    assert wd._apply(window, Verdict(Action.RELOAD))
+    assert calls == []
+
+
+def test_a_failing_renderer_end_still_reloads() -> None:
+    from jarvis.ui.window_watchdog import Verdict
+
+    def _boom() -> list[int]:
+        raise RuntimeError("access denied")
+
+    window = _FakeWindow()
+    wd = _watchdog(window, end_hung_renderer=_boom)
+    assert wd._apply(window, Verdict(Action.RELOAD, after_up=True, hung=True))
+    assert window.loaded_urls
+
+
+def test_ending_busy_renderers_without_any_renderer_is_a_no_op() -> None:
+    """In-process web views (macOS, Linux) and the test runner have no renderer child."""
+    from jarvis.ui.window_watchdog import end_busy_renderers
+
+    assert end_busy_renderers(sample_s=0.0) == []
+
+
+def test_the_watchdog_writes_the_detail_it_was_given() -> None:
+    window = _FakeWindow()
+    wd = _watchdog(window, failure_detail=lambda: "ModuleNotFoundError: click")
+    from jarvis.ui.window_watchdog import Verdict
+
+    wd._apply(window, Verdict(Action.EXPLAIN, BlankReason.BACKEND_DEAD))
+    assert window.loaded_html
+    assert "ModuleNotFoundError: click" in window.loaded_html[0]
+
+
+def test_a_window_that_is_not_there_yet_costs_nothing() -> None:
+    """Found live: pywebview raises until ``webview.start`` has run.
+
+    The guard is armed before that on purpose — a window that never navigates
+    is one of the failures it exists for — so a refused call must cost neither
+    the explanation nor a reload from the budget.
+    """
+
+    class _NotYet:
+        def evaluate_js(self, _js: str) -> str:
+            raise RuntimeError("Main window failed to start")
+
+        def load_url(self, _url: str) -> None:
+            raise RuntimeError("Main window failed to start")
+
+        def load_html(self, _html: str) -> None:
+            raise RuntimeError("Main window failed to start")
+
+    window = _NotYet()
+    wd = _watchdog(window, policy=_policy())  # type: ignore[arg-type]
+    from jarvis.ui.window_watchdog import Verdict
+
+    wd._policy.decide(_obs(0.0))
+    assert wd._apply(window, Verdict(Action.RELOAD)) is False
+    assert wd._apply(window, Verdict(Action.EXPLAIN, BlankReason.VIEW_EMPTY)) is False
+    # Budget untouched: once the window is real, all three reloads are still there.
+    real = _FakeWindow()
+    wd._window = real
+    for i in range(3):
+        v = wd._policy.decide(_obs(GRACE + 1 + i * (SETTLE + 1)))
+        assert v.action is Action.RELOAD, f"reload {i + 1} was already spent"
+
+
+def test_a_probe_that_raises_cannot_stop_the_guard() -> None:
+    """A watchdog that dies on a failing probe has failed at its only job."""
+
+    def _boom() -> bool:
+        raise RuntimeError("probe exploded")
+
+    window = _FakeWindow()
+    wd = _watchdog(window, health_probe=_boom, backend_alive=_boom)
+    assert wd._safe(_boom, default=False) is False
+    assert wd._safe(_boom, default=True) is True
+
+
+def test_a_closed_window_is_not_a_blank_window() -> None:
+    """After detach the guard has nothing to watch and must not paint anything."""
+    window = _FakeWindow()
+    wd = _watchdog(window)
+    wd.detach()
+    assert wd._window is None
+
+
+def test_attaching_a_reopened_window_starts_a_fresh_incident() -> None:
+    """The tray can reopen main; the replacement deserves its own full budget."""
+    window = _FakeWindow()
+    wd = _watchdog(window)
+    wd._policy.decide(_obs(0.0))
+    wd._policy.decide(_obs(GRACE + 1))  # spends a reload
+    second = _FakeWindow()
+    wd.attach(second)
+    assert wd._window is second
+    assert wd._policy.decide(_obs(0.0)).action is Action.WAIT
+
+
+def test_a_hung_page_is_asked_for_its_stack_before_the_renderer_ends() -> None:
+    from jarvis.ui.window_watchdog import Verdict
+
+    order: list[str] = []
+
+    class _Probe:
+        def arm(self) -> None:
+            order.append("arm")
+
+        def capture(self) -> list[str]:
+            order.append("capture")
+            return ["sample 1: 1 frame(s)", "  #0 spin index.js:1:2"]
+
+    window = _FakeWindow()
+    wd = _watchdog(
+        window,
+        stack_probe=_Probe(),
+        end_hung_renderer=lambda: order.append("end") or [],
+    )
+    assert wd._apply(window, Verdict(Action.RELOAD, after_up=True, hung=True))
+    assert order == ["capture", "end"]

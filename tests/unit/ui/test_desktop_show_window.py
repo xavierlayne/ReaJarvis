@@ -1,0 +1,422 @@
+"""DesktopApp bus subscriber for ShowWindowRequested.
+
+The overlay right-click publishes ``ShowWindowRequested``; the DesktopApp's
+subscriber must raise its window via ``_safe_window_show`` (itself null-safe
+when there is no window — headless / VPS).
+
+The handler MUST be a coroutine: ``EventBus._safe_dispatch`` does
+``await handler(event)``. A plain ``def`` handler runs its side effect but then
+``await None`` raises a ``TypeError`` that the bus swallows as a WARNING — so
+every right-click would spam a traceback. These tests round-trip through the
+real bus so that mismatch cannot slip through (a direct call would not).
+
+The show path must also leave the EVENT LOOP alone: pywebview window calls
+block their calling thread (``evaluate_js`` waits up to ~20 s), and run on the
+asyncio loop that starved the realtime WebRTC mic sender 40 s behind wall
+clock until the provider reset the call (live 2026-08-06 17:40). The off-loop
+tests below pin the thread-hop for both entry points — the bus subscriber and
+the ``/api/window/focus`` body ``_focus_window_now``.
+"""
+from __future__ import annotations
+
+import inspect
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from jarvis.core.bus import EventBus
+from jarvis.core.events import ShowWindowRequested
+from jarvis.ui.desktop_app import DesktopApp
+
+
+def test_handler_is_coroutine_for_bus_dispatch() -> None:
+    # EventBus.subscribe expects an awaitable handler (await handler(event)).
+    assert inspect.iscoroutinefunction(DesktopApp._on_show_window_requested)
+
+
+async def test_show_window_handler_raises_window_directly() -> None:
+    app = DesktopApp.__new__(DesktopApp)
+    calls: list[bool] = []
+    app._safe_window_show = lambda: calls.append(True)  # type: ignore[method-assign]  # noqa: SLF001
+
+    await app._on_show_window_requested(  # noqa: SLF001
+        ShowWindowRequested(source="overlay_rightclick")
+    )
+
+    assert calls == [True]
+
+
+async def test_show_window_handler_runs_through_real_bus() -> None:
+    """End-to-end: a published ShowWindowRequested reaches the subscriber and
+    raises the window — exercising the real ``await handler(event)`` path."""
+    app = DesktopApp.__new__(DesktopApp)
+    calls: list[bool] = []
+    app._safe_window_show = lambda: calls.append(True)  # type: ignore[method-assign]  # noqa: SLF001
+
+    bus = EventBus()
+    bus.subscribe(ShowWindowRequested, app._on_show_window_requested)  # noqa: SLF001
+    await bus.publish(ShowWindowRequested(source="overlay_rightclick"))
+
+    assert calls == [True]
+
+
+async def test_show_window_handler_hops_off_the_event_loop() -> None:
+    """The subscriber must run the (blocking) show path in a worker thread.
+
+    ``_reload_window_if_stale`` inside ``_safe_window_show`` probes the WebView
+    with ``evaluate_js``, which pywebview bounds at ~20 s — executed on the
+    asyncio loop it stalls every socket, watchdog and the realtime audio pumps
+    at once (the 2026-08-06 session-death signature).
+    """
+    app = DesktopApp.__new__(DesktopApp)
+    loop_thread = threading.current_thread()
+    show_threads: list[threading.Thread] = []
+    app._safe_window_show = lambda: show_threads.append(  # type: ignore[method-assign]  # noqa: SLF001
+        threading.current_thread()
+    )
+
+    await app._on_show_window_requested(  # noqa: SLF001
+        ShowWindowRequested(source="overlay_rightclick")
+    )
+
+    assert show_threads, "the show path never ran"
+    assert show_threads[0] is not loop_thread, (
+        "_safe_window_show ran on the event loop — a stale-frame probe there "
+        "blocks audio, barge-in and the provider socket for up to 20 s"
+    )
+
+
+class _RecordingWindow:
+    """Minimal pywebview stand-in recording which thread serviced each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, threading.Thread]] = []
+
+    def show(self) -> None:
+        self.calls.append(("show", threading.current_thread()))
+
+    def restore(self) -> None:
+        self.calls.append(("restore", threading.current_thread()))
+
+
+async def test_focus_window_now_completes_the_visibility_dance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_focus_window_now`` is the synchronous ``/api/window/focus`` body: it
+    shows + restores + raises the window and restores the overlay, and reports
+    the foreground verdict honestly. The route wraps it in ``asyncio.to_thread``
+    — pinned here by running it exactly as the route does and asserting the
+    window calls landed off the loop thread."""
+    app = DesktopApp.__new__(DesktopApp)
+    window = _RecordingWindow()
+    app._window = window  # noqa: SLF001
+    overlay_restored: list[bool] = []
+    app._restore_overlay_for_visible_window = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda: overlay_restored.append(True)
+    )
+    monkeypatch.setattr(
+        "jarvis.ui.desktop_app._bring_window_to_front_by_title",
+        lambda _title: True,
+    )
+    # A minimized window: the dance restores it. (The real probe would read
+    # whatever Jarvis window happens to be open on the test machine.)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_needs_restore", lambda _title: True)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_restores_maximized", lambda _title: False)
+
+    import asyncio
+
+    loop_thread = threading.current_thread()
+    result = await asyncio.to_thread(app._focus_window_now)  # noqa: SLF001
+
+    assert result == {"ok": True, "focused": True}
+    assert app._window_visible is True  # noqa: SLF001
+    assert overlay_restored == [True]
+    assert [name for name, _ in window.calls] == ["show", "restore"]
+    assert all(thread is not loop_thread for _, thread in window.calls)
+
+
+def test_focus_window_now_keeps_a_maximized_window_maximized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-03: a click on the appshot card shrank the maximized app,
+    because "bring it forward" also restored it — on Windows that means back
+    to the normal size. A window already on screen is only raised."""
+    app = DesktopApp.__new__(DesktopApp)
+    window = _RecordingWindow()
+    app._window = window  # noqa: SLF001
+    app._restore_overlay_for_visible_window = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    monkeypatch.setattr("jarvis.ui.desktop_app._bring_window_to_front_by_title", lambda _t: True)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_needs_restore", lambda _title: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_restores_maximized", lambda _title: False)
+
+    assert app._focus_window_now() == {"ok": True, "focused": True}  # noqa: SLF001
+    assert [name for name, _ in window.calls] == ["show"]
+
+    window.calls.clear()
+    app._reload_window_if_stale = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    app._safe_window_show()  # noqa: SLF001  # the appshot card / overlay path
+    assert [name for name, _ in window.calls] == ["show"]
+
+
+def test_a_window_minimized_while_maximized_comes_back_maximized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-03 (video): Edit on the appshot card brought the minimized
+    app back small. pywebview's restore() sets the normal size; Win32
+    SW_RESTORE alone returns a window to the maximized state it left."""
+    app = DesktopApp.__new__(DesktopApp)
+    window = _RecordingWindow()
+    app._window = window  # noqa: SLF001
+    app._restore_overlay_for_visible_window = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    app._reload_window_if_stale = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    monkeypatch.setattr("jarvis.ui.desktop_app._bring_window_to_front_by_title", lambda _t: True)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_needs_restore", lambda _title: True)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_restores_maximized", lambda _title: True)
+
+    assert app._focus_window_now() == {"ok": True, "focused": True}  # noqa: SLF001
+    app._safe_window_show()  # noqa: SLF001
+    assert "restore" not in [name for name, _ in window.calls]
+
+
+class _PlacementUser32:
+    """Answers GetWindowPlacement with the given flags."""
+
+    def __init__(self, flags: int, ok: bool = True) -> None:
+        self.flags = flags
+        self.ok = ok
+
+    def GetWindowPlacement(self, _hwnd: int, placement: object) -> bool:  # noqa: N802
+        placement._obj.flags = self.flags  # type: ignore[attr-defined]
+        return self.ok
+
+
+def test_placement_tells_a_window_that_returns_maximized() -> None:
+    from jarvis.ui.desktop_app import _placement_restores_maximized
+
+    assert _placement_restores_maximized(1, _PlacementUser32(0x0002)) is True
+    assert _placement_restores_maximized(1, _PlacementUser32(0x0000)) is False
+    assert _placement_restores_maximized(1, _PlacementUser32(0x0002, ok=False)) is False
+    assert _placement_restores_maximized(1, object()) is False
+
+
+def test_focus_window_now_without_window_reports_no_window() -> None:
+    app = DesktopApp.__new__(DesktopApp)
+    app._window = None  # noqa: SLF001
+
+    assert app._focus_window_now() == {"ok": False, "reason": "no_window"}  # noqa: SLF001
+
+
+def test_focus_window_now_leaves_a_quitting_window_alone() -> None:
+    """A second launch during a quit must not raise the window being destroyed.
+
+    Live 2026-09-30: the focus reply said "raised", the launch exited as if it
+    had worked, and the user was left with no window at all.
+    """
+    app = DesktopApp.__new__(DesktopApp)
+    window = _RecordingWindow()
+    app._window = window  # noqa: SLF001
+    app._user_requested_quit = True  # noqa: SLF001
+
+    assert app._focus_window_now() == {  # noqa: SLF001
+        "ok": False,
+        "focused": False,
+        "reason": "quitting",
+    }
+    assert window.calls == []
+
+
+def test_a_shown_window_windows_would_not_activate_is_reported_as_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live 2026-10-06: Windows' foreground lock refused the activation of a
+    healthy, visible window. The reply said only "not focused", and the second
+    launch offered to kill the app as "probably stuck". A window on screen is
+    reported as shown, and its taskbar button flashes."""
+    app = DesktopApp.__new__(DesktopApp)
+    window = _RecordingWindow()
+    app._window = window  # noqa: SLF001
+    app._restore_overlay_for_visible_window = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    flashed: list[str] = []
+    monkeypatch.setattr("jarvis.ui.desktop_app._bring_window_to_front_by_title", lambda _t: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_needs_restore", lambda _title: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_restores_maximized", lambda _title: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app._flash_taskbar_button", flashed.append)
+
+    assert app._focus_window_now() == {  # noqa: SLF001
+        "ok": True,
+        "focused": False,
+        "shown": True,
+        "reason": "foreground_lock",
+    }
+    assert flashed == [desktop_app_title()]
+
+
+def test_a_window_still_minimized_after_a_refused_activation_is_not_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = DesktopApp.__new__(DesktopApp)
+    app._window = _RecordingWindow()  # noqa: SLF001
+    app._restore_overlay_for_visible_window = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    flashed: list[str] = []
+    monkeypatch.setattr("jarvis.ui.desktop_app._bring_window_to_front_by_title", lambda _t: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_needs_restore", lambda _title: True)
+    monkeypatch.setattr("jarvis.ui.desktop_app.window_restores_maximized", lambda _title: False)
+    monkeypatch.setattr("jarvis.ui.desktop_app._flash_taskbar_button", flashed.append)
+
+    reply = app._focus_window_now()  # noqa: SLF001
+    assert reply["shown"] is False
+    assert reply["ok"] is False
+    assert flashed == []
+
+
+def desktop_app_title() -> str:
+    from jarvis.ui.desktop_app import WINDOW_TITLE
+
+    return WINDOW_TITLE
+
+
+class _Reply:
+    def __init__(self, payload: dict) -> None:
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_launcher_focus_does_not_fall_back_to_a_quitting_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A holder that reports "quitting" is not raised by title either."""
+    import sys
+    from types import ModuleType
+
+    from jarvis.ui import desktop_app
+
+    fake_httpx = ModuleType("httpx")
+    fake_httpx.post = lambda *_a, **_k: _Reply(  # type: ignore[attr-defined]
+        {"ok": False, "focused": False, "reason": "quitting"}
+    )
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    monkeypatch.setattr(desktop_app, "_read_meta", lambda: {"port": 47821})
+    monkeypatch.setattr(desktop_app, "_focus_request_headers", lambda _port: {})
+    raised: list[str] = []
+    monkeypatch.setattr(
+        desktop_app, "_bring_window_to_front_by_title", lambda title: raised.append(title) or True
+    )
+
+    assert desktop_app.focus_existing_instance_robust() is False
+    assert raised == []
+
+
+class _ProbedWindow:
+    """pywebview stand-in whose staleness probe answers with ``probe``."""
+
+    def __init__(self, probe: object) -> None:
+        self.probe = probe
+        self.scripts: list[str] = []
+        self.loaded: list[str] = []
+
+    def evaluate_js(self, script: str) -> object:
+        self.scripts.append(script)
+        if isinstance(self.probe, Exception):
+            raise self.probe
+        return self.probe
+
+    def load_url(self, url: str) -> None:
+        self.loaded.append(url)
+
+
+def _probed_app(window: _ProbedWindow) -> DesktopApp:
+    app = DesktopApp.__new__(DesktopApp)
+    app._window = window  # noqa: SLF001
+    app._url = lambda: "http://127.0.0.1:47821/"  # type: ignore[method-assign]  # noqa: SLF001
+    return app
+
+
+def test_showing_a_healthy_window_never_reloads_it() -> None:
+    """Regression 2026-10-03: a click on the appshot card reloaded the app.
+
+    The probe used to require "Jarvis" in ``document.title``; the title has
+    been "Assistant" since July, so every show — tray, orb, appshot card —
+    reloaded the window, wiping the editor the card had just opened and
+    hanging up a running voice call.
+    """
+    window = _ProbedWindow(probe=True)
+    _probed_app(window)._reload_window_if_stale()  # noqa: SLF001
+
+    assert window.loaded == []
+    assert "title" not in window.scripts[0], "the title is not the app's identity"
+
+
+def test_a_stale_error_page_is_still_reloaded() -> None:
+    window = _ProbedWindow(probe=False)
+    _probed_app(window)._reload_window_if_stale()  # noqa: SLF001
+
+    assert window.loaded == ["http://127.0.0.1:47821/"]
+
+
+def test_a_failing_probe_leaves_the_window_alone() -> None:
+    """A probe that throws knows nothing about the page; reloading on it
+    reloaded a healthy window on every show."""
+    window = _ProbedWindow(probe=RuntimeError("bridge not ready"))
+    _probed_app(window)._reload_window_if_stale()  # noqa: SLF001
+
+    assert window.loaded == []
+
+
+def test_the_shipped_index_satisfies_the_probe() -> None:
+    """The probe's marker must exist in the document the app actually serves."""
+    from pathlib import Path
+
+    from jarvis.ui import desktop_app
+
+    index = Path(desktop_app.__file__).parent / "web" / "frontend" / "index.html"
+    assert "root" in desktop_app._SPA_DOCUMENT_PROBE  # noqa: SLF001
+    assert 'id="root"' in index.read_text(encoding="utf-8")
+
+
+def test_the_appshot_editor_window_opens_in_compact_proportions() -> None:
+    """Live 2026-10-03: the editor should sit in front of the app,
+    about 2/5 of the screen wide, a bit under half its height
+    — never so small that toolbar buttons drop off, never as big as the app."""
+    from jarvis.ui.desktop_app import detached_window_size
+
+    assert detached_window_size("visualization", (2560, 1440)) == (1100, 750)
+    assert detached_window_size("appshot-editor", (2560, 1440)) == (1024, 662)
+    assert detached_window_size("appshot-editor", None) == (1100, 750)
+    # A small screen: the toolbar's minimum, but never past the screen.
+    assert detached_window_size("appshot-editor", (1280, 720)) == (900, 600)
+    assert detached_window_size("appshot-editor", (800, 500)) == (800, 500)
+
+
+def test_an_open_editor_window_is_pointed_at_the_new_appshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The appshot card opens the editor through ``open_detached_window`` with
+    a query; an editor already open is re-pointed, never duplicated."""
+    app = DesktopApp.__new__(DesktopApp)
+    loaded: list[str] = []
+    scripts: list[str] = []
+    shown: list[bool] = []
+    existing = SimpleNamespace(
+        load_url=loaded.append,
+        # The warm page answers: it switched to the new appshot in place.
+        evaluate_js=lambda js: scripts.append(js) or True,
+        show=lambda: shown.append(True),
+    )
+    app._detached_windows = {"appshot-editor": existing}  # noqa: SLF001
+    app._url = lambda: "http://127.0.0.1:47821"  # type: ignore[method-assign]  # noqa: SLF001
+    raised: list[str] = []
+    monkeypatch.setattr(
+        "jarvis.ui.desktop_app._bring_window_to_front_by_title", lambda title: raised.append(title)
+    )
+
+    result = app.open_detached_window("appshot-editor", query="appshot=a1b2c3d4")
+
+    assert result == {"ok": True, "already_open": True, "view": "appshot-editor"}
+    assert loaded == [], "a warm editor is re-pointed, not reloaded"
+    assert scripts and '"a1b2c3d4"' in scripts[0]
+    assert shown == [True]
+    assert len(raised) == 1

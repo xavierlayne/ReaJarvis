@@ -1,0 +1,914 @@
+"""Actuator contract tests — landed-position verification and pure mapping.
+
+No test here dispatches real input (clicks/keys would hit the developer's
+desktop); real-input behaviour is exercised by scripts/cu_test_rig.py.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import types
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+import jarvis.cu.actuate.base as base_mod
+from jarvis.cu.actuate.base import (
+    ActResult,
+    ActuationUnavailable,
+    Actuator,
+    verified_click,
+    verified_move,
+)
+from jarvis.cu.actuate.windows import (
+    expand_combo_keys,
+    normalize_virtualdesk,
+    resolve_vk,
+)
+
+
+class FakeActuator(Actuator):
+    """Scriptable fake: lands where told to, records calls."""
+
+    name = "fake"
+
+    def __init__(self, landings: list[tuple[int, int] | None]) -> None:
+        self.landings = list(landings)
+        self.moves: list[tuple[int, int]] = []
+
+    def cursor_pos(self):
+        return self.landings.pop(0) if self.landings else None
+
+    def move(self, x: int, y: int) -> None:
+        self.moves.append((x, y))
+
+    def click(self, x, y, *, button="left", double=False):  # pragma: no cover
+        raise NotImplementedError
+
+    def drag(self, x1, y1, x2, y2, *, duration_s=0.4):  # pragma: no cover
+        raise NotImplementedError
+
+    def scroll(self, direction, notches, *, x=None, y=None):  # pragma: no cover
+        raise NotImplementedError
+
+    def key_combo(self, keys):  # pragma: no cover
+        raise NotImplementedError
+
+    def type_text(self, text, *, delay_s=0.02):  # pragma: no cover
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# verified_move — the anti-silent-miss contract
+# ---------------------------------------------------------------------------
+
+def test_verified_move_accepts_exact_landing():
+    fake = FakeActuator(landings=[(100, 200)])
+    res = verified_move(fake, 100, 200)
+    assert res.ok and res.landed == (100, 200)
+    assert fake.moves == [(100, 200)]
+
+
+def test_verified_move_accepts_within_tolerance():
+    fake = FakeActuator(landings=[(101, 198)])
+    res = verified_move(fake, 100, 200)
+    assert res.ok
+
+
+def test_verified_move_retries_once_then_fails_loudly():
+    # Both attempts land 500px off (a DPI mis-mapping) -> refuse to act.
+    fake = FakeActuator(landings=[(600, 200), (600, 200)])
+    res = verified_move(fake, 100, 200)
+    assert not res.ok
+    assert len(fake.moves) == 2
+    assert "coordinate-space mismatch" in res.detail
+    assert res.landed == (600, 200)
+
+
+def test_verified_move_retry_recovers():
+    fake = FakeActuator(landings=[(600, 200), (100, 200)])
+    res = verified_move(fake, 100, 200)
+    assert res.ok and len(fake.moves) == 2
+
+
+def test_verified_move_refuses_unreadable_cursor():
+    fake = FakeActuator(landings=[None, None])
+    res = verified_move(fake, 50, 60)
+    assert not res.ok and res.landed is None
+    assert "unreadable" in res.detail
+    assert fake.moves == [(50, 60), (50, 60)]
+
+
+def test_verified_move_refuses_virtual_desktop_gap(monkeypatch):
+    from jarvis.cu.geometry import MonitorInfo
+
+    fake = FakeActuator(landings=[(150, 150)])
+    monkeypatch.setattr(
+        "jarvis.cu.geometry.list_monitors",
+        lambda: [
+            MonitorInfo(left=0, top=0, width=100, height=100),
+            MonitorInfo(left=100, top=100, width=100, height=100),
+        ],
+    )
+
+    res = verified_move(fake, 150, 50)
+
+    assert res.ok is False
+    assert "virtual-desktop gap" in res.detail
+    assert fake.moves == []
+
+
+def test_verified_drag_refuses_gap_destination_before_button_down(monkeypatch):
+    from jarvis.cu.actuate.base import verified_drag
+    from jarvis.cu.geometry import MonitorInfo
+
+    class _DragActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(10, 10)])
+            self.drags = []
+
+        def drag(self, *args, **kwargs):
+            self.drags.append((args, kwargs))
+
+    fake = _DragActuator()
+    monkeypatch.setattr(
+        "jarvis.cu.geometry.list_monitors",
+        lambda: [MonitorInfo(left=0, top=0, width=100, height=100)],
+    )
+
+    result = verified_drag(fake, 10, 10, 150, 50)
+
+    assert result.ok is False
+    assert "virtual-desktop gap" in result.detail
+    assert fake.moves == []
+    assert fake.drags == []
+
+
+def test_verified_drag_refuses_path_crossing_display_gap(monkeypatch):
+    from jarvis.cu.actuate.base import verified_drag
+    from jarvis.cu.geometry import MonitorInfo
+
+    class _DragActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(50, 50)])
+            self.drags = []
+
+        def drag_from_cursor(self, *args, **kwargs):
+            self.drags.append((args, kwargs))
+
+    fake = _DragActuator()
+    monkeypatch.setattr(
+        "jarvis.cu.geometry.list_monitors",
+        lambda: [
+            MonitorInfo(left=0, top=0, width=100, height=100),
+            MonitorInfo(left=200, top=100, width=100, height=100),
+        ],
+    )
+
+    result = verified_drag(fake, 50, 50, 250, 150)
+
+    assert result.ok is False
+    assert "path crosses" in result.detail
+    assert fake.moves == []
+    assert fake.drags == []
+
+
+def test_verified_click_refuses_backend_without_at_cursor_primitive(monkeypatch):
+    fake = FakeActuator(landings=[(10, 20)])
+    monkeypatch.setattr("jarvis.cu.geometry.list_monitors", lambda: [])
+
+    result = verified_click(fake, 10, 20)
+
+    assert result.ok is False
+    assert "at-cursor click" in result.detail
+
+
+def test_verified_click_rechecks_original_target_not_tolerated_landing(monkeypatch):
+    class _ClickActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(11, 20)])
+            self.expected = None
+
+        def click_at_cursor(self, *, button, double, expected):
+            self.expected = expected
+
+    fake = _ClickActuator()
+    monkeypatch.setattr("jarvis.cu.geometry.list_monitors", lambda: [])
+
+    result = verified_click(fake, 10, 20)
+
+    assert result.ok is True
+    assert fake.expected == (10, 20)
+
+
+def test_verified_click_rechecks_foreground_immediately_before_button(monkeypatch):
+    class _ClickActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(10, 20)])
+            self.clicked = False
+
+        def click_at_cursor(self, *, button, double, expected):
+            self.clicked = True
+
+    fake = _ClickActuator()
+    monkeypatch.setattr("jarvis.cu.geometry.list_monitors", lambda: [])
+
+    result = verified_click(fake, 10, 20, pre_action_check=lambda: False)
+
+    assert result.ok is False
+    assert "foreground window changed" in result.detail
+    assert fake.clicked is False
+
+
+def test_verified_drag_uses_at_cursor_primitive(monkeypatch):
+    from jarvis.cu.actuate.base import verified_drag
+
+    class _DragActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(10, 10), (80, 90)])
+            self.at_cursor_calls = []
+
+        def drag(self, *args, **kwargs):
+            raise AssertionError("drag() would repeat the verified start move")
+
+        def drag_from_cursor(self, *args, **kwargs):
+            self.at_cursor_calls.append((args, kwargs))
+
+    fake = _DragActuator()
+    monkeypatch.setattr("jarvis.cu.geometry.list_monitors", lambda: [])
+
+    result = verified_drag(fake, 10, 10, 80, 90, duration_s=0.2)
+
+    assert result.ok is True
+    assert fake.at_cursor_calls == [((10, 10, 80, 90), {"duration_s": 0.2})]
+
+
+def test_verified_drag_rechecks_foreground_before_button_down(monkeypatch):
+    from jarvis.cu.actuate.base import verified_drag
+
+    class _DragActuator(FakeActuator):
+        def __init__(self):
+            super().__init__([(10, 10)])
+            self.dragged = False
+
+        def drag_from_cursor(self, *args, **kwargs):
+            self.dragged = True
+
+    fake = _DragActuator()
+    monkeypatch.setattr("jarvis.cu.geometry.list_monitors", lambda: [])
+
+    result = verified_drag(
+        fake,
+        10,
+        10,
+        80,
+        90,
+        pre_action_check=lambda: False,
+    )
+
+    assert result.ok is False
+    assert "foreground window changed" in result.detail
+    assert fake.dragged is False
+
+
+def test_act_result_is_frozen():
+    res = ActResult(ok=True)
+    with pytest.raises(FrozenInstanceError):
+        res.ok = False  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Windows pure mapping helpers (importable and testable on every OS)
+# ---------------------------------------------------------------------------
+
+def test_normalize_virtualdesk_folds_negative_origin():
+    # Virtual desktop: left monitor at -3840, total 6400x2160.
+    vx, vy, vw, vh = -3840, 0, 6400, 2160
+    assert normalize_virtualdesk(-3840, 0, vx, vy, vw, vh) == (0, 0)
+    nx, ny = normalize_virtualdesk(vx + vw - 1, vh - 1, vx, vy, vw, vh)
+    assert (nx, ny) == (65535, 65535)
+    # The live-log click target (-1398, 1147) maps strictly inside.
+    nx, ny = normalize_virtualdesk(-1398, 1147, vx, vy, vw, vh)
+    assert 0 < nx < 65535 and 0 < ny < 65535
+
+
+def _recording_windows_actuator():
+    """A WindowsActuator that records key events instead of calling SendInput.
+
+    Built via ``__new__`` so no ctypes/Win32 struct setup runs — the mapping
+    under test is pure, and this keeps the test host-agnostic.
+    """
+    from jarvis.cu.actuate.windows import WindowsActuator
+
+    actuator = WindowsActuator.__new__(WindowsActuator)
+    sent: list[list[tuple[int, int, int]]] = []
+    actuator._t = None
+    actuator._key_input = lambda vk, scan, flags: (vk, scan, flags)
+    actuator._send = lambda events: sent.append(list(events))
+    return actuator, sent
+
+
+def test_type_text_presses_enter_for_a_newline():
+    """KEYEVENTF_UNICODE cannot deliver U+000A: Windows edit controls act on
+    the KEY, so a unicode LF typed NOTHING and every multi-line type_text
+    landed as one run-on line — while pynput on macOS/Linux pressed Enter."""
+    from jarvis.cu.actuate.windows import _KEYEVENTF_KEYUP
+
+    actuator, sent = _recording_windows_actuator()
+    actuator.type_text("a\nb", delay_s=0)
+
+    assert len(sent) == 3
+    assert sent[1] == [(0x0D, 0, 0), (0x0D, 0, _KEYEVENTF_KEYUP)]
+    # The surrounding characters still go out as unicode code units.
+    assert sent[0][0][0] == 0 and sent[0][0][1] == ord("a")
+    assert sent[2][0][1] == ord("b")
+
+
+def test_type_text_maps_tab_and_collapses_crlf_to_one_enter():
+    actuator, sent = _recording_windows_actuator()
+    actuator.type_text("\t\r\n", delay_s=0)
+
+    assert [batch[0][0] for batch in sent] == [0x09, 0x0D]
+
+
+def test_type_text_still_sends_astral_characters_as_surrogate_pairs():
+    from jarvis.cu.actuate.windows import _KEYEVENTF_UNICODE
+
+    actuator, sent = _recording_windows_actuator()
+    actuator.type_text("\U0001F600", delay_s=0)    # emoji → two UTF-16 units
+
+    assert len(sent) == 1
+    assert len(sent[0]) == 4    # down+up per surrogate half
+    assert all(vk == 0 and flags & _KEYEVENTF_UNICODE for vk, _scan, flags in sent[0])
+
+
+def test_normalize_virtualdesk_clamps_outside_points():
+    assert normalize_virtualdesk(-9999, -9999, 0, 0, 1920, 1080) == (0, 0)
+    assert normalize_virtualdesk(99999, 99999, 0, 0, 1920, 1080) == (65535, 65535)
+
+
+def test_resolve_vk_letters_digits_and_names():
+    assert resolve_vk("a") == ord("A")
+    assert resolve_vk("Z") == ord("Z")
+    assert resolve_vk("7") == ord("7")
+    assert resolve_vk("enter") == 0x0D
+    assert resolve_vk("Ctrl") == 0x11
+    assert resolve_vk("f12") == 0x7B
+    assert resolve_vk("option") == 0x12
+    assert resolve_vk("command") == 0x5B
+    assert resolve_vk("bogus") is None
+    assert resolve_vk("") is None
+
+
+def test_resolve_vk_maps_punctuation_shortcut_keys():
+    """The shared vocabulary accepts any single printable character and the
+    pynput backend types it — this backend resolved only a-z/0-9, so every
+    punctuation shortcut (Ctrl+- / Ctrl+= zoom, Ctrl+, settings, Ctrl+/
+    comment) raised "Unknown key" and the whole action failed."""
+    assert resolve_vk("-") == 0xBD    # VK_OEM_MINUS  — any layout
+    assert resolve_vk("=") == 0xBB    # VK_OEM_PLUS   — any layout
+    assert resolve_vk(",") == 0xBC    # VK_OEM_COMMA  — any layout
+    assert resolve_vk(".") == 0xBE    # VK_OEM_PERIOD — any layout
+    assert resolve_vk("/") == 0xBF
+    assert resolve_vk("[") == 0xDB
+    assert resolve_vk("]") == 0xDD
+
+
+def test_resolve_vk_refuses_shifted_characters():
+    """Emitting the unshifted key for '+' would send input nobody asked for —
+    a loud "Unknown key" beats a wrong keystroke."""
+    for shifted in ("+", "_", "{", "}", ":", "?", "~"):
+        assert resolve_vk(shifted) is None, shifted
+
+
+def test_punctuation_shortcut_survives_the_whole_combo_path():
+    """expand_combo_keys already split "ctrl+-"; resolve_vk then rejected it."""
+    expanded = expand_combo_keys(["ctrl+-"])
+    assert expanded == ["ctrl", "-"]
+    assert [resolve_vk(k) for k in expanded] == [0x11, 0xBD]
+
+
+def test_expand_combo_keys_splits_known_combos_only():
+    assert expand_combo_keys(["ctrl+v"]) == ["ctrl", "v"]
+    assert expand_combo_keys(["ctrl+shift+t"]) == ["ctrl", "shift", "t"]
+    assert expand_combo_keys(["ctrl", "v"]) == ["ctrl", "v"]
+    # Unknown part -> token kept verbatim so it errors loudly downstream.
+    assert expand_combo_keys(["ctrl+bogus"]) == ["ctrl+bogus"]
+    assert expand_combo_keys(["+"]) == ["+"]
+
+
+# ---------------------------------------------------------------------------
+# key_combo must never strand a modifier in the down state
+# ---------------------------------------------------------------------------
+
+def _combo_actuator(refuse_after: int | None = None):
+    """Recording WindowsActuator whose first _send optionally reports a partial
+    injection, the way SendInput does when UIPI truncates a batch."""
+    from jarvis.cu.actuate.windows import SendInputRefused, WindowsActuator
+
+    actuator = WindowsActuator.__new__(WindowsActuator)
+    actuator._t = None
+    actuator._key_input = lambda vk, scan, flags: (vk, scan, flags)
+    sent: list[list[tuple[int, int, int]]] = []
+
+    def _send(events):
+        batch = list(events)
+        sent.append(batch)
+        if refuse_after is not None and len(sent) == 1:
+            raise SendInputRefused(
+                "refused", injected=refuse_after, total=len(batch),
+            )
+
+    actuator._send = _send
+    return actuator, sent
+
+
+def test_key_combo_presses_in_order_and_releases_in_reverse():
+    from jarvis.cu.actuate.windows import _KEYEVENTF_KEYUP
+
+    actuator, sent = _combo_actuator()
+    actuator.key_combo(["ctrl", "shift", "t"])
+
+    assert sent[0] == [(0x11, 0, 0), (0x10, 0, 0), (0x54, 0, 0)]
+    assert sent[1] == [
+        (0x54, 0, _KEYEVENTF_KEYUP),
+        (0x10, 0, _KEYEVENTF_KEYUP),
+        (0x11, 0, _KEYEVENTF_KEYUP),
+    ]
+
+
+def test_key_combo_releases_the_keys_a_refused_batch_already_pressed():
+    """SendInput fills a batch element by element and stops at the first
+    rejection. Sending downs and ups as ONE array meant a truncated press
+    raised with Ctrl/Alt/Shift/Win logically HELD for the rest of the session:
+    every later click became a modified click and typing turned into shortcuts,
+    with no way back short of tapping the physical key."""
+    from jarvis.cu.actuate.windows import _KEYEVENTF_KEYUP, SendInputRefused
+
+    actuator, sent = _combo_actuator(refuse_after=2)
+
+    with pytest.raises(SendInputRefused):
+        actuator.key_combo(["ctrl", "shift", "t"])
+
+    assert len(sent) == 2
+    # Exactly the two keys the OS took, released innermost-first.
+    assert sent[1] == [(0x10, 0, _KEYEVENTF_KEYUP), (0x11, 0, _KEYEVENTF_KEYUP)]
+
+
+def test_key_combo_sends_no_stray_keyup_when_nothing_was_injected():
+    """A batch refused outright must not inject a WM_KEYUP for a key that was
+    never pressed — applications that watch raw key transitions react to it."""
+    from jarvis.cu.actuate.windows import SendInputRefused
+
+    actuator, sent = _combo_actuator(refuse_after=0)
+
+    with pytest.raises(SendInputRefused):
+        actuator.key_combo(["ctrl", "c"])
+
+    assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Backend selection on the current host (read-only construction)
+# ---------------------------------------------------------------------------
+
+def test_get_actuator_on_this_host():
+    from jarvis.cu.actuate import get_actuator
+
+    if os.name == "nt":
+        actuator = get_actuator()
+        assert actuator.name == "windows-sendinput"
+        # Read-only: cursor read-back must work on a real desktop session.
+        pos = actuator.cursor_pos()
+        assert pos is None or (isinstance(pos[0], int) and isinstance(pos[1], int))
+    else:
+        # Non-Windows CI can be headless/Wayland — both must surface the
+        # honest refusal instead of a broken backend.
+        try:
+            actuator = get_actuator()
+        except ActuationUnavailable as exc:
+            assert str(exc)
+        else:
+            assert actuator.name.startswith("posix-")
+
+
+class _Clock:
+    """A monotonic clock a test advances (the service's cooldown and grant cache)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def macos_ax(monkeypatch):
+    """The REAL permission service on a REAL port that sits on FakeTCC.
+
+    Builds a darwin world per call. ``sys.platform`` is switched to ``darwin``
+    because the actuator only consults the permission layer on macOS; nothing
+    here ran on a real Mac, FakeTCC models the OS.
+    """
+    from jarvis.platform import permission_service as service_module
+    from jarvis.platform.permission_service import PermissionService
+    from tests.fakes.fake_tcc import FakeTCC, install_port
+
+    created: list[PermissionService] = []
+
+    def build(platform: str = "darwin", **tcc_kwargs):
+        tcc = FakeTCC(**tcc_kwargs)
+        install_port(monkeypatch, tcc.port(platform))
+        clock = _Clock()
+        service = PermissionService(clock=clock, watch_interval_s=3600.0)
+        monkeypatch.setattr(service_module, "_SERVICE", service)
+        created.append(service)
+        if platform == "darwin":
+            monkeypatch.setattr(base_mod.sys, "platform", "darwin")
+        return types.SimpleNamespace(tcc=tcc, service=service, clock=clock)
+
+    yield build
+    for service in created:
+        service._shutdown()
+
+
+def test_macos_first_input_asks_once_and_refuses_with_the_agent_prefix(macos_ax):
+    from tests.fakes.fake_tcc import DialogPolicy
+
+    world = macos_ax(default_policy=DialogPolicy.NEVER_ANSWERED)
+
+    with pytest.raises(base_mod.PermissionNeededError) as first:
+        base_mod.get_actuator()
+
+    # The text for an LLM tool error: the prefix the engine maps, prohibitive.
+    assert str(first.value).startswith("[permission_needed:accessibility] ")
+    assert "must not retry" in str(first.value)
+    assert isinstance(first.value, ActuationUnavailable)  # flat tools keep their handler
+    assert first.value.result.granted is False
+    assert len(world.tcc.requests("accessibility")) == 1
+    assert world.tcc.implicit_prompts() == []
+
+    # A second action inside the cooldown asks nothing more (the dialog is open).
+    world.clock.now += 5
+    with pytest.raises(base_mod.PermissionNeededError):
+        base_mod.get_actuator()
+    assert len(world.tcc.requests("accessibility")) == 1
+
+
+def test_macos_input_never_proceeds_on_a_denied_accessibility_grant(macos_ax):
+    from tests.fakes.fake_tcc import DialogPolicy
+
+    world = macos_ax(default_policy=DialogPolicy.DENY)
+
+    with pytest.raises(base_mod.PermissionNeededError):
+        base_mod.get_actuator()
+    world.clock.now += 5
+    with pytest.raises(base_mod.PermissionNeededError):
+        base_mod.get_actuator()
+
+    # A decision is on file: macOS is not asked again and nothing acts.
+    assert len(world.tcc.requests("accessibility")) == 1
+    assert world.tcc.ignored_requests("accessibility") == []
+
+
+def test_macos_input_with_the_grant_present_asks_nothing(macos_ax):
+    world = macos_ax(granted=("accessibility",))
+
+    base_mod._ensure_macos_input_permission("computer_use")
+
+    assert world.tcc.requests() == []
+    assert world.tcc.implicit_prompts() == []
+
+
+def test_macos_input_is_rechecked_after_revocation(macos_ax):
+    from tests.fakes.fake_tcc import DialogPolicy
+
+    world = macos_ax(granted=("accessibility",), default_policy=DialogPolicy.NEVER_ANSWERED)
+
+    base_mod._ensure_macos_input_permission("computer_use")
+    world.tcc.deny("accessibility")
+    world.clock.now += 5  # the service caches a grant for about a second
+    with pytest.raises(base_mod.PermissionNeededError, match="permission_needed"):
+        base_mod._ensure_macos_input_permission("computer_use")
+
+
+def test_macos_input_names_the_feature_that_wanted_it(monkeypatch):
+    from tests.fakes.fake_permission_service import FakePermissionService
+
+    gate = FakePermissionService(default="needs_settings")
+    monkeypatch.setattr(base_mod, "_permission_gate", lambda: gate)
+    monkeypatch.setattr(base_mod.sys, "platform", "darwin")
+
+    with pytest.raises(base_mod.PermissionNeededError):
+        base_mod.get_actuator()
+
+    (call,) = gate.ensure_calls()
+    assert call.permission.value == "accessibility"  # event_posting is an alias: one ask
+    assert call.feature == "computer_use"
+    assert call.interactive is True
+    assert call.wait_s == 0.0  # a tool body never blocks on a person
+
+
+def test_an_empty_gate_answer_is_not_a_grant(monkeypatch):
+    class _Gate:
+        def ensure_all(self, permissions, **_kwargs):
+            return []
+
+    monkeypatch.setattr(base_mod, "_permission_gate", lambda: _Gate())
+    monkeypatch.setattr(base_mod.sys, "platform", "darwin")
+
+    with pytest.raises(base_mod.PermissionNeededError) as refusal:
+        base_mod._ensure_macos_input_permission("computer_use")
+    assert str(refusal.value).startswith("[permission_needed:accessibility] ")
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_off_macos_the_actuator_never_touches_the_permission_layer(macos_ax, platform):
+    world = macos_ax(platform=platform)
+
+    base_mod._ensure_macos_input_permission("computer_use")
+
+    world.tcc.assert_silent()
+
+
+def test_pynput_key_table_maps_core_vocabulary():
+    keyboard = pytest.importorskip("pynput.keyboard", reason="pynput not installed")
+    from jarvis.cu.actuate.posix import _pynput_key_table
+
+    table = _pynput_key_table(keyboard)
+    for name in (
+        "ctrl", "shift", "alt", "option", "enter", "tab", "esc", "left", "f5",
+    ):
+        assert name in table
+    # Off-Windows "win" must resolve to the platform super/command key.
+    assert "win" in table
+
+
+class _FakePynputKeyboard:
+    """Stand-in for ``pynput.keyboard`` — the ``Key`` members plus ``from_vk``.
+
+    Deliberately NOT ``importorskip``: this asserts a cross-OS vocabulary
+    contract, so it has to run on the machines that break it. pynput is a
+    desktop extra and is absent on this dev box and on headless CI, which is
+    exactly where a macOS/Linux gap would otherwise sail through unchecked.
+    Only the surface ``_pynput_key_table`` touches is modelled.
+    """
+
+    class Key:
+        pass
+
+    class KeyCode:
+        def __init__(self, vk: int) -> None:
+            self.vk = vk
+
+        @classmethod
+        def from_vk(cls, vk: int) -> _FakePynputKeyboard.KeyCode:
+            return cls(vk)
+
+    def __init__(self) -> None:
+        # Every ``Key`` member the real pynput exposes on macOS/X11 and that
+        # `_pynput_key_table` looks up by name.
+        for member in (
+            "ctrl", "shift", "alt", "cmd", "esc", "enter", "tab", "space",
+            "backspace", "delete", "insert", "home", "end", "page_up",
+            "page_down", "left", "up", "right", "down", "caps_lock",
+            *(f"f{i}" for i in range(1, 21)),
+        ):
+            setattr(self.Key, member, f"<Key.{member}>")
+
+
+def test_pynput_key_table_covers_the_shared_key_vocabulary(monkeypatch):
+    """macOS/Linux must address every key the tool boundary accepts.
+
+    ``base._NAMED_KEYS`` is the ONE vocabulary a Computer-Use action is
+    validated against, and the Windows backend maps all of it (VK 0x60-0x6F
+    for the numpad alone). The POSIX table had no entry for a single numpad
+    key, so an action that ran on Windows failed on a Mac with
+    ``ValueError: Unknown key: 'numpad5'`` — the same "offered everywhere,
+    works on one OS" defect the keybind picker had.
+    """
+    from jarvis.cu.actuate.base import _NAMED_KEYS
+    from jarvis.cu.actuate.posix import _pynput_key_table
+
+    # Modifier side-variants are Windows spellings of keys the table already
+    # carries generically; pynput models no separate member for them.
+    windows_only = {"lwin", "rwin", "windows", "menu"}
+
+    for platform in ("darwin", "linux"):
+        monkeypatch.setattr(sys, "platform", platform)
+        table = _pynput_key_table(_FakePynputKeyboard())
+        missing = sorted(_NAMED_KEYS - windows_only - set(table))
+        assert not missing, (
+            f"on {platform}: accepted by the tool boundary, unusable: {missing}"
+        )
+
+
+def test_macos_cursor_readback_uses_quartz_global_coordinates(monkeypatch):
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    quartz = types.SimpleNamespace(
+        CGEventCreate=lambda _source: object(),
+        CGEventGetLocation=lambda _event: types.SimpleNamespace(x=-1440, y=525),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+
+    class _Mouse:
+        @property
+        def position(self):
+            raise AssertionError("pynput getter used")
+
+    actuator = object.__new__(PosixActuator)
+    actuator._mouse = _Mouse()
+    actuator._pyautogui = None
+
+    assert actuator.cursor_pos() == (-1440, 525)
+
+
+def test_macos_pyautogui_fallback_maps_command_and_option(monkeypatch):
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    sent: list[tuple[str, ...]] = []
+    actuator = object.__new__(PosixActuator)
+    actuator._keyboard = None
+    actuator._pyautogui = types.SimpleNamespace(
+        hotkey=lambda *keys: sent.append(keys),
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    actuator.key_combo(["cmd", "option", "left"])
+
+    assert sent == [("command", "alt", "left")]
+
+
+def _fake_quartz_mouse(monkeypatch, *, location=(-1440, 525)):
+    posted: list[types.SimpleNamespace] = []
+
+    def create_mouse(_source, event_type, point, button):
+        return types.SimpleNamespace(
+            event_type=event_type,
+            point=tuple(point),
+            button=button,
+            click_state=None,
+        )
+
+    quartz = types.SimpleNamespace(
+        CGEventCreate=lambda _source: object(),
+        CGEventGetLocation=lambda _event: types.SimpleNamespace(
+            x=location[0], y=location[1],
+        ),
+        CGEventCreateMouseEvent=create_mouse,
+        CGEventSetIntegerValueField=lambda event, _field, value: setattr(
+            event, "click_state", value,
+        ),
+        CGEventPost=lambda _tap, event: posted.append(event),
+        kCGHIDEventTap=1,
+        kCGMouseEventClickState=2,
+        kCGEventMouseMoved=3,
+        kCGEventLeftMouseDown=4,
+        kCGEventLeftMouseUp=5,
+        kCGEventLeftMouseDragged=6,
+        kCGEventRightMouseDown=7,
+        kCGEventRightMouseUp=8,
+        kCGEventRightMouseDragged=9,
+        kCGEventOtherMouseDown=10,
+        kCGEventOtherMouseUp=11,
+        kCGEventOtherMouseDragged=12,
+        kCGMouseButtonLeft=0,
+        kCGMouseButtonRight=1,
+        kCGMouseButtonCenter=2,
+    )
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+    return posted
+
+
+def test_macos_quartz_double_click_uses_exact_global_point_and_click_states(
+    monkeypatch,
+):
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    posted = _fake_quartz_mouse(monkeypatch)
+    actuator = object.__new__(PosixActuator)
+    actuator._mouse = object()
+    actuator._pyautogui = None
+
+    actuator.click_at_cursor(
+        button="left",
+        double=True,
+        expected=(-1440, 525),
+    )
+
+    assert [event.event_type for event in posted] == [4, 5, 4, 5]
+    assert [event.point for event in posted] == [(-1440, 525)] * 4
+    assert [event.click_state for event in posted] == [1, 1, 2, 2]
+
+
+def test_macos_quartz_click_refuses_cursor_changed_after_verification(monkeypatch):
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    posted = _fake_quartz_mouse(monkeypatch, location=(200, 300))
+    actuator = object.__new__(PosixActuator)
+    actuator._mouse = object()
+    actuator._pyautogui = None
+
+    with pytest.raises(RuntimeError, match="cursor moved"):
+        actuator.click_at_cursor(expected=(100, 100))
+
+    assert posted == []
+
+
+def test_macos_quartz_drag_posts_down_dragged_endpoint_and_up(monkeypatch):
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    posted = _fake_quartz_mouse(monkeypatch, location=(10, 20))
+    actuator = object.__new__(PosixActuator)
+    actuator._mouse = object()
+    actuator._pyautogui = None
+
+    actuator.drag_from_cursor(10, 20, 30, 40, duration_s=0.0)
+
+    assert [event.event_type for event in posted] == [4, 6, 6, 5]
+    assert posted[0].point == (10, 20)
+    assert posted[-2].point == (30, 40)
+    assert posted[-1].point == (30, 40)
+
+
+# ---------------------------------------------------------------------------
+# POSIX pyautogui fallback: Unicode typing (deep-dive 2026-07-15 follow-up)
+# ---------------------------------------------------------------------------
+#
+# Linux always runs on the pyautogui fallback (the desktop extras skip pynput
+# there), and pyautogui.typewrite silently DROPS non-ASCII characters — so
+# German umlauts / accents would vanish from typed text. Non-ASCII must route
+# through `xdotool type` (Unicode-capable on X11) and only fall back to
+# pyautogui with a loud warning.
+
+
+def _pyautogui_only_actuator(monkeypatch):
+    """A PosixActuator forced onto the pyautogui fallback with a spy."""
+    from jarvis.cu.actuate import posix as posix_mod
+
+    calls: dict[str, list] = {"typewrite": []}
+
+    class _FakePyautogui:
+        FAILSAFE = True
+
+        @staticmethod
+        def typewrite(text, interval=0.0):
+            calls["typewrite"].append(text)
+
+    actuator = posix_mod.PosixActuator.__new__(posix_mod.PosixActuator)
+    actuator._mouse = None
+    actuator._keyboard = None
+    actuator._keys = {}
+    actuator._buttons = {}
+    actuator._pyautogui = _FakePyautogui()
+    return actuator, calls
+
+
+def test_posix_ascii_typing_stays_on_pyautogui(monkeypatch):
+    actuator, calls = _pyautogui_only_actuator(monkeypatch)
+    xdotool_calls: list[str] = []
+    monkeypatch.setattr(
+        type(actuator), "_xdotool_type",
+        staticmethod(lambda text, *, delay_s: xdotool_calls.append(text) or True),
+    )
+    actuator.type_text("hello world", delay_s=0)
+    assert calls["typewrite"] == ["hello world"]
+    assert xdotool_calls == []
+
+
+def test_posix_unicode_typing_prefers_xdotool(monkeypatch):
+    actuator, calls = _pyautogui_only_actuator(monkeypatch)
+    xdotool_calls: list[str] = []
+    monkeypatch.setattr(
+        type(actuator), "_xdotool_type",
+        staticmethod(lambda text, *, delay_s: xdotool_calls.append(text) or True),
+    )
+    actuator.type_text("Grüße aus München", delay_s=0)  # i18n-allow: umlaut fixture under test
+    assert xdotool_calls == ["Grüße aus München"]  # i18n-allow: umlaut fixture under test
+    assert calls["typewrite"] == []  # never reached pyautogui
+
+
+def test_posix_unicode_typing_falls_back_loudly(monkeypatch, caplog):
+    """xdotool absent/failed -> pyautogui still types, with a WARNING."""
+    import logging
+
+    actuator, calls = _pyautogui_only_actuator(monkeypatch)
+    monkeypatch.setattr(
+        type(actuator), "_xdotool_type",
+        staticmethod(lambda text, *, delay_s: False),
+    )
+    with caplog.at_level(logging.WARNING, logger="jarvis.cu.actuate.posix"):
+        actuator.type_text("Grüße", delay_s=0)  # i18n-allow: umlaut fixture under test
+    assert calls["typewrite"] == ["Grüße"]  # i18n-allow: umlaut fixture under test
+    assert any("non-ASCII" in r.message for r in caplog.records)
+
+
+def test_xdotool_type_refuses_off_linux():
+    """The xdotool path is X11-only; Windows/macOS must return False."""
+    from jarvis.cu.actuate.posix import PosixActuator
+
+    if not sys.platform.startswith("linux"):
+        assert PosixActuator._xdotool_type("text", delay_s=0.02) is False

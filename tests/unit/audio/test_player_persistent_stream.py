@@ -1,0 +1,395 @@
+"""Unit tests for AudioPlayer's persistent OutputStream across play_chunks calls.
+
+Background: 2026-05-16 TTS time-stretch diagnosis (5-agent deep-dive,
+see docs/diagnostics/tts-stretch-2026-05-16.html). The streaming-TTS
+pipeline calls ``play_chunks`` once per sentence. The original
+implementation closed the ``sd.OutputStream`` in a ``finally`` at the
+end of every ``play_chunks`` call, so every sentence boundary triggered
+a fresh stream-open + WASAPI prebuffer + scipy ``resample_poly`` FIR
+ringing — perceived as phonemes being elongated and duplicated
+("Hallo" → "haaaaa lalala oooo").
+
+The fix hoists the stream lifecycle to instance fields
+(``_active_stream``, ``_active_source_rate``, ``_active_device_rate``)
+so it survives between ``play_chunks`` invocations. The stream is only
+torn down when:
+
+  * the next call comes in with a different source sample rate, or
+  * ``stop()`` is called (barge-in).
+
+These tests pin that contract.
+"""
+from __future__ import annotations
+
+import asyncio
+import threading
+from collections.abc import AsyncIterator
+
+import pytest
+
+import jarvis.audio.player as player_module
+from jarvis.audio.player import AudioPlayer
+from jarvis.core.protocols import AudioChunk
+
+
+async def _one_chunk(pcm: bytes, sample_rate: int = 24_000) -> AsyncIterator[AudioChunk]:
+    yield AudioChunk(pcm=pcm, sample_rate=sample_rate, timestamp_ns=0, channels=1)
+
+
+async def _twenty_ms_chunks(count: int) -> AsyncIterator[AudioChunk]:
+    pcm = b"\x01\x00" * 480
+    for _ in range(count):
+        yield AudioChunk(pcm=pcm, sample_rate=24_000, timestamp_ns=0, channels=1)
+
+
+def _make_player(monkeypatch) -> tuple[AudioPlayer, list[str]]:
+    """Build an AudioPlayer with stream IO monkeypatched to record events.
+
+    Returns (player, events). Each call to ``_open_output_stream`` appends
+    ``"open"`` and each ``_close_output_stream`` appends ``"close"`` —
+    the test asserts on the count.
+    """
+    player = AudioPlayer.__new__(AudioPlayer)
+    player._device = None
+    player._sample_rate = 24_000
+    player._channels = 1
+    player._device_logged = True
+    player._bus = None
+    player._play_lock = None
+    player._active_stream = None
+    player._active_source_rate = None
+    player._active_device_rate = None
+    player._device_rate_cache = {}
+    player._device_rate_failed = set()
+
+    events: list[str] = []
+
+    fake_stream_counter = {"n": 0}
+
+    def fake_open(needed_rate: int):
+        fake_stream_counter["n"] += 1
+        events.append(f"open@{needed_rate}#{fake_stream_counter['n']}")
+        # Return a sentinel + the same device rate (no resample needed).
+        return (object(), needed_rate)
+
+    def fake_close(stream):
+        events.append("close")
+
+    def fake_write(stream, arr, src_rate, dev_rate, **_kwargs):
+        events.append(f"write@{src_rate}")
+
+    monkeypatch.setattr(player, "_open_output_stream", fake_open)
+    monkeypatch.setattr(player, "_close_output_stream", fake_close)
+    monkeypatch.setattr(player, "_write_samples", fake_write)
+
+    return player, events
+
+
+@pytest.mark.asyncio
+async def test_two_sequential_play_chunks_share_one_stream(monkeypatch) -> None:
+    """Two ``play_chunks`` calls at the same sample rate must reuse the
+    same OutputStream. Pre-fix behaviour was: open, write, close, open,
+    write, close (2× open). Post-fix: open, write, write (1× open, 0× close
+    until ``stop()`` or rate-change).
+    """
+    player, events = _make_player(monkeypatch)
+
+    pcm = b"\x01\x00" * 4000  # ~333 ms at 24 kHz
+    await player.play_chunks(_one_chunk(pcm))
+    await player.play_chunks(_one_chunk(pcm))
+
+    opens = [e for e in events if e.startswith("open@")]
+    closes = [e for e in events if e == "close"]
+    writes = [e for e in events if e.startswith("write@")]
+
+    assert len(opens) == 1, f"expected 1 stream open across two calls, got {opens}"
+    assert len(closes) == 0, (
+        f"stream must stay open between calls — got {len(closes)} close events"
+    )
+    assert len(writes) == 2, f"both calls should have written, got {writes}"
+    assert player._active_stream is not None, "active stream must survive call return"
+    assert player._active_source_rate == 24_000
+
+
+@pytest.mark.asyncio
+async def test_first_write_uses_low_latency_prefix_then_larger_batches(
+    monkeypatch,
+) -> None:
+    """A 20 ms provider stream reaches PortAudio after 40 ms, not 120 ms."""
+    player, _events = _make_player(monkeypatch)
+    writes: list[int] = []
+
+    def record_write(stream, arr, src_rate, dev_rate, **_kwargs):
+        writes.append(len(arr))
+
+    monkeypatch.setattr(player, "_write_samples", record_write)
+
+    await player.play_chunks(_twenty_ms_chunks(12))
+
+    assert writes[0] == 960  # 40 ms at 24 kHz
+    assert writes[1] == 2_880  # steady-state 120 ms batch
+    assert sum(writes) == 12 * 480
+
+
+@pytest.mark.asyncio
+async def test_sample_rate_change_triggers_reopen(monkeypatch) -> None:
+    """When the source sample rate changes between two calls (e.g. Gemini
+    24 kHz → SAPI5 22 kHz fallback), the old stream must be closed and a
+    new one opened at the new rate.
+    """
+    player, events = _make_player(monkeypatch)
+
+    pcm_24k = b"\x01\x00" * 4000
+    pcm_22k = b"\x02\x00" * 4000
+
+    await player.play_chunks(_one_chunk(pcm_24k, sample_rate=24_000))
+    await player.play_chunks(_one_chunk(pcm_22k, sample_rate=22_050))
+
+    opens = [e for e in events if e.startswith("open@")]
+    closes = [e for e in events if e == "close"]
+
+    assert len(opens) == 2, f"rate change should reopen — got opens={opens}"
+    assert len(closes) == 1, (
+        f"old stream should be closed on rate change — got closes={len(closes)}"
+    )
+    assert player._active_source_rate == 22_050
+
+
+@pytest.mark.asyncio
+async def test_stop_aborts_active_stream(monkeypatch) -> None:
+    """``stop()`` must abort the persistent stream — the old implementation
+    only called ``sd.stop()`` which is a no-op for ``sd.OutputStream``
+    instances opened via ``play_chunks``. Barge-in was therefore silent.
+    """
+    player, events = _make_player(monkeypatch)
+
+    abort_calls = {"n": 0}
+    close_calls = {"n": 0}
+
+    class FakeStream:
+        def abort(self) -> None:
+            abort_calls["n"] += 1
+
+        def close(self) -> None:
+            close_calls["n"] += 1
+
+    # Override fake_open to yield a stream whose .abort() and .close() we count.
+    fake_stream_counter = {"n": 0}
+
+    def fake_open_real(needed_rate: int):
+        fake_stream_counter["n"] += 1
+        events.append(f"open@{needed_rate}#{fake_stream_counter['n']}")
+        return (FakeStream(), needed_rate)
+
+    monkeypatch.setattr(player, "_open_output_stream", fake_open_real)
+
+    pcm = b"\x01\x00" * 4000
+    await player.play_chunks(_one_chunk(pcm))
+    assert player._active_stream is not None, "stream should be open before stop()"
+
+    player.stop()
+
+    assert abort_calls["n"] == 1, "stop() must call stream.abort() exactly once"
+    assert close_calls["n"] == 1, "stop() must also call stream.close()"
+    assert player._active_stream is None, "active fields must reset after stop()"
+    assert player._active_source_rate is None
+    assert player._active_device_rate is None
+
+
+@pytest.mark.asyncio
+async def test_stop_is_idempotent_when_no_stream(monkeypatch) -> None:
+    """Calling ``stop()`` with no active stream must not raise — it's
+    legitimate to call stop() defensively even when nothing is playing.
+    """
+    player, _ = _make_player(monkeypatch)
+    assert player._active_stream is None
+    player.stop()  # must not raise
+    player.stop()  # idempotent
+
+
+def test_output_latency_reports_the_active_stream_value(monkeypatch) -> None:
+    """Half-duplex callers can cover a device buffer longer than 500 ms."""
+
+    player, _ = _make_player(monkeypatch)
+
+    class _HighLatencyStream:
+        latency = 0.869
+
+    player._active_stream = _HighLatencyStream()
+
+    assert player.output_latency_s == pytest.approx(0.869)
+
+
+@pytest.mark.asyncio
+async def test_stop_absorbs_expected_portaudio_error_from_inflight_write(
+    monkeypatch,
+) -> None:
+    """A native write aborted by this playback generation is not a failure."""
+
+    player, _ = _make_player(monkeypatch)
+    monkeypatch.setattr(
+        player,
+        "_write_samples",
+        AudioPlayer._write_samples.__get__(player, AudioPlayer),
+    )
+    write_entered = threading.Event()
+    release_write = threading.Event()
+
+    class _AbortRaceStream:
+        latency = 0.869
+
+        def write(self, _samples) -> bool:
+            write_entered.set()
+            assert release_write.wait(timeout=1.0)
+            raise player_module._PortAudioError(
+                "Internal PortAudio error",
+                -9986,
+            )
+
+        def abort(self) -> None:
+            release_write.set()
+
+        def close(self) -> None:
+            return None
+
+    stream = _AbortRaceStream()
+    monkeypatch.setattr(
+        player,
+        "_open_output_stream",
+        lambda needed_rate: (stream, needed_rate),
+    )
+    if player_module.sd is not None:
+        monkeypatch.setattr(player_module.sd, "stop", lambda: None)
+
+    play_task = asyncio.create_task(
+        player.play_chunks(_one_chunk(b"\x01\x00" * 4_000))
+    )
+    assert await asyncio.to_thread(write_entered.wait, 1.0)
+
+    player.stop()
+
+    assert await asyncio.wait_for(play_task, timeout=1.0) is False
+
+
+@pytest.mark.asyncio
+async def test_live_portaudio_write_error_still_propagates(monkeypatch) -> None:
+    """Cancellation handling must not hide an active device failure."""
+
+    player, _ = _make_player(monkeypatch)
+    monkeypatch.setattr(player_module, "_ranked_output_device_indices", lambda *_: [])
+    monkeypatch.setattr(
+        player,
+        "_write_samples",
+        AudioPlayer._write_samples.__get__(player, AudioPlayer),
+    )
+
+    class _FailingStream:
+        latency = 0.2
+
+        def write(self, _samples) -> bool:
+            raise player_module._PortAudioError("Output device failed", -9986)
+
+        def abort(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    stream = _FailingStream()
+    monkeypatch.setattr(
+        player,
+        "_open_output_stream",
+        lambda needed_rate: (stream, needed_rate),
+    )
+    if player_module.sd is not None:
+        monkeypatch.setattr(player_module.sd, "stop", lambda: None)
+
+    with pytest.raises(player_module._PortAudioError, match="Output device failed"):
+        await player.play_chunks(_one_chunk(b"\x01\x00" * 4_000))
+
+    player.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_rejects_stream_that_finishes_opening_after_cancel(
+    monkeypatch,
+) -> None:
+    """A worker-thread stream open cannot resurrect stopped playback."""
+
+    player, events = _make_player(monkeypatch)
+    open_entered = threading.Event()
+    release_open = threading.Event()
+
+    def delayed_open(needed_rate: int):
+        events.append(f"open@{needed_rate}")
+        open_entered.set()
+        assert release_open.wait(timeout=1.0)
+        return object(), needed_rate
+
+    monkeypatch.setattr(player, "_open_output_stream", delayed_open)
+    if player_module.sd is not None:
+        monkeypatch.setattr(player_module.sd, "stop", lambda: None)
+
+    pcm = b"\x01\x00" * 4000
+    play_task = asyncio.create_task(player.play_chunks(_one_chunk(pcm)))
+    assert await asyncio.to_thread(open_entered.wait, 1.0)
+
+    player.stop()
+    release_open.set()
+
+    assert await asyncio.wait_for(play_task, timeout=1.0) is False
+    assert [event for event in events if event == "close"] == ["close"]
+    assert [event for event in events if event.startswith("write@")] == []
+    assert player._active_stream is None
+
+
+@pytest.mark.asyncio
+async def test_multi_sentence_brain_response_keeps_one_stream(monkeypatch) -> None:
+    """Simulates the streaming-TTS pipeline: 5 sentences in one brain
+    response = 5 sequential ``play_chunks`` calls at the same rate.
+    Must result in exactly 1 stream open, 5 writes, 0 closes — the entire
+    point of the persistent-stream fix.
+    """
+    player, events = _make_player(monkeypatch)
+
+    pcm = b"\x01\x00" * 4000
+    for _ in range(5):
+        await player.play_chunks(_one_chunk(pcm))
+
+    opens = [e for e in events if e.startswith("open@")]
+    closes = [e for e in events if e == "close"]
+    writes = [e for e in events if e.startswith("write@")]
+
+    assert len(opens) == 1, (
+        f"5-sentence response should open ONE stream, got {len(opens)}: {opens}"
+    )
+    assert len(closes) == 0, (
+        f"no closes until stop() or rate-change — got {len(closes)} closes"
+    )
+    assert len(writes) == 5, f"all 5 sentences must reach the writer, got {writes}"
+
+
+class _LatencyStream:
+    latency = 0.4
+
+
+@pytest.mark.asyncio
+async def test_one_shot_blob_is_followed_by_a_buffer_deep_silent_tail(monkeypatch) -> None:
+    """WASAPI's blocking stop() discards the device buffer instead of draining it.
+
+    A cue shorter than the buffer was accepted instantly and thrown away
+    unheard, so ``play_pcm`` must write trailing silence one buffer deep.
+    """
+    player, _events = _make_player(monkeypatch)
+    written: list[int] = []
+    monkeypatch.setattr(
+        player, "_open_output_stream", lambda rate: (_LatencyStream(), rate)
+    )
+    monkeypatch.setattr(
+        player,
+        "_write_samples",
+        lambda stream, arr, src, dev, **_k: written.append(int(arr.size)),
+    )
+    blob_samples = 2_400  # 100 ms at 24 kHz, well under the 0.4 s buffer
+    await player.play_pcm(b"\x10\x00" * blob_samples, sample_rate=24_000)
+    assert written == [blob_samples + int(24_000 * 0.45)]

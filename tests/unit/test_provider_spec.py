@@ -1,0 +1,247 @@
+"""Integrity tests for the declarative ProviderSpec list.
+
+Important: every secret_key referenced in PROVIDERS must also exist in the
+setup wizard's SECRETS set — otherwise the API endpoint
+POST /api/secrets/{key} falls into the whitelist hole.
+"""
+from __future__ import annotations
+
+from urllib.parse import urlsplit
+
+from jarvis.setup.wizard import SECRETS
+from jarvis.ui.web.provider_spec import (
+    PROVIDERS,
+    AltCredential,
+    ProviderSpec,
+    all_secret_keys,
+    get_spec,
+    provider_billing,
+)
+
+
+def test_provider_ids_are_unique() -> None:
+    ids = [spec.id for spec in PROVIDERS]
+    assert len(ids) == len(set(ids)), f"Duplikate in PROVIDERS: {ids}"
+
+
+def test_every_secret_key_exists_in_wizard() -> None:
+    wizard_keys = {spec.key for spec in SECRETS}
+    for spec in PROVIDERS:
+        for key in spec.secret_keys:
+            assert key in wizard_keys, (
+                f"Provider '{spec.id}' references secret_key '{key}', "
+                f"which is not declared in wizard.SECRETS"
+            )
+
+
+def test_only_subscription_cli_providers_use_cli_login() -> None:
+    """A login CLI belongs to the subscription/login providers only. Codex logs
+    in via ``codex login``; Antigravity drives the bare ``agy`` binary (it has
+    no ``login`` subcommand); the Claude subscription signs in with the
+    ``/login`` slash command of the ``claude`` CLI. Every pure API-key / local
+    provider has none."""
+    for spec in PROVIDERS:
+        assert spec.auth_mode != "subscription_cli"  # never the legacy literal
+        if spec.id in {"codex", "codex-subscription-realtime"}:
+            assert spec.auth_mode == "codex"
+            assert spec.login_cli == ("codex", "login")
+        elif spec.id == "antigravity":
+            assert spec.auth_mode == "antigravity"
+            assert spec.login_cli == ("agy",)
+        elif spec.id == "claude-cli":
+            assert spec.auth_mode == "claude_cli"
+            assert spec.login_cli == ("claude", "/login")
+        elif spec.id == "grok-build":
+            assert spec.auth_mode == "grok_build"
+            assert spec.login_cli == ("grok", "login")
+            assert spec.secret_keys == ()
+            assert provider_billing(spec) == "subscription"
+            assert spec.brain_switchable is False
+        else:
+            assert spec.login_cli is None, f"{spec.id}: unexpected login_cli"
+
+
+def test_api_key_specs_have_dashboard_url() -> None:
+    for spec in PROVIDERS:
+        if spec.auth_mode == "api_key":
+            assert spec.dashboard_url, f"{spec.id}: api_key braucht dashboard_url"
+            assert spec.secret_keys, f"{spec.id}: api_key braucht mindestens einen secret_key"
+
+
+def test_codex_spec_is_separate_from_openai_api_key() -> None:
+    codex = get_spec("codex")
+    openai = get_spec("openai")
+    assert codex is not None
+    assert openai is not None
+    assert codex.auth_mode == "codex"
+    assert codex.secret_keys == ("codex_openai_api_key",)
+    assert openai.secret_keys == ("openai_api_key",)
+
+
+def test_none_specs_never_require_credentials() -> None:
+    """auth_mode "none" bills as "local" and must never DEMAND a credential.
+    OPTIONAL secret slots are allowed (local-openai's vLLM --api-key case) —
+    is_credential_present reports none-cards as configured either way."""
+    from jarvis.ui.web.provider_spec import provider_billing
+
+    for spec in PROVIDERS:
+        if spec.auth_mode == "none":
+            assert provider_billing(spec) == "local"
+            assert spec.login_cli is None
+
+
+def test_get_spec_lookup() -> None:
+    assert get_spec("openai") is not None
+    assert get_spec("claude-api") is not None
+    assert get_spec("does-not-exist") is None
+
+
+def test_codex_subscription_realtime_is_removed_from_provider_catalog() -> None:
+    """Removed 2026-08-10 with its adapter; the stable subscription voice
+    runs as a classic-pipeline profile, not a realtime card."""
+    assert "codex-subscription-realtime" not in {spec.id for spec in PROVIDERS}
+
+
+def test_groq_stt_is_last_without_a_caution_badge() -> None:
+    """Groq remains selectable and last; ordering de-emphasizes it, the
+    explicit "Not recommended" badge was retired (2026-08-23)."""
+    stt_specs = [spec for spec in PROVIDERS if spec.tier == "stt"]
+    assert stt_specs[-1].id == "groq-api"
+    assert stt_specs[-1].recommended is False
+    assert stt_specs[-1].caution is None
+
+
+def test_all_secret_keys_collects_unique_set() -> None:
+    keys = all_secret_keys()
+    assert "anthropic_api_key" in keys
+    assert "gemini_api_key" in keys
+    assert "openai_api_key" in keys
+    # ElevenLabs is a first-class, selectable TTS provider (see the elevenlabs
+    # ProviderSpec with tier="tts"). It has a mature plugin
+    # (jarvis/plugins/tts/elevenlabs_tts.py), a factory branch, cross-family
+    # fallback wiring, TOML defaults, and is named as a cloud-TTS default in
+    # docs/PHILOSOPHY.md — so its credential slot MUST be surfaced. (This
+    # reverses an earlier "dead code" snapshot from before it was wired into
+    # the API-Keys section.)
+    assert "elevenlabs_api_key" in keys
+
+
+def test_no_hardcoded_model_names_in_specs() -> None:
+    """Defensive smoke check: model-name indicators must NOT appear in a spec."""
+    forbidden_substrings = [
+        "claude-3", "claude-4", "claude-opus", "claude-haiku", "claude-sonnet",
+        "gpt-4", "gpt-5", "o1-", "o3-",
+        "gemini-1", "gemini-2", "gemini-3",
+    ]
+    for spec in PROVIDERS:
+        haystack = (spec.id + spec.label).lower()
+        for needle in forbidden_substrings:
+            assert needle not in haystack, (
+                f"Provider '{spec.id}' contains model name '{needle}' — forbidden by the spec"
+            )
+
+
+def test_provider_spec_is_frozen_dataclass() -> None:
+    spec = PROVIDERS[0]
+    assert isinstance(spec, ProviderSpec)
+    try:
+        spec.id = "mutated"  # type: ignore[misc]
+    except Exception:
+        return
+    raise AssertionError("ProviderSpec should be frozen")
+
+
+# ── New: per-provider credential help + billing classification ───────────────
+
+
+def test_every_provider_has_credential_help() -> None:
+    """Each provider explains, in plain English, what credential it needs and
+    what it is for — the user-facing 'which key / subscription, and what for'."""
+    for spec in PROVIDERS:
+        assert spec.credential_help, f"{spec.id}: missing credential_help text"
+        assert spec.credential_help.strip() == spec.credential_help
+
+
+def test_provider_billing_is_derived_from_auth_mode() -> None:
+    """Billing is capability-driven, never branched on a provider name
+    (multi-provider mandate). API-key → pay-per-token; a subscription-login
+    provider that ALSO accepts an API key → subscription_or_api; one that does
+    not → subscription; local → no credential. Both Codex and Antigravity now
+    accept an API key (the ChatGPT/Google subscription OR a per-token key), so
+    both are subscription_or_api."""
+    by_id = {spec.id: spec for spec in PROVIDERS}
+    assert provider_billing(by_id["claude-api"]) == "api"
+    assert provider_billing(by_id["gemini"]) == "api"
+    assert provider_billing(by_id["antigravity"]) == "subscription_or_api"
+    assert provider_billing(by_id["codex"]) == "subscription_or_api"
+    # No auth_mode="none" provider ships today — the local "faster-whisper" STT
+    # was removed as a user-selectable provider in v1.0.1 — but the capability
+    # mapping still resolves "none" → "local" for any future local provider.
+    _local = ProviderSpec(
+        id="synthetic-local",
+        label="Synthetic Local",
+        tier="stt",
+        auth_mode="none",
+        secret_keys=(),
+        dashboard_url=None,
+    )
+    assert provider_billing(_local) == "local"
+
+
+def test_antigravity_accepts_api_key_billing() -> None:
+    """Antigravity mirrors Codex: it bills over the Google subscription OAuth OR
+    a Gemini API key (the Google Cloud credential), so it carries a secret key."""
+    antigravity = get_spec("antigravity")
+    assert antigravity is not None
+    assert antigravity.auth_mode == "antigravity"
+    assert "gemini_api_key" in antigravity.secret_keys
+    assert provider_billing(antigravity) == "subscription_or_api"
+
+
+def test_billing_covers_every_provider() -> None:
+    allowed = {"api", "subscription", "subscription_or_api", "local"}
+    for spec in PROVIDERS:
+        assert provider_billing(spec) in allowed, f"{spec.id}: unknown billing"
+
+
+def test_gemini_offers_both_aistudio_and_vertex() -> None:
+    """The Gemini brain + TTS must surface BOTH credential paths so a user does
+    not top up an AI-Studio key while Jarvis bills a Vertex service account
+    (the 2026-06-22 forensic). Primary path = AI Studio (API key); the
+    alt_credential = Vertex AI (service account, separate billing)."""
+    for pid in ("gemini", "gemini-flash-tts"):
+        spec = get_spec(pid)
+        assert spec is not None, pid
+        # Primary path is the AI-Studio API key.
+        assert spec.auth_mode == "api_key"
+        assert urlsplit(spec.dashboard_url).hostname == "aistudio.google.com"
+        # The Vertex path is offered as an explicit alternative.
+        assert spec.alt_credential is not None, f"{pid}: missing Vertex alt path"
+        alt = spec.alt_credential
+        assert "vertex" in alt.label.lower()
+        assert alt.billing == "api"
+        assert alt.credential_help
+        host = urlsplit(alt.dashboard_url).hostname or ""
+        assert host == "cloud.google.com" or host.endswith(".cloud.google.com")
+
+
+def test_other_families_have_no_google_project_credential_path() -> None:
+    """The Google family offers key and Cloud project paths across surfaces."""
+    for spec in PROVIDERS:
+        if spec.id in (
+            "gemini", "gemini-api", "gemini-flash-tts", "gemini-live",
+            "vertex", "vertex-stt", "vertex-tts", "vertex-live",
+        ):
+            continue
+        assert spec.alt_credential is None, f"{spec.id}: unexpected alt_credential"
+
+
+def test_alt_credential_is_frozen() -> None:
+    alt = AltCredential(
+        label="x", billing="api", credential_help="y", dashboard_url=None,
+    )
+    try:
+        alt.label = "mutated"  # type: ignore[misc]
+    except Exception:
+        return
+    raise AssertionError("AltCredential should be frozen")

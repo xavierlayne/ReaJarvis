@@ -1,0 +1,507 @@
+# Secrets (never commit; stored in the system credential manager)
+.env
+.env.local
+.env.*.local
+# Local plaintext API-key snapshot — developer convenience file, must stay local
+apikeys-snapshot.md
+*.pem
+# Exception: supply-chain PUBLIC keys live in install/keys/ and MUST be
+# committed plain so the verifier can pin them. Encrypted *.enc private
+# keys are also committed (passphrase lives in GH Actions secrets / pw mgr).
+!install/keys/*.pub.pem
+!install/keys/*.pub
+!install/keys/*.enc
+
+# Boot-timing harness artifacts (scripts/measure_boot.py) — throwaway, local
+.boot-bench/
+boot-latest.json
+boot-baseline.json
+
+# Config-Drift-Guard temp backups (never commit)
+jarvis.toml.tmp
+*.toml.tmp
+*.key
+secrets/
+credentials/
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+dist/
+build/
+# EXCEPTION: the built web UI ships IN the repo — a fresh clone/installer must
+# have a servable frontend without a Node toolchain (public installs relied on
+# this on every v1.0.x release). Rebuilt + committed as part of each release.
+!jarvis/ui/web/dist/
+!jarvis/ui/web/dist/**
+jarvis/ui/web/.frontend-*
+
+# Installer-managed-install marker: written by install/installer.py at install
+# time to opt a checkout into in-app self-update. Must NEVER be committed — a
+# manual clone or a dev tree must not look like a managed install (else the
+# in-app updater could git-reset --hard it). See jarvis/ui/web/update_routes.py.
+.jarvis-managed-install
+# Atomic in-app update handoff/result files. They are local lifecycle state and
+# must never make a source checkout look like an update is pending.
+.jarvis-update-pending.json
+.jarvis-update-pending.json.tmp
+.jarvis-update-result.json
+.jarvis-update-result.json.tmp
+
+# Jarvis Runtime-Daten (nie committen)
+data/*
+data/**/
+# The dev instance's runtime data (jarvis/core/instance.py) — same rule as data/.
+data-dev/
+*.db
+*.sqlite
+*.sqlite3
+
+# Wake-Word Custom-Models + Whisper-Cache
+*.ppn
+*.onnx
+models/
+# ...but the Silero VAD model we deliberately BUNDLE and ship in-repo is tracked
+# (jarvis/audio/vad.py loads it): it must ship in the base wheel so end-of-speech
+# detection works out-of-the-box on a fresh install — it is NOT an ignored
+# user/cache model. Scoped to the exact file so nearby *.onnx (user-trained custom
+# wake models, Whisper cache) stay ignored. The word-agnostic openWakeWord feature
+# backbones under jarvis/assets/wakeword/ are likewise deliberately tracked — see
+# their own whitelist note below.
+!jarvis/assets/vad/silero_vad.onnx
+# The word-agnostic openWakeWord feature backbones are deliberately BUNDLED and
+# shipped in-repo (jarvis/assets/__init__.py loads them for user-trained custom
+# wake models). Scoped to the exact files so nearby *.onnx (user-trained custom
+# wake models, Whisper cache) stay ignored. No branded hey_* model is tracked.
+!jarvis/assets/wakeword/melspectrogram.onnx
+!jarvis/assets/wakeword/embedding_model.onnx
+
+# Audio-Blobs + Flight-Recorder-Traces
+blobs/
+traces/
+logs/
+
+# Stray screenshots & test artefacts (UI captures, GitHub shots, debug frames,
+# Browser-MCP screenshots, smoke-test backend logs). Root-level images are
+# throwaway scratch and must never be committed. Load-bearing images live under
+# jarvis/ui/web/frontend/public, jarvis/ui/web/dist, assets/icons, the mascot
+# art, and OS-Level/.../mascot-fallback.png — never at the repo root.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.bmp
+/*.mp4
+/*.mov
+# Screen recordings. OBS-style capture writes multi-GB .avi next to whatever
+# directory it was pointed at; a single one of these outweighs the whole repo.
+/*.avi
+/*.webm
+/*.mkv
+/*.log
+# OS screenshot dumps anywhere in the tree (Windows / macOS naming). Extension-free
+# so the .jpg and .mp4 variants of the same dialog are caught too.
+Screenshot *
+Bildschirmfoto *
+Screen Shot *
+# Screenshot-tool captures named "<foreground-process>_<random>" — e.g.
+# pythonw_AbCd123456.png. The name records which window was in front when the shot
+# was taken, NOT which tool wrote the file: ShareX itself saves to its own folder.
+# These land in the tree because a capture handed to a coding agent is copied into
+# the working directory under its original name, so they appear in subdirectories
+# too and the root-only "/*.png" rules above miss them.
+#
+# Verified 2026-08-28: two such captures (jarvis/ui/web/frontend/pythonw_*.png)
+# did reach the public history this way before the first of these rules existed.
+# Written without an extension so the .gif and .mp4 variants are covered as well;
+# checked against `git ls-files` — no tracked path starts with any of these.
+pythonw_*
+ShareX_*
+chrome_*
+Cursor_*
+ChatGPT_*
+Discord_*
+Hermes_*
+explorer_*
+PersonalJarvis_*
+PersonalJarvisDev_*
+bridgespace-tauri_*
+# Phone photos synced in from a camera roll (Google Pixel naming).
+PXL_*
+# Images pasted into a coding agent's prompt: the harness writes them to the
+# working directory. A Stop hook removes the .png ones immediately; this catches
+# the .gif and .webp variants it misses. Extension-scoped so the tracked
+# clipboard-list-*.js icon bundle is not swept up with them.
+clipboard-*.png
+clipboard-*.gif
+clipboard-*.jpg
+clipboard-*.webp
+clipboard-*.mp4
+# Generated images downloaded from a chat assistant.
+ChatGPT Image *
+
+# Canonical home for development/verification screenshots (see AGENTS.md).
+# The app's boot sweep consolidates stray root captures here and auto-prunes
+# them after 10 days (jarvis/core/screenshots.py). Folder is created on boot.
+/screenshots/
+
+# Sub-Agent-Sandbox-Outputs (Research-/Demo-Drops, kein Projekt-Code)
+examples/
+github-research/
+# The marketing website is its OWN git repo living in personaljarvisweb/, so one
+# folder holds both projects. Ignored on purpose: without this line git
+# records it as a gitlink and leaks the site's path and commit ids into
+# this public repo. Never remove it; never stage anything under it.
+personaljarvisweb/
+# Phase-6 worker-isolation parent (worktrees + per-mission Jarvis-Agent state).
+# Each mission gets a fresh `git worktree` under here; never commit.
+jarvis-agent-outputs/
+# Legacy name kept so any existing sub-agents-outputs/ stays ignored (2026-06-29 rename).
+sub-agents-outputs/
+
+# Generated test inventory (refreshed by tooling, never reviewed by hand).
+all-tests.list
+
+# Wiki auto-backups (rolling tarballs from the backup scheduler; never reviewed).
+wiki/wiki-backups/
+
+# Excalidraw export scratch + diagram-capture screenshots under scripts/.
+scripts/_*.png
+scripts/_*.json
+scripts/_flow_in_browser.png
+jarvis/assets/browser/wheels/
+jarvis/assets/browser/requirements-bundled.lock
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+
+# Runtime artifacts (Claude Code + Playwright MCP)
+.claude/*
+# Subagents, slash commands and skills are team knowledge and are versioned
+!.claude/agents/
+!.claude/commands/
+!.claude/skills/
+# ...except the security-github skill: RETIRED 2026-08-05. It orchestrated the
+# depersonalized public-release push — a staging build, a parallel clone, a
+# frontend build, and a sub-agent that read every tracked file hunting for
+# personal data, on every push. A push is `git push` now (AGENTS.md §2). The
+# ignore rules stay as a tombstone so a stray local copy can never be
+# versioned; do not re-add the skill without the maintainer's say-so.
+.claude/skills/security-github/
+# .agents/ is the tool-neutral twin of .claude/ (synced by
+# scripts/ci/sync_agents_dir.py) — same include/exclude shape, so the retired
+# security-github skill can never leak in via the mirror either.
+.agents/*
+!.agents/README.md
+!.agents/agents/
+!.agents/commands/
+!.agents/skills/
+.agents/skills/security-github/
+.playwright-mcp/
+
+# TypeScript incremental build cache (regenerated on every `tsc --build`)
+*.tsbuildinfo
+
+# Standalone sibling project — versioned in its own repo
+jarvis-promo-video/
+
+# Obsidian transient workspace state (plugin configs ARE committed)
+wiki/obsidian-vault/.obsidian/workspace.json
+wiki/obsidian-vault/.obsidian/workspace-mobile.json
+wiki/obsidian-vault/.obsidian/workspaces.json
+wiki/obsidian-vault/.trash/
+
+# Generated worktree inventory (ephemeral)
+git-worktree-status.csv
+
+# ============================================================
+# Open-source separation (Wave 0, 2026-05-30): personal state stays
+# local, only shared code + an empty seed scaffold ship. The files below
+# were `git rm --cached`-ed (kept on disk, removed from tracking). See
+# Downloads/Open-Source-Privacy-Separation.md for the full plan.
+# ============================================================
+
+# Personal config instance — ship jarvis.toml.example instead. Jarvis already
+# boots with NO jarvis.toml (pure Pydantic defaults, core/config.py).
+/jarvis.toml
+# Per-user MCP server config — ship mcp.json.example instead.
+/mcp.json
+
+# Personal knowledge-vault CONTENT. The vault self-creates on first run
+# (jarvis/memory/wiki/integration.py seeds schema.md); only the empty skeleton
+# (schema.md, README.md, 00-index/, 99-templates/) ships as a seed.
+wiki/obsidian-vault/sessions/
+wiki/obsidian-vault/_archive/
+wiki/obsidian-vault/entities/
+wiki/obsidian-vault/concepts/
+wiki/obsidian-vault/projects/
+wiki/obsidian-vault/log.md
+# Runtime-regenerated vault self-documentation page (live stats + person links).
+wiki/obsidian-vault/memory.md
+
+# Local CI repro artifact (JUnit XML), regenerated per run — never committed.
+ci-repro-report.xml
+# Personal Obsidian UI state (theme + plugin-config defaults stay tracked as a seed).
+wiki/obsidian-vault/.obsidian/graph.json
+wiki/obsidian-vault/.obsidian/hotkeys.json
+
+# Dev scratch & personal incident reports (pytest dumps, recovery notes).
+/_*.txt
+/claude-progress.txt
+/macicon-candidates.json
+/RECOVERY.md
+/recovery-report.md
+/restore-report.md
+# One-off scratch experiments at the repo root (cookie-transplant utilities,
+# promo-video brand drops, ad-hoc probes). Anything named `scratch_*` /
+# `scratch/` is personal throwaway work and must never be committed.
+/scratch_*
+/scratch/
+
+# Misc per-user state the code may write into the repo tree.
+# Anchored to the repo root so it does NOT also match the tracked `jarvis/state/`
+# package (an unanchored `state/` silently dropped it from a fresh-clone release).
+/state/
+
+# TypeScript incremental build cache — regenerated every build
+*.tsbuildinfo
+
+# Backstage runtime/scratch dirs: bridge attachments + tmp, swarm scratch, and
+# the ad-hoc `verify_*.py` probes that land here. Never part of a release.
+/.bridge/
+/.bridgespace/
+# Pre-release dist backups (a snapshot copy of jarvis/ui/web/dist taken before a
+# UI rework). The live build output is dist/, not these dated backup siblings.
+jarvis/ui/web/dist._predockpolish/
+# Computer-Use restore points (plain no-git file snapshots taken before risky CU
+# work, with a restore script). Local safety nets, never committed.
+/cu-restore-points/
+
+# Scratch analysis + video render output (local-only working material).
+# Historical video sources are already tracked; the root rule below prevents
+# newly created private production files from entering future commits.
+.tmp_video_analysis/
+video/public/*
+# The tracked Voice composition depends on these reproducible source assets.
+!video/public/vo-voice/
+video/public/vo-voice/*
+!video/public/vo-voice/*.mp3
+!video/public/shot-voice-ptt-crop.png
+!video/public/shot-voice-handsfree-crop.png
+!video/public/shot-voice-polish-crop.png
+!video/public/shot-voice-translate-crop.png
+!video/public/shot-voice-stats-crop.png
+video/out/
+
+# Vertical social promo reel — a self-contained Remotion project kept entirely
+# local by maintainer request: marketing material, not something a downloader
+# of the repo should have to carry or watch. Source AND renders stay out.
+video/reel/
+
+# ============================================================
+# Local working-state, scratch notes & config backups (2026-06-29 sweep).
+# Captured during a local-only commit pass — these never belong in history.
+# ============================================================
+
+# Atomic-config-writer / manual backups of the personal jarvis.toml & friends.
+# May carry provider picks or personal config — keep strictly local.
+*.bak
+/.backups/
+
+# Raw audio capture blobs.
+*.pcm
+
+# Throwaway scratch dir (thumbnail / contact-sheet analysis).
+/tmp/
+
+# Stray Remotion capture dropped into the tracked video/ source project
+# (render output is already covered by video/out/ + video/public/ above).
+video/*.png
+
+# Misplaced root-level duplicate of jarvis/voice/action_phrases.py.
+/action_phrases.py
+# Empty stray file (accidental version-string artifact).
+/0.26.0
+
+# Personal progress / audit / handoff notes kept loose at the repo root. Real
+# docs live under docs/; these root notes are local scratch only.
+/STARTUP_*.md
+/computer-use-*.md
+/progress.md
+/progress-*.md
+/progress_*.md
+/jarvis-agents-rename-handoff.md
+/jarvis-antwortverhalten-fixes.md
+/voice-assistant-system-prompt.md
+# Editor-generated untitled notes (personal scratch) — a Google Docs export keeps
+# the placeholder title as its filename. Matched in EVERY directory, not just the
+# root: five of these reached the public history, and four of the paths that
+# carried them were subdirectories (Aufgaben/, ReviewSubagent/, SubAgentenSt/,
+# "Jarvis  Long-Term Memory/"), which a root-anchored rule cannot see.
+# i18n-allow: literal filename a German-locale editor generates
+Unbenanntes Dokument*
+Untitled document*
+
+# Codex-session visualization artifacts (generated HTML analysis pages; the
+# tracked .codex/ agent definitions stay versioned).
+/.codex/visualizations/
+
+# Desktop cold-boot timing snapshots (regenerated by the boot harness).
+/desktop-boot-*.json
+
+# Personal voice-session transcripts (auto-generated by the running app; never ship)
+/voice-session-*.txt
+/voice-session-*.json
+/voice-session-*.md
+
+# Ad-hoc generated deliverables (presentations, exports) — never ship
+/outputs/
+/test_output.txt
+
+# --- Privacy: captures of the maintainer's LIVE personal vault ---------------
+# These screenshots/frames show real vault pages (relocation planning, finances,
+# health notes, and named third parties). The distribution denylist has always
+# withheld them; they are untracked here so they cannot be re-added by accident.
+# Regenerate any needed capture against a STAGED demo vault, never the live one.
+/assets/screenshots/view-wiki.png
+/video/qa-wiki/
+
+# Internal trademark/brand risk assessment. A self-authored record of known,
+# deferred IP risk — keep it private; the public posture is TRADEMARK.md.
+/docs/legal/trademark-brand-audit-*.html
+
+# ============================================================
+# Pre-1.6.0 release sweep: local tool caches, audit material, and runtime
+# write paths that were reachable from inside the repo tree.
+# ============================================================
+
+# Cloudflare Wrangler cache — stores the signed-in account name (a real email
+# address) and account id in plaintext. Never part of the product.
+/.wrangler/
+
+# Repository audit / deep-dive material. These enumerate unfixed defects with
+# file:line precision and quote local absolute paths — a private working
+# record, not a deliverable. Findings belong in a private tracker.
+/reports/
+/REPOSITORY_DEEP_DIVE_REPORT_*.md
+
+# Ad-hoc scratch dirs used by audit and test tooling.
+/.audit-tmp/
+/.tmp_pytest/
+/.tmp_research/
+
+# Agentic-IDE drop staging: files a user drags onto a pane land here, including
+# screenshots and clipboard images. The runtime writes a child .gitignore
+# (jarvis/agentic_ide/drops.py) but swallows a write failure, so anchor it here
+# too rather than relying on a best-effort side effect.
+/.jarvis/
+
+# Personal knowledge-vault write paths that fill at runtime. The contact mirror
+# and daily-note writers create these on first use; only the empty skeleton
+# ships (see the vault-content block above).
+wiki/obsidian-vault/people/
+wiki/obsidian-vault/10-notes/
+wiki/obsidian-vault/index.md
+wiki/obsidian-vault/attachments/
+# Attachment sink: ignore the contents, keep the tracked folder placeholder.
+wiki/obsidian-vault/90-attachments/*
+!wiki/obsidian-vault/90-attachments/.gitkeep
+
+# ============================================================
+# Marketing material — LOCAL ONLY, never distributed (maintainer directive
+# 2026-08-06). Personal Jarvis ships a product, not a marketing project: launch
+# drafts, campaign copy and readiness audits are the maintainer's own working
+# notes, carry no value for anyone downloading the repo, and publishing a launch
+# plan before the launch is itself the leak. The paths stay on disk and keep
+# being worked on; git simply never sees them again. Belt and braces: the same
+# subtree is withheld by scripts/ci/privacy_gate/references/distribution-denylist.txt,
+# which check_denylist_not_tracked.py enforces on every commit.
+# ============================================================
+/marketing/
+docs/reports/*marketing-readiness*
+
+# ============================================================
+# Privacy-gate reference manifests (2026-08-13)
+# ------------------------------------------------------------
+# pii-scrub.tsv and secret-allowlist.tsv hold the maintainer's real name, both
+# e-mail addresses, the GitHub login and personal home paths as scrub *patterns*.
+# The file that defines what must never be public was itself the most complete
+# public inventory of that data. distribution-denylist.txt has withheld
+# `scripts/ci/privacy_gate/**` since the build-a-snapshot era, but that era ended
+# when releasing became a plain `git push` (AGENTS.md §2), so nothing filtered
+# them any more and they stayed live on the public default branch.
+#
+# They remain on disk: the local pre-push docs scan and strip_and_scan.py still
+# read them. docs_privacy_scan.py already falls back to a generic manifest when
+# the file is absent, so CI stays green for every clone and fork.
+# ============================================================
+scripts/ci/privacy_gate/references/pii-scrub.tsv
+scripts/ci/privacy_gate/references/secret-allowlist.tsv
+
+# Temporary marketing-video workspace (Remotion project + rendered frames)
+.tmp-music-video/
+
+# Private Mars implementation inputs, runtime captures, and local test evidence.
+.tmp/rub69/
+docs/plans/mars-world/
+
+# Hypothesis's example database. Every file in it stamps the absolute path of
+# the machine that ran the tests into its header, so it is a personal-data leak
+# as much as it is a cache. Regenerated on demand; never committed.
+.hypothesis/
+
+# Local integration worktrees, test output, and release scratch stay on disk.
+/.tmp/
+/.rub14-worktree/
+/.pytest-tmp-rub14-*/
+/_tmp_agy_schema.py
+/run_in_executor
+/to_thread
+/wait
+/{cutoff_iso}
+/flow_labs
+/flow_landing
+/grok-light.svg
+/handshake.txt
+/svgl.json
+
+# Internal planning and video production are withheld by the distribution
+# denylist; keep newly created files out of ordinary commits as well.
+/docs/plans/
+/docs/superpowers/
+/video/
+
+# Local validation scripts, runtime captures, and machine-specific telemetry.
+/scripts/_*.py
+/art/studies/*/evidence/
+/art/studies/agent-symbol-companions/mars-integration.patch
+/desktop-ttu-latest.json
+
+# Figure build: fetched CC0 sources and generated sheets (scripts/figures/README.md)
+scripts/figures/cache/
+
+# Launch-video renders from the /brag skill (thousands of frames).
+brag-output/
+eval-results/

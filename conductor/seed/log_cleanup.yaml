@@ -1,0 +1,15 @@
+# Demo job 3 — shell command, manual trigger.
+# Shows how to frame an OS-native command as a Conductor job.
+id: 7b4d7e01-5c11-4c57-9c1d-10cc00000003
+name: Data-Dir Listing
+description: >
+  Lists the Jarvis data directory. Demo shell job, manually
+  triggerable. No destructive command — we delete nothing.
+enabled: true
+tags: [demo, shell]
+spec:
+  type: shell
+  command: cmd /c dir /b data
+  timeout_s: 10.0
+schedule:
+  type: manual

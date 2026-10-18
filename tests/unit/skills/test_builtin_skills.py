@@ -1,0 +1,231 @@
+"""Unit tests for the 3 built-in skills.
+
+Checks that all SKILL.md files parse, have valid frontmatter,
+all trigger payloads are semantically OK, and voice regexes compile.
+"""
+from __future__ import annotations
+
+import re
+
+import pytest
+
+# If parallel B1 work isn't finished yet: graceful skip.
+pytest.importorskip("jarvis.skills.schema")
+pytest.importorskip("jarvis.skills.loader")
+
+from jarvis.skills.builtin import BUILTIN_SKILL_NAMES, builtin_skill_path
+from jarvis.skills.loader import parse_skill
+from jarvis.skills.schema import SkillFrontmatter, SkillLifecycleState
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_skill_file_exists(name: str) -> None:
+    path = builtin_skill_path(name)
+    assert path.is_file(), f"Missing SKILL.md for builtin '{name}' at {path}"
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_skill_parses_successfully(name: str) -> None:
+    path = builtin_skill_path(name)
+    skill = parse_skill(path)
+    assert skill.frontmatter is not None, (
+        f"parse_skill returned no frontmatter for {name}: error={skill.error}"
+    )
+    assert skill.state != SkillLifecycleState.DRAFT or skill.error is None
+    # Explicitly validate the frontmatter model
+    SkillFrontmatter.model_validate(skill.frontmatter.model_dump())
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_skill_has_valid_triggers(name: str) -> None:
+    skill = parse_skill(builtin_skill_path(name))
+    assert skill.frontmatter is not None
+    # Disabled skills are intentionally trigger-less (e.g. memory-save was
+    # deprecated in B5 once the wiki-ingest tool took over the same job)
+    # and must NOT be auto-fired by the TriggerMatcher.  Loading them
+    # remains valid so that historical references in user data still
+    # resolve.
+    if skill.frontmatter.state == SkillLifecycleState.DISABLED:
+        assert skill.frontmatter.triggers == [], (
+            f"disabled skill {name} must not declare triggers"
+        )
+        return
+    # Meta skills (category="meta") may live without an auto trigger — they
+    # are pulled by the supervisor via intent dispatch, not by the
+    # TriggerMatcher. Paired plugins may instead use the relevance channel's
+    # explicit verb/object vocabulary, without broad brand regexes.
+    if skill.frontmatter.plugin_id and not skill.frontmatter.triggers:
+        assert skill.frontmatter.plugin_id in skill.frontmatter.requires_tools
+        assert skill.frontmatter.intent_verbs and skill.frontmatter.intent_objects
+        assert skill.frontmatter.when_to_use
+    elif skill.frontmatter.category != "meta":
+        assert len(skill.frontmatter.triggers) >= 1, (
+            f"{name} needs at least one trigger (category={skill.frontmatter.category})"
+        )
+    for t in skill.frontmatter.triggers:
+        errors = t.validate_payload()
+        assert not errors, f"{name} trigger invalid: {errors}"
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_skill_has_risk_policy(name: str) -> None:
+    skill = parse_skill(builtin_skill_path(name))
+    assert skill.frontmatter is not None
+    rp = skill.frontmatter.risk_policy
+    assert rp.default_tier in ("safe", "monitor", "ask", "block")
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_voice_patterns_compile(name: str) -> None:
+    skill = parse_skill(builtin_skill_path(name))
+    assert skill.frontmatter is not None
+    for t in skill.frontmatter.triggers:
+        if t.type == "voice":
+            assert t.pattern is not None
+            # Must compile as a regex
+            compiled = re.compile(t.pattern, re.IGNORECASE)
+            assert compiled is not None
+
+
+def test_expected_builtin_count() -> None:
+    """The base skills (Phase 1c + skill-creator + control-api) plus the paired
+    plugin skills. Computed from the components so adding a plugin does not rot
+    this guard; only a missing base skill or a duplicate trips it."""
+    from jarvis.skills.builtin import _PLUGIN_PAIRED_SKILLS
+
+    base = {
+        "deep-work-mode",
+        "memory-save",
+        "skill-creator",
+        "control-api",
+        "cli-gcloud",
+        "jarvis-doc-author",
+    }
+    assert base.issubset(set(BUILTIN_SKILL_NAMES)), (
+        f"missing base skill(s): {base - set(BUILTIN_SKILL_NAMES)}"
+    )
+    assert len(BUILTIN_SKILL_NAMES) == len(base) + len(_PLUGIN_PAIRED_SKILLS)
+    assert len(set(BUILTIN_SKILL_NAMES)) == len(BUILTIN_SKILL_NAMES), "duplicate skill name"
+
+
+def test_every_bundled_plugin_skill_is_shipped() -> None:
+    """Every plugin-* directory under builtin/ must be in BUILTIN_SKILL_NAMES.
+
+    ensure_user_skills_dir() only copies LISTED skills into the user skills
+    dir — an unlisted bundle directory is never loaded, its paired capability
+    never registers, and the evidence gate refuses the plugin's domain although
+    the plugin is connected. Live 2026-07-17: plugin-google_calendar existed on
+    disk but was missing from the list, so a connected Google Calendar was
+    answered with the deterministic "no calendar access" refusal.
+    """
+    from jarvis.skills.builtin import BUILTIN_SKILLS_DIR
+
+    # EVERY bundled directory, not just ``plugin-*``. The defect is the dead
+    # bundle, and it does not care about the prefix: ``jarvis-doc-author``
+    # shipped unlisted and unloadable for exactly as long as the narrower
+    # version of this assertion was green (2026-08-20).
+    bundled = {p.parent.name for p in BUILTIN_SKILLS_DIR.glob("*/SKILL.md")}
+    unlisted = bundled - set(BUILTIN_SKILL_NAMES)
+    assert not unlisted, (
+        f"bundled skill(s) missing from BUILTIN_SKILL_NAMES: {unlisted}"
+    )
+
+
+def test_control_api_specifics() -> None:
+    """The shipped Control-API skill is documentation for coding agents.
+
+    AP-15: VALIDATED (not DRAFT — would never load; not ACTIVE — would bypass
+    review). category=meta so it carries NO voice triggers: a trigger matching
+    "switch language" would make the router pick run_skill (a markdown body that
+    cannot call HTTP) instead of the set_config_value tool on the voice path.
+    """
+    skill = parse_skill(builtin_skill_path("control-api"))
+    fm = skill.frontmatter
+    assert fm is not None
+    assert skill.state == SkillLifecycleState.VALIDATED
+    assert fm.category == "meta"
+    assert fm.triggers == []
+
+
+def test_cli_gcloud_specifics() -> None:
+    """The gcloud guidance skill teaches the brain to drive Google Cloud via the
+    cli_gcloud tool instead of the browser console. Like control-api it is
+    category=meta with NO voice triggers — a trigger would make the router pick
+    run_skill (a markdown body) over the cli_gcloud tool. Gated to gcloud being
+    connected via requires_tools; guidance-only (no paired capability, so no
+    vocab duplication with the CLI catalog).
+    """
+    skill = parse_skill(builtin_skill_path("cli-gcloud"))
+    fm = skill.frontmatter
+    assert fm is not None
+    assert skill.state == SkillLifecycleState.VALIDATED
+    assert fm.category == "meta"
+    assert fm.triggers == []
+    assert fm.requires_tools == ["cli_gcloud"]
+    assert fm.intent_verbs == []
+    assert fm.intent_objects == []
+
+
+@pytest.mark.parametrize("name", list(BUILTIN_SKILL_NAMES))
+def test_no_builtin_skill_runs_on_a_schedule(name: str) -> None:
+    """Nothing shipped runs by itself (2026-09-30): the retired morning-routine
+    fired a full brain turn at 07:00 on every install. A schedule is a routine,
+    and routines are the user's own to make."""
+    skill = parse_skill(builtin_skill_path(name))
+    fm = skill.frontmatter
+    assert fm is not None
+    assert "schedule" not in {t.type for t in fm.triggers}
+
+
+def test_deep_work_mode_specifics() -> None:
+    skill = parse_skill(builtin_skill_path("deep-work-mode"))
+    fm = skill.frontmatter
+    assert fm is not None
+    trig_types = {t.type for t in fm.triggers}
+    assert "hotkey" in trig_types
+    assert "voice" in trig_types
+    hotkey = next(t for t in fm.triggers if t.type == "hotkey")
+    assert hotkey.combo == "ctrl+alt+d"
+    assert fm.config.get("duration_minutes") == 90
+
+
+def test_memory_save_specifics() -> None:
+    """memory-save was deprecated in B5 once the wiki-ingest tool took over
+    the same job.  The skill remains in the registry as DISABLED so old
+    user-facing references resolve; it must not auto-fire from the
+    TriggerMatcher.  The original trigger-shape assertions are replaced
+    by a contract check: state=DISABLED, no triggers, risk_policy safe.
+    """
+    skill = parse_skill(builtin_skill_path("memory-save"))
+    fm = skill.frontmatter
+    assert fm is not None
+    assert fm.state == SkillLifecycleState.DISABLED, (
+        "memory-save must remain DISABLED — re-enable would re-introduce "
+        "the BUG-class addressed by wiki-ingest"
+    )
+    assert fm.triggers == [], (
+        "memory-save must have no triggers — TriggerMatcher must not fire it"
+    )
+    assert fm.risk_policy.default_tier == "safe"
+
+
+def test_spotify_play_verb_plus_song_noun_triggers() -> None:
+    """Generic "play a song" must capture so music_service can swap to the
+    preferred connected connector. Live 2026-08-19: a play request that named
+    no service was taken by disconnected Spotify."""
+    skill = parse_skill(builtin_skill_path("plugin-spotify"))
+    assert skill.frontmatter is not None
+    patterns = [
+        re.compile(t.pattern, re.IGNORECASE)
+        for t in skill.frontmatter.triggers
+        if t.type == "voice" and t.pattern
+    ]
+    hits = "bitte mal ein schönes Lied abspielen?"  # i18n-allow: live utterance
+    misses = "was bedeutet das Lied"  # i18n-allow: definitional, no play verb
+    assert any(p.search(hits) for p in patterns)
+    # The brand/musik trigger still fires on "Lied" only if a play verb is
+    # next to it; a bare song-noun question must not.
+    play_noun = [
+        p for p in patterns if "lied" in (p.pattern or "") and "spotify" not in (p.pattern or "")
+    ]
+    assert play_noun and not any(p.search(misses) for p in play_noun)

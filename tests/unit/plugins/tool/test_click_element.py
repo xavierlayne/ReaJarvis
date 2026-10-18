@@ -1,0 +1,229 @@
+"""Unit tests for the click_element tool.
+
+A fake vision source feeds a hand-built UIAutomation Observation so the
+tool can be exercised without a live desktop. ``_click_windows`` is
+patched on the click_element module namespace to record the coordinates
+it would have clicked.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from jarvis.core.protocols import ExecutionContext, Observation, UIANode
+from jarvis.plugins.tool.click_element import ClickElementTool
+
+
+def _ctx() -> ExecutionContext:
+    return ExecutionContext(
+        trace_id=uuid4(),
+        user_utterance="test",
+        config={},
+        memory_read=None,
+        approved_by="auto",
+    )
+
+
+class _FakeVisionSource:
+    """Returns a fixed Observation built from the given nodes."""
+
+    def __init__(self, nodes: tuple[UIANode, ...]) -> None:
+        self._nodes = nodes
+
+    async def observe(self) -> Observation:
+        return Observation(
+            trace_id=uuid4(),
+            timestamp_ns=0,
+            screenshot_path=None,
+            screenshot_hash="",
+            nodes=self._nodes,
+            window_title="Test",
+        )
+
+
+@pytest.fixture(autouse=True)
+def stable_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.click_element._foreground_window_signature",
+        lambda: ("handle", 11, (0, 0, 800, 600)),
+    )
+
+
+@pytest.fixture
+def recorder(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int, str, bool]]:
+    """Patch _click_windows so the test runs cross-platform and records calls."""
+    calls: list[tuple[int, int, str, bool]] = []
+
+    def _record(
+        x: int,
+        y: int,
+        button: str,
+        double: bool,
+        **_kwargs,
+    ) -> None:
+        calls.append((x, y, button, double))
+
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.click_element._click_windows", _record
+    )
+    # Force the Windows native path so the recorder is hit on every platform.
+    monkeypatch.setattr("jarvis.plugins.tool.click_element.os", SimpleNamespace(name="nt"))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_click_by_name_hits_center_of_node(
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    nodes = (
+        UIANode(role="Button", name="Save", bounds=(10, 20, 100, 40), enabled=True),
+        UIANode(role="Button", name="Cancel", bounds=(200, 20, 80, 40), enabled=True),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource(nodes))
+
+    result = await tool.execute({"name": "save"}, _ctx())
+
+    assert result.success is True
+    # Center of (10, 20, 100, 40) -> (10 + 50, 20 + 20) = (60, 40).
+    assert recorder == [(60, 40, "left", False)]
+    assert "Save" in result.output
+
+
+@pytest.mark.asyncio
+async def test_role_filter_narrows_correctly(
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    nodes = (
+        UIANode(role="Edit", name="Item", bounds=(0, 0, 50, 50), enabled=True),
+        UIANode(role="Button", name="Item", bounds=(300, 100, 60, 20), enabled=True),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource(nodes))
+
+    result = await tool.execute({"name": "item", "role": "Button"}, _ctx())
+
+    assert result.success is True
+    # Only the Button "Item" should match -> center of (300, 100, 60, 20).
+    assert recorder == [(330, 110, "left", False)]
+    assert "Button" in result.output
+
+
+@pytest.mark.asyncio
+async def test_nth_selects_second_match(
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    nodes = (
+        UIANode(role="ListItem", name="Row", bounds=(0, 0, 100, 20), enabled=True),
+        UIANode(role="ListItem", name="Row", bounds=(0, 30, 100, 20), enabled=True),
+        UIANode(role="ListItem", name="Row", bounds=(0, 60, 100, 20), enabled=True),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource(nodes))
+
+    result = await tool.execute({"name": "row", "nth": 1}, _ctx())
+
+    assert result.success is True
+    # Second match -> center of (0, 30, 100, 20) = (50, 40).
+    assert recorder == [(50, 40, "left", False)]
+
+
+@pytest.mark.asyncio
+async def test_no_match_lists_available_names(
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    nodes = (
+        UIANode(role="Button", name="Save", bounds=(0, 0, 50, 20), enabled=True),
+        UIANode(role="Button", name="Cancel", bounds=(0, 30, 50, 20), enabled=True),
+        # Disabled and zero-area nodes must not appear in the candidate set.
+        UIANode(role="Button", name="Hidden", bounds=(0, 0, 0, 0), enabled=True),
+        UIANode(role="Button", name="Disabled", bounds=(0, 0, 50, 20), enabled=False),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource(nodes))
+
+    result = await tool.execute({"name": "DoesNotExist"}, _ctx())
+
+    assert result.success is False
+    assert recorder == []
+    assert result.error is not None
+    assert "Save" in result.error
+    assert "Cancel" in result.error
+
+
+@pytest.mark.asyncio
+async def test_posix_unavailable_backend_reports_actionable_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-Windows without an input backend: the capability-probe message
+    (Wayland/headless/extras missing) must reach the model — not a raw
+    pyautogui ImportError (§3 honest degradation)."""
+    from jarvis.cu.actuate.base import ActuationUnavailable
+
+    monkeypatch.setattr("jarvis.plugins.tool.click_element.os.name", "posix")
+
+    def _unavailable() -> None:
+        raise ActuationUnavailable(
+            "Cannot control mouse/keyboard: no input backend is installed. "
+            "Install the desktop extras (pip install "
+            "'personal-jarvis[desktop]') to get pynput/pyautogui."
+        )
+
+    monkeypatch.setattr("jarvis.cu.actuate.base.get_actuator", _unavailable)
+
+    nodes = (
+        UIANode(role="Button", name="Save", bounds=(10, 20, 100, 40), enabled=True),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource(nodes))
+
+    result = await tool.execute({"name": "save"}, _ctx())
+
+    assert result.success is False
+    assert "desktop extras" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_refuses_engine_capture_from_a_different_foreground_window(
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    current = ("handle", 22, (0, 0, 800, 600))
+    captured = ("handle", 11, (0, 0, 800, 600))
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.click_element._foreground_window_signature",
+        lambda: current,
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource((
+        UIANode(role="Button", name="Save", bounds=(10, 20, 100, 40)),
+    )))
+
+    result = await tool.execute(
+        {"name": "save", "_expected_window_signature": captured},
+        _ctx(),
+    )
+
+    assert result.success is False
+    assert "foreground window changed" in (result.error or "")
+    assert recorder == []
+
+
+@pytest.mark.asyncio
+async def test_refuses_switch_during_async_ui_tree_observation(
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: list[tuple[int, int, str, bool]],
+) -> None:
+    signatures = iter((
+        ("handle", 11, (0, 0, 800, 600)),
+        ("handle", 22, (0, 0, 800, 600)),
+    ))
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.click_element._foreground_window_signature",
+        lambda: next(signatures),
+    )
+    tool = ClickElementTool(vision_source=_FakeVisionSource((
+        UIANode(role="Button", name="Save", bounds=(10, 20, 100, 40)),
+    )))
+
+    result = await tool.execute({"name": "save"}, _ctx())
+
+    assert result.success is False
+    assert "while its UI tree was being observed" in (result.error or "")
+    assert recorder == []

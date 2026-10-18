@@ -1,0 +1,287 @@
+"""Realtime emergency voice keeps its family and session voice.
+
+A realtime recovery uses the same family and the session's resolved credential.
+The independently selected pipeline voice may use a shared credential, with a
+legacy realtime slot only as the final fallback within that provider family.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from jarvis.core.config import (
+    PROVIDER_SECRET_CANDIDATES,
+    override_provider_secrets,
+)
+from jarvis.plugins.tts import (
+    _TTS_SECRET_CANDIDATES,
+    _tts_has_credential,
+    build_realtime_surface_tts,
+)
+from jarvis.plugins.tts.gemini_flash_tts import GeminiFlashTTS, VertexTTS
+from jarvis.ui.web.provider_spec import PROVIDERS
+
+# The realtime tier's own provider ids — the ones ALLOWED to put a
+# ``realtime_``-scoped slot first, because that slot IS their primary credential.
+# DERIVED from the provider cards rather than written down here: a hardcoded pair
+# silently turned every new realtime family into a violation of the invariant
+# below instead of a member of the exempt set.
+_REALTIME_PROVIDER_IDS = tuple(
+    spec.id for spec in PROVIDERS if spec.tier == "realtime"
+) + ("openai-realtime",)  # Read-time credential compatibility; no picker card.
+
+
+def _cfg(voice: str = "Fenrir") -> SimpleNamespace:
+    return SimpleNamespace(
+        brain=SimpleNamespace(
+            providers={
+                "gemini-live": SimpleNamespace(voice=voice),
+                "vertex-live": SimpleNamespace(voice=voice),
+            },
+        ),
+        tts=SimpleNamespace(
+            language_code="de-DE",
+            allow_sapi5_fallback=False,
+            streaming=False,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forward direction: realtime emergency voice stays realtime-scoped.
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_live_builds_same_family_tts_with_session_voice() -> None:
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(_cfg(), "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    # The session voice carries over verbatim (shared prebuilt-voice catalog).
+    assert tts._default_voice == "Fenrir"
+    # The realtime-resolved key is injected — never left to the generic
+    # environment lookup, so realtime-scoped keys stay out of pipeline scope.
+    assert tts._resolve_api_key() == "rt-scoped-key"
+
+
+def test_unknown_session_voice_falls_back_to_family_default() -> None:
+    # "cedar" is not a Gemini voice but carries a curated MASCULINE profile,
+    # and Charon is the family's first curated masculine voice — the
+    # continuity pick and the historical default coincide here.
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(_cfg(voice="cedar"), "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._default_voice == "Charon"
+
+
+def test_feminine_session_voice_keeps_a_feminine_fallback() -> None:
+    """BUG-089: the surface fallback keeps the session's voice PROFILE.
+
+    A feminine live voice hard-flipping to masculine Charon reads as a
+    second assistant joining the call (Mac live test 2026-07-18). Pinned via
+    the curated gender register, never a hardcoded voice id.
+    """
+    from jarvis.plugins.tts import _GEMINI_VOICES
+    from jarvis.plugins.tts.curated_catalog import FEMININE, voice_gender
+
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(_cfg(voice="marin"), "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._default_voice in _GEMINI_VOICES
+    assert voice_gender(tts._default_voice) == FEMININE
+
+
+def test_untagged_unknown_voice_still_falls_back_to_charon() -> None:
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(
+            _cfg(voice="definitely-not-a-voice"), "gemini-live"
+        )
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._default_voice == "Charon"
+
+
+def test_surface_fallback_renders_one_take_with_the_config_drift_knobs() -> None:
+    """BUG-090: Gemini TTS is generative — one generation per SENTENCE let the
+    2026-07-19 fallback re-roll the delivery mid-answer and flip the voice's
+    gender past the Fenrir pin. The emergency re-render is always ONE take and
+    inherits the [tts] drift knobs the pipeline instance already honors."""
+    cfg = _cfg()
+    cfg.tts.seed = 7
+    cfg.tts.temperature = 0.7
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(cfg, "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._chunk_by_sentence is False
+    assert tts._seed == 7
+    assert tts._temperature == 0.7
+
+
+def test_surface_fallback_is_one_take_even_without_configured_knobs() -> None:
+    """A fresh install without the [tts] drift knobs still gets the one-take
+    profile — voice identity is the fallback's entire purpose (§3: never
+    assume the maintainer's config)."""
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(_cfg(), "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._chunk_by_sentence is False
+    assert tts._seed is None
+    assert tts._temperature is None
+
+
+def test_surface_fallback_always_streams_whatever_the_pipeline_knob_says() -> None:
+    """One whole-answer take is only safe while the transport streams it.
+
+    Live forensic 2026-08-11 21:27: the emergency re-render of a
+    1000-character answer went out as a single BLOCKING generation and took
+    36 s — the user heard nothing and hung up 15 s before the audio existed.
+    ``chunk_by_sentence=False`` (voice identity) and blocking synthesis
+    (first audio == whole generation) are only compatible via streaming, so
+    streaming is this instance's precondition, not an inherited preference:
+    ``_cfg()`` deliberately carries ``[tts].streaming = False``.
+    """
+    cfg = _cfg()
+    assert cfg.tts.streaming is False, "fixture must model the pipeline knob OFF"
+    with override_provider_secrets({"gemini-live": "rt-scoped-key"}):
+        tts = build_realtime_surface_tts(cfg, "gemini-live")
+    assert isinstance(tts, GeminiFlashTTS)
+    assert tts._streaming is True, (
+        "a pipeline knob turned off must never convert the emergency voice "
+        "into a blocking whole-answer take"
+    )
+    assert tts._chunk_by_sentence is False
+
+
+# ---------------------------------------------------------------------------
+# Vertex Live: same voices, Cloud project credential path (BUG-148).
+# ---------------------------------------------------------------------------
+
+
+def test_vertex_live_builds_vertex_tts_with_session_voice() -> None:
+    """Live 2026-08-18 18:41: three grounded Vertex Live answers were never
+    heard because the family map knew only gemini-live — the surface fallback
+    stayed text-only while the host had a working Vertex TTS. Provider parity:
+    vertex-live gets its own sibling, keyed through the Vertex slots."""
+    with override_provider_secrets({"vertex-live": "rt-vertex-key"}):
+        tts = build_realtime_surface_tts(_cfg(), "vertex-live")
+    assert isinstance(tts, VertexTTS)
+    assert tts._default_voice == "Fenrir"
+    assert tts._resolve_api_key() == "rt-vertex-key"
+    # Same emergency-render profile as the AI-Studio sibling.
+    assert tts._streaming is True
+    assert tts._chunk_by_sentence is False
+
+
+def test_vertex_live_builds_on_the_project_path_without_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Application Default Credentials: a configured [google].vertex_project
+    is a full Vertex setup with no key anywhere. The sibling must still be
+    built; VertexTTS resolves the credential state itself."""
+    monkeypatch.setattr(
+        "jarvis.core.config.vertex_credential_configured", lambda *_a, **_k: True
+    )
+    with override_provider_secrets({"vertex-live": None}):
+        tts = build_realtime_surface_tts(_cfg(), "vertex-live")
+    assert isinstance(tts, VertexTTS)
+    assert tts._api_key is None
+
+
+def test_vertex_live_without_any_credential_yields_no_surface_tts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "jarvis.core.config.vertex_credential_configured", lambda *_a, **_k: False
+    )
+    with override_provider_secrets({"vertex-live": None}):
+        assert build_realtime_surface_tts(_cfg(), "vertex-live") is None
+
+
+def test_session_voice_override_wins_over_empty_config() -> None:
+    """BUG-155: the live socket's voice, not the empty card pin, must speak
+    the progress line. An empty [brain.providers.vertex-live].voice used to
+    hard-default the sibling to Charon."""
+    with override_provider_secrets({"vertex-live": "rt-vertex-key"}):
+        tts = build_realtime_surface_tts(
+            _cfg(voice=""), "vertex-live", session_voice="Kore"
+        )
+    assert isinstance(tts, VertexTTS)
+    assert tts._default_voice == "Kore"
+
+
+def test_keyless_realtime_provider_yields_no_surface_tts() -> None:
+    with override_provider_secrets({"gemini-live": None}):
+        assert build_realtime_surface_tts(_cfg(), "gemini-live") is None
+
+
+def test_realtime_family_without_tts_sibling_yields_no_surface_tts() -> None:
+    # A key alone is not enough: without a same-family TTS sibling the
+    # emergency re-render stays text-only — never the pipeline voice.
+    with override_provider_secrets({"openai-realtime": "some-key"}):
+        assert build_realtime_surface_tts(_cfg(), "openai-realtime") is None
+
+
+def test_empty_provider_yields_no_surface_tts() -> None:
+    assert build_realtime_surface_tts(_cfg(), "") is None
+
+
+def test_resolution_failure_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(_provider: str) -> str:
+        raise RuntimeError("keyring exploded")
+
+    monkeypatch.setattr("jarvis.core.config.get_provider_secret", _boom)
+    assert build_realtime_surface_tts(_cfg(), "gemini-live") is None
+
+
+def test_injected_api_key_wins_over_environment_lookup() -> None:
+    tts = GeminiFlashTTS(api_key="explicit-key")
+    assert tts._resolve_api_key() == "explicit-key"
+
+
+# ---------------------------------------------------------------------------
+# Reverse direction: pipeline resolution never sees realtime key slots.
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_tts_uses_realtime_slots_only_as_trailing_family_fallbacks() -> None:
+    for family, candidates in _TTS_SECRET_CANDIDATES.items():
+        for position, (keyring_key, _env) in enumerate(candidates):
+            if keyring_key.startswith("realtime_"):
+                assert family == "gemini-flash-tts"
+                assert keyring_key == "realtime_gemini_api_key"
+                assert position == len(candidates) - 1
+
+
+def test_realtime_slots_are_only_trailing_fallbacks_outside_realtime_ids() -> None:
+    """Static guard: outside the realtime provider ids, a dedicated realtime
+    slot may appear ONLY as the last (trailing) candidate of its family.
+
+    The trailing cross-read is deliberate (2026-07-21 Mac forensic: an install
+    whose only key came from the Realtime card had every delegated Brain turn
+    brick on "Kein Brain-Key gefunden"),  # i18n-allow: quoted log diagnostic
+    but it must never outrank a generic
+    family key — and pipeline TTS keeps its own realtime-free candidate table
+    (guarded above)."""
+    for provider, candidates in PROVIDER_SECRET_CANDIDATES.items():
+        if provider in _REALTIME_PROVIDER_IDS:
+            continue
+        for position, (keyring_key, _env) in enumerate(candidates):
+            if keyring_key.startswith("realtime_"):
+                assert position == len(candidates) - 1, (
+                    f"realtime slot {keyring_key!r} must be the LAST candidate "
+                    f"of provider {provider!r}, found at index {position}"
+                )
+
+
+def test_pipeline_tts_can_use_its_own_familys_realtime_key_as_a_last_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single Gemini key supports the explicit pipeline choice, without a cross-family key."""
+
+    def _secret(name: str, env_fallback: str | None = None, **_kw: object):
+        return "rt-only-key" if name == "realtime_gemini_api_key" else None
+
+    monkeypatch.setattr("jarvis.core.config.get_secret", _secret)
+    tts_cfg = SimpleNamespace(use_vertex=False)
+    assert _tts_has_credential("gemini-flash-tts", tts_cfg) is True
+    assert _tts_has_credential("grok-voice", tts_cfg) is False

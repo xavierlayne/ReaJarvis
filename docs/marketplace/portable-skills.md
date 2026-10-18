@@ -1,0 +1,150 @@
+# Portable skills — a marketplace for more than Jarvis
+
+**Status:** app side live since 2026-08-16 · registry side written, awaiting
+the maintainer's push · storefront open ·
+**Registry:** [community-registry.md](community-registry.md) ·
+**Packaging (plugins):** [agent-plugins-standard.md](agent-plugins-standard.md)
+
+The registry publishes skills. A skill is a `SKILL.md` — instructions an
+assistant follows — and that file format is not ours. The same file runs in
+Claude Code, Cursor, Codex, Copilot and everything else that reads Agent
+Skills, and `npx skills add` ([skills.sh](https://skills.sh), Vercel Labs)
+installs it into whichever of those is configured locally.
+
+So the store carries two kinds of skill, and says which is which:
+
+| Flavor | Frontmatter | Where it runs |
+|---|---|---|
+| `jarvis` (default) | this app's schema: triggers, risk policy, execution mode, plugin coupling | Personal Jarvis |
+| `portable` | the open format: `name` + `description`, plus whatever the publishing agent uses | every SKILL.md-reading agent, Jarvis included |
+
+A publisher does not have to write for Jarvis to publish here. That is the
+whole point: an open registry that only accepts its own dialect is a private
+registry with extra steps.
+
+## Two install commands per listing
+
+Every skill card shows the commands that actually work for it, as tabs:
+
+```
+jarvis marketplace install <name>              # this app
+npx skills add <owner>/<repo> --skill <name>   # every other agent
+```
+
+The second line is **derived, never stored** — `installStandard.ts`
+(`skillsShTarget`) reads it out of the URLs the entry already carries:
+
+1. `raw_url` on `raw.githubusercontent.com` is exact: the folder holding
+   `SKILL.md` is the `--skill` argument, and a `SKILL.md` at the repository
+   root has none (`npx skills add owner/repo` is then the whole command). A
+   `refs/heads/<branch>` path prefix is consumed as the ref it is, so a branch
+   name never poses as the skill folder.
+2. Otherwise `source_url` on `github.com` gives `owner/repo`, and the entry
+   name is used as the folder — which is what the registry publishes as
+   `skills/<name>/SKILL.md`.
+3. Anything else (no GitHub, no https) gets **no** skills.sh line. That
+   installer resolves against github.com and nothing else, so inventing one
+   would advertise a broken command.
+
+Verified live on 2026-08-16 against the real CLI — `npx skills add
+PersonalJarvis/marketplace --list` clones the registry and lists the
+published skill, and `-s, --skill <name>` is the flag it documents. The
+`skills/<name>/SKILL.md` layout the registry publishes is exactly what it
+searches, so no repo-side change was needed for the command to work.
+
+Plugins never get the second line: a plugin carries an MCP server and a
+sign-in flow, which that installer knows nothing about.
+
+The storefront on personaljarvis.ai mirrors this file as
+`src/lib/install-standard.ts`. Both surfaces must print the same string —
+change one, change both, and keep both pinned by their tests.
+
+## What the app does with a portable skill
+
+`jarvis/skills/portable.py` is the second reading of a `SKILL.md`, tried only
+after the strict schema rejected it. Strict when writing, tolerant when
+reading: the authoring and creator services still validate against the full
+schema, so a typo in a hand-written skill is caught where it is made.
+
+* **Whitelist, not blacklist.** Only descriptive fields are adopted: `name`,
+  `description`, `when_to_use`, `version`, `author`, `license`, `category`,
+  `tags`, the three URLs, `token_budget_estimate`. Dashed spellings
+  (`when-to-use`) fold onto the underscored ones.
+* **`state` is adopted, for the opposite of the usual reason.** The loader
+  reads a missing `state` as VALIDATED — the active pool — so dropping an
+  author's (or the import route's, AP-15) `state: draft` would *promote* the
+  file by discarding its own restriction. It is read so it can only hold a
+  skill back: a value in a vocabulary Jarvis does not share (`state:
+  published`) falls to DRAFT rather than being ignored.
+* **Nothing that grants behaviour crosses over** — not even when a foreign
+  file spells it exactly the way Jarvis does: `triggers` (fires by itself),
+  `risk_policy` (lowers the confirmation tier), `auto_fire` (promotes into the
+  matcher), `execution` (dispatches a background worker), `requires_tools`,
+  `config`, and the plugin-coupling fields. A portable skill is instructions
+  the assistant may follow, never a permission grant.
+* **Tolerant, not silent.** Every dropped key is listed on the skill
+  (`ignored_fields`), travels on `GET /api/skills`, and is shown in the Skills
+  view under the portable notice. A file whose `name` is missing or malformed
+  still lands as DRAFT with the old error — falling back to the filename would
+  silently rename someone's skill.
+
+Consent is unchanged: the install dialog shows the instructions verbatim
+before anything is downloaded, because the text IS the skill.
+
+## Feed contract
+
+`CommunitySkillEntry` in `jarvis/marketplace/community_source.py` reads two
+fields, both optional, both tolerated when absent or unknown:
+
+```jsonc
+{
+  "name": "three-point-check",
+  "description": "Summarize any topic in three bullets",
+  "raw_url": "https://raw.githubusercontent.com/…/skills/three-point-check/SKILL.md",
+  "source_url": "https://github.com/…",
+  "flavor": "portable",                                  // or "jarvis"; absent = "jarvis"
+  "compatible_agents": ["Claude Code", "Cursor", "Codex"] // display only, bounded
+}
+```
+
+* An unknown `flavor` costs the word, not the entry — it falls back to the
+  default rather than failing the index (BUG-016 class).
+* `compatible_agents` is publisher-written free text that lands in the store
+  UI, so the client bounds it: 8 entries, 32 characters each, deduplicated,
+  non-strings dropped.
+
+### Registry side (`PersonalJarvis/marketplace`) — written, on branch
+`portable-skills`
+
+- [x] `build_index.py` emits `flavor` and `compatible_agents` on every skill.
+- [x] **The flavor is derived, not demanded.** A SKILL.md using none of
+      Jarvis' own keys (`schema_version`, `triggers`, `requires_tools`,
+      `risk_policy`, `execution`, `auto_fire`, `state`, `config`,
+      `token_budget_estimate`, `plugin_id`, `intent_verbs`, `intent_objects`)
+      is portable. Every submission published before the field gets the right
+      mark without its author touching anything; a submission may still state
+      `flavor` outright when the derivation would be wrong.
+- [x] `validate.py` bounds the two fields and rejects rather than truncates.
+- [x] The gate needed no loosening: it only ever required `name` and
+      `description` in the frontmatter, so a foreign SKILL.md always passed.
+- [x] `scripts/test_portable_flavor.py`, wired into `validate.yml`.
+- [x] Verified end to end: built feed → `CommunityIndex` → `parse_skill`,
+      with a portable probe reading as portable at every step.
+
+Not pushed — that is the maintainer's call (contract §2).
+
+### Storefront (personaljarvis.ai) — open
+
+- [ ] Mirror `src/lib/install-standard.ts` (the `commands` array and the
+      skills.sh derivation) and render the tabs.
+- [ ] Show the "portable · also runs in …" mark on the card.
+- [ ] Let the submit form pick a flavor and name the agents.
+
+## Trust — unchanged, and why it holds for a foreign file
+
+A portable skill widens the *format*, not the blast radius. Everything that
+carried the weight before still carries it: registry CI, name ownership,
+client-side re-validation, the consent dialog that shows the text, the
+`ToolExecutor` as the single execution path, and the skill lifecycle. The
+adapter's whitelist is the addition: a file from an agent Jarvis has never
+heard of cannot arrive carrying a lowered risk tier or a trigger that fires it.

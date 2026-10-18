@@ -1,0 +1,696 @@
+{
+  "$comment": "Figure asset contract v1 — docs/agent-society/character-pipeline.md §4/§5. The build (build_figures.py) and the CI gate (scripts/ci/check_society_figures.py) both read this file; the runtime reads the extras the build writes from it and the catalog.json the build generates.",
+  "contract": 1,
+  "sheet": {
+    "size": 128,
+    "cell_width": 8,
+    "cell_height": 16,
+    "cells": [
+      "skin",
+      "skin_shade",
+      "hair",
+      "eyes",
+      "primary",
+      "primary_shade",
+      "secondary",
+      "secondary_shade",
+      "accent",
+      "metal",
+      "leather",
+      "fur",
+      "fur_shade",
+      "shoes",
+      "eye_white",
+      "emissive"
+    ]
+  },
+  "styles": {
+    "$comment": "Every base and part carries one or more style tags; the creator filters by them. Keep the ids stable — recipes and the catalog reference them.",
+    "modern": "Everyday people — offices, streets, workshops",
+    "fantasy": "Knights, mages, rangers, barbarians, undead",
+    "cartoon": "Chunky, big-headed, kart-racer proportions",
+    "animal": "Four-legged companions",
+    "scifi": "Robots, suits, visors",
+    "spirit": "Ghosts and familiars",
+    "custom": "Imported by the person"
+  },
+  "archetypes": {
+    "biped": {
+      "bones": [
+        "root",
+        "hips",
+        "spine",
+        "chest",
+        "head",
+        "upper_arm_l",
+        "lower_arm_l",
+        "wrist_l",
+        "hand_l",
+        "handslot_l",
+        "upper_arm_r",
+        "lower_arm_r",
+        "wrist_r",
+        "hand_r",
+        "handslot_r",
+        "upper_leg_l",
+        "lower_leg_l",
+        "foot_l",
+        "toes_l",
+        "upper_leg_r",
+        "lower_leg_r",
+        "foot_r",
+        "toes_r"
+      ],
+      "feet": [
+        "toes_l",
+        "toes_r"
+      ],
+      "slots": {
+        "hair": {
+          "attach": "head"
+        },
+        "headgear": {
+          "attach": "head"
+        },
+        "face_extra": {
+          "attach": "head"
+        },
+        "torso_over": {
+          "attach": "chest"
+        },
+        "belt": {
+          "attach": "hips"
+        },
+        "back": {
+          "attach": "chest"
+        },
+        "hand_l": {
+          "attach": "handslot_l"
+        },
+        "hand_r": {
+          "attach": "handslot_r"
+        },
+        "feet": {
+          "attach": "hips"
+        }
+      },
+      "clips": {
+        "idle": {
+          "loop": true,
+          "duration": [
+            0.8,
+            6.0
+          ]
+        },
+        "walk": {
+          "loop": true,
+          "duration": [
+            0.8,
+            1.2
+          ],
+          "stride": true
+        },
+        "run": {
+          "loop": true,
+          "duration": [
+            0.5,
+            0.9
+          ],
+          "stride": true
+        },
+        "work": {
+          "loop": true,
+          "duration": [
+            0.5,
+            4.0
+          ]
+        },
+        "talk": {
+          "loop": true,
+          "duration": [
+            0.8,
+            3.0
+          ]
+        },
+        "sit": {
+          "loop": true,
+          "duration": [
+            1.0,
+            6.0
+          ]
+        },
+        "sleep": {
+          "loop": true,
+          "duration": [
+            1.0,
+            6.0
+          ]
+        },
+        "celebrate": {
+          "loop": false,
+          "duration": [
+            0.5,
+            4.0
+          ]
+        },
+        "wave": {
+          "loop": false,
+          "duration": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "variants": {
+        "small": {
+          "height_m": 1.15
+        },
+        "medium": {
+          "height_m": 1.75
+        },
+        "large": {
+          "height_m": 2.3
+        }
+      },
+      "budget": {
+        "triangles": 4500,
+        "materials": 2,
+        "primitives": 2
+      }
+    },
+    "quadruped": {
+      "bones": [
+        "root",
+        "hips",
+        "spine",
+        "chest",
+        "neck",
+        "head",
+        "jaw",
+        "tail_1",
+        "tail_2",
+        "upper_leg_fl",
+        "lower_leg_fl",
+        "foot_fl",
+        "upper_leg_fr",
+        "lower_leg_fr",
+        "foot_fr",
+        "upper_leg_bl",
+        "lower_leg_bl",
+        "foot_bl",
+        "upper_leg_br",
+        "lower_leg_br",
+        "foot_br"
+      ],
+      "optional_bones": [
+        "ear_l",
+        "ear_r",
+        "wing_l",
+        "wing_r"
+      ],
+      "feet": [
+        "foot_fl",
+        "foot_fr",
+        "foot_bl",
+        "foot_br"
+      ],
+      "slots": {
+        "headgear": {
+          "attach": "head"
+        },
+        "collar": {
+          "attach": "neck"
+        },
+        "back": {
+          "attach": "chest"
+        },
+        "tail_extra": {
+          "attach": "tail_2"
+        }
+      },
+      "clips": {
+        "idle": {
+          "loop": true,
+          "duration": [
+            0.8,
+            6.0
+          ]
+        },
+        "walk": {
+          "loop": true,
+          "duration": [
+            0.6,
+            1.4
+          ],
+          "stride": true
+        },
+        "run": {
+          "loop": true,
+          "duration": [
+            0.4,
+            0.9
+          ],
+          "stride": true
+        },
+        "talk": {
+          "loop": true,
+          "duration": [
+            0.8,
+            3.0
+          ]
+        },
+        "sit": {
+          "loop": true,
+          "duration": [
+            1.0,
+            6.0
+          ]
+        },
+        "sleep": {
+          "loop": true,
+          "duration": [
+            1.0,
+            6.0
+          ]
+        },
+        "celebrate": {
+          "loop": false,
+          "duration": [
+            0.5,
+            4.0
+          ]
+        }
+      },
+      "variants": {
+        "default": {
+          "height_m": 0.9
+        }
+      },
+      "budget": {
+        "triangles": 4500,
+        "materials": 2,
+        "primitives": 2
+      }
+    },
+    "spirit": {
+      "bones": [
+        "root",
+        "body",
+        "face"
+      ],
+      "feet": [],
+      "slots": {
+        "headgear": {
+          "attach": "body"
+        },
+        "hand_l": {
+          "attach": "body"
+        },
+        "hand_r": {
+          "attach": "body"
+        }
+      },
+      "clips": {
+        "idle": {
+          "loop": true,
+          "duration": [
+            0.8,
+            6.0
+          ]
+        },
+        "walk": {
+          "loop": true,
+          "duration": [
+            0.6,
+            2.0
+          ],
+          "stride": false
+        },
+        "talk": {
+          "loop": true,
+          "duration": [
+            0.8,
+            3.0
+          ]
+        },
+        "sleep": {
+          "loop": true,
+          "duration": [
+            1.0,
+            6.0
+          ]
+        },
+        "celebrate": {
+          "loop": false,
+          "duration": [
+            0.5,
+            4.0
+          ]
+        },
+        "wave": {
+          "loop": false,
+          "duration": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "variants": {
+        "default": {
+          "height_m": 1.9
+        }
+      },
+      "budget": {
+        "triangles": 4000,
+        "materials": 3,
+        "primitives": 3
+      }
+    }
+  },
+  "limits": {
+    "part_triangles": 900,
+    "base_file_kb": 512,
+    "part_file_kb": 120,
+    "max_texture": 256,
+    "max_influences": 4,
+    "loop_epsilon": 0.002,
+    "loop_epsilon_deg": 1.0,
+    "origin_epsilon": 0.01,
+    "center_epsilon": 0.2,
+    "scale_epsilon": 0.0001
+  },
+  "targets": [
+    {
+      "id": "biped-rogue",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "rogue",
+      "source": "kaykit-adventurers",
+      "character": "Rogue",
+      "label": "Ranger",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-knight",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "knight",
+      "source": "kaykit-adventurers",
+      "character": "Knight",
+      "label": "Knight",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-mage",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "mage",
+      "source": "kaykit-adventurers",
+      "character": "Mage",
+      "label": "Mage",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-barbarian",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "barbarian",
+      "source": "kaykit-adventurers",
+      "character": "Barbarian",
+      "label": "Barbarian",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-office",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "office",
+      "source": "jarvis-humanoids",
+      "character": "Office",
+      "label": "Office",
+      "styles": [
+        "modern"
+      ]
+    },
+    {
+      "id": "biped-casual",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "casual",
+      "source": "jarvis-humanoids",
+      "character": "Casual",
+      "label": "Casual",
+      "styles": [
+        "modern"
+      ]
+    },
+    {
+      "id": "biped-chibi",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "chibi",
+      "source": "jarvis-humanoids",
+      "character": "Chibi",
+      "label": "Chibi",
+      "styles": [
+        "cartoon"
+      ]
+    },
+    {
+      "id": "biped-android",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "android",
+      "source": "jarvis-humanoids",
+      "character": "Android",
+      "label": "Android",
+      "styles": [
+        "scifi"
+      ]
+    },
+    {
+      "id": "biped-worker",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "worker",
+      "source": "jarvis-humanoids",
+      "character": "Worker",
+      "label": "Worker",
+      "styles": [
+        "modern"
+      ]
+    },
+    {
+      "id": "biped-athlete",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "athlete",
+      "source": "jarvis-humanoids",
+      "character": "Athlete",
+      "label": "Athlete",
+      "styles": [
+        "modern"
+      ]
+    },
+    {
+      "id": "biped-medic",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "medic",
+      "source": "jarvis-humanoids",
+      "character": "Medic",
+      "label": "Medic",
+      "styles": [
+        "modern"
+      ]
+    },
+    {
+      "id": "biped-toon",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "toon",
+      "source": "jarvis-humanoids",
+      "character": "Toon",
+      "label": "Toon",
+      "styles": [
+        "cartoon"
+      ]
+    },
+    {
+      "id": "biped-blockhead",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "blockhead",
+      "source": "jarvis-humanoids",
+      "character": "Blockhead",
+      "label": "Blockhead",
+      "styles": [
+        "cartoon"
+      ]
+    },
+    {
+      "id": "biped-pilot",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "pilot",
+      "source": "jarvis-humanoids",
+      "character": "Pilot",
+      "label": "Pilot",
+      "styles": [
+        "scifi"
+      ]
+    },
+    {
+      "id": "biped-trooper",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "trooper",
+      "source": "jarvis-humanoids",
+      "character": "Trooper",
+      "label": "Trooper",
+      "styles": [
+        "scifi"
+      ]
+    },
+    {
+      "id": "biped-scientist",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "scientist",
+      "source": "jarvis-humanoids",
+      "character": "Scientist",
+      "label": "Scientist",
+      "styles": [
+        "scifi"
+      ]
+    },
+    {
+      "id": "biped-dwarf",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "dwarf",
+      "source": "jarvis-humanoids",
+      "character": "Dwarf",
+      "label": "Dwarf",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-elf",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "elf",
+      "source": "jarvis-humanoids",
+      "character": "Elf",
+      "label": "Elf",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "biped-monk",
+      "archetype": "biped",
+      "variant": "medium",
+      "base": "monk",
+      "source": "jarvis-humanoids",
+      "character": "Monk",
+      "label": "Monk",
+      "styles": [
+        "fantasy"
+      ]
+    },
+    {
+      "id": "quadruped-fox",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "fox",
+      "source": "jarvis-animals",
+      "character": "Fox",
+      "label": "Fox",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "quadruped-cat",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "cat",
+      "source": "jarvis-animals",
+      "character": "Cat",
+      "label": "Cat",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "quadruped-dog",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "dog",
+      "source": "jarvis-animals",
+      "character": "Dog",
+      "label": "Dog",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "quadruped-wolf",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "wolf",
+      "source": "jarvis-animals",
+      "character": "Wolf",
+      "label": "Wolf",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "quadruped-rabbit",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "rabbit",
+      "source": "jarvis-animals",
+      "character": "Rabbit",
+      "label": "Rabbit",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "quadruped-bear",
+      "archetype": "quadruped",
+      "variant": "default",
+      "base": "bear",
+      "source": "jarvis-animals",
+      "character": "Bear",
+      "label": "Bear",
+      "styles": [
+        "animal"
+      ]
+    },
+    {
+      "id": "spirit-gigi",
+      "archetype": "spirit",
+      "variant": "default",
+      "base": "gigi",
+      "source": "gigi-mascot",
+      "character": "Gigi",
+      "label": "Gigi",
+      "styles": [
+        "spirit"
+      ]
+    }
+  ]
+}

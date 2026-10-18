@@ -1,0 +1,104 @@
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, expect, it, vi } from "vitest";
+import { AgentAppearanceDialog } from "./AgentAppearanceDialog";
+import { SAMPLE_ROSTER } from "../mockRoster";
+import { defaultCompanion } from "./appearance";
+
+vi.mock("@/i18n", () => ({ useT: () => (key: string) => key }));
+vi.mock("./CompanionPreview", () => ({ CompanionPreview: () => <div data-testid="preview" /> }));
+vi.mock("../figures/AgentFigureViewer", () => ({ AgentFigureViewer: () => <div data-testid="character-preview" /> }));
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+const PETS = { active: "gigi", scale: 1, bubble: true, strip_always: false, visible: true, pets: ["gigi", "cocoa"].map(id => ({
+  id, name: id, description: "", builtin: true, frame_size: 48, animations: { idle: { row: 0, frames: 1, fps: 1, loop: true } }, sheet_url: `/api/pets/${id}/sheet.png`,
+})) };
+
+function setup(fail = false, legacy = false) {
+  const original = SAMPLE_ROSTER.find(a => a.tier !== "lead")!;
+  const figure = legacy ? { contract: 1 as const, archetype: "biped" as const, base: "rogue", parts: {} } : original.figure!;
+  const agent = { ...original, agentId: "appearance-test", figure: { ...figure, companion: { ...defaultCompanion("test"), shape: "circle" as const } } };
+  const close = vi.fn();
+  // The look picker reads agent levels; an unreachable level system leaves every look open.
+  const fetcher = vi.fn(async (url: RequestInfo | URL) => String(url).startsWith("/api/progression")
+    ? new Response("{}", { status: 404 })
+    : String(url).startsWith("/api/pets") ? new Response(JSON.stringify(PETS), { status: 200 })
+    : new Response(JSON.stringify({ agent }), { status: fail ? 500 : 200 }));
+  const saves = () => fetcher.mock.calls.filter(([url]) => String(url).startsWith("/api/society/agents/"));
+  vi.stubGlobal("fetch", fetcher);
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}><AgentAppearanceDialog agent={agent} sample={false} onClose={close} /></QueryClientProvider>);
+  return { agent, fetcher, close, saves };
+}
+
+it("saves companion edits without overwriting character parts or other agent fields", async () => {
+  const { agent, saves } = setup();
+  fireEvent.click(screen.getByRole("button", { name: "society.companion.shapes.cloud" }));
+  fireEvent.click(screen.getByRole("button", { name: "society.card.save" }));
+  await waitFor(() => expect(saves()).toHaveLength(1));
+  const [, init] = saves()[0] as unknown as [string, RequestInit];
+  const body = JSON.parse(init.body as string);
+  expect(Object.keys(body)).toEqual(["avatar"]);
+  expect(body.avatar.companion.shape).toBe("cloud");
+  expect(body.avatar.parts).toEqual(agent.figure?.parts);
+  expect(body.avatar.base).toBe(agent.figure?.base);
+});
+
+it("protects an unsaved companion after a rejected save", async () => {
+  const { close } = setup(true);
+  fireEvent.click(screen.getByRole("button", { name: "society.companion.shapes.cloud" }));
+  fireEvent.click(screen.getByRole("button", { name: "society.card.save" }));
+  await screen.findByRole("alert");
+  expect(screen.getByRole("button", { name: "society.companion.shapes.cloud" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(screen.getAllByRole("button", { name: "society.card.close" })[0]);
+  expect(close).not.toHaveBeenCalled();
+  expect(screen.getByText("society.profile_card.unsaved")).toBeTruthy();
+});
+
+it("keeps the companion choice while editing the character", async () => {
+  setup();
+  fireEvent.click(screen.getByRole("button", { name: "society.companion.shapes.cloud" }));
+  fireEvent.click(screen.getByRole("tab", { name: "society.companion.character" }));
+  await screen.findByTestId("character-preview");
+  fireEvent.click(screen.getByRole("tab", { name: "society.companion.companion" }));
+  expect(screen.getByRole("button", { name: "society.companion.shapes.cloud" }).getAttribute("aria-pressed")).toBe("true");
+});
+
+it("keeps shape customization without size or following-distance sliders", () => {
+  setup();
+  expect(screen.queryByRole("slider")).toBeNull();
+  expect(screen.queryByText("society.companion.size")).toBeNull();
+  expect(screen.queryByText("society.companion.distance")).toBeNull();
+  expect(screen.getByRole("button", { name: "society.companion.shapes.cloud" })).toBeTruthy();
+});
+
+it("saves a chosen hairstyle on the recipe without dropping its colours", async () => {
+  const { agent, saves } = setup();
+  fireEvent.click(screen.getByRole("tab", { name: "society.companion.character" }));
+  await screen.findByTestId("character-preview");
+  fireEvent.click(screen.getByRole("button", { name: "society.office.hair_beanie" }));
+  expect(screen.getByRole("button", { name: "society.office.hair_beanie" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: "society.card.save" }));
+  await waitFor(() => expect(saves()).toHaveLength(1));
+  const [, init] = saves()[0] as unknown as [string, RequestInit];
+  const body = JSON.parse(init.body as string);
+  expect(body.avatar.hairStyle).toBe("beanie");
+  expect(body.avatar.palette).toEqual(agent.figure?.palette);
+});
+
+it("lets an agent wear a pet instead of its shape, and take the shape back", async () => {
+  const { saves } = setup();
+  fireEvent.click(screen.getByRole("button", { name: "society.companion.look_pet" }));
+  fireEvent.click(await screen.findByRole("button", { name: "cocoa" }));
+  expect(screen.queryByRole("button", { name: "society.companion.shapes.cloud" })).toBeNull();
+  // A pet brings its own colours: no colour picker beside it.
+  expect(screen.queryByLabelText("society.companion.custom_color")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "society.card.save" }));
+  await waitFor(() => expect(saves()).toHaveLength(1));
+  const worn = JSON.parse((saves()[0] as unknown as [string, RequestInit])[1].body as string);
+  expect(worn.avatar.companion).toMatchObject({ pet: "cocoa", shape: "circle" });
+  fireEvent.click(screen.getByRole("button", { name: "society.companion.look_shape" }));
+  fireEvent.click(screen.getByRole("button", { name: "society.card.save" }));
+  await waitFor(() => expect(saves()).toHaveLength(2));
+  const bare = JSON.parse((saves()[1] as unknown as [string, RequestInit])[1].body as string);
+  expect("pet" in bare.avatar.companion).toBe(false);
+});

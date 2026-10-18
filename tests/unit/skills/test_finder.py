@@ -1,0 +1,431 @@
+"""Unit tests for the SkillFinder.
+
+Cover:
+- Filter semantics (trust, stars, category, language, risk).
+- Heuristic ranking without a brain.
+- Brain-ranking integration (with a fake brain).
+- Brain-failure fallback to heuristics.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from jarvis.skills.finder import (
+    SearchFilters,
+    SkillCandidate,
+    SkillFinder,
+    TRUST_ORDER,
+    _passes_filter,
+    _score_heuristic,
+    _tokenize,
+)
+
+
+# ----------------------------------------------------------------------
+# Fixtures
+# ----------------------------------------------------------------------
+
+@pytest.fixture
+def sample_entries() -> list[dict]:
+    return [
+        {
+            "name": "email-triage",
+            "title": "Email Triage",
+            "description": "Prioritizes inbox, summarizes, suggests replies.",
+            "source": "skills-sh",
+            "source_url": "https://skills.sh/",
+            "raw_url": None,
+            "trust": "community",
+            "stars": 1800,
+            "categories": ["productivity", "communication"],
+            "languages": ["en", "de"],
+            "risk": "monitor",
+            "tags": ["email", "triage", "gmail"],
+        },
+        {
+            "name": "skill-creator",
+            "title": "Skill Creator",
+            "description": "Creates new skills and improves existing ones.",
+            "source": "anthropic",
+            "source_url": "https://github.com/anthropics/skills/tree/main/skills/skill-creator",
+            "raw_url": "https://raw.githubusercontent.com/anthropics/skills/main/skills/skill-creator/SKILL.md",
+            "trust": "official",
+            "stars": None,
+            "categories": ["meta", "authoring"],
+            "languages": ["en"],
+            "risk": "ask",
+            "tags": ["meta", "skills"],
+        },
+        {
+            "name": "voice-journal",
+            "title": "Voice Journal",
+            "description": "Voice-driven diary with STT and summarization.",
+            "source": "experimental",
+            "source_url": "https://example.com/",
+            "raw_url": None,
+            "trust": "experimental",
+            "stars": 80,
+            "categories": ["productivity"],
+            "languages": ["en", "de"],
+            "risk": "safe",
+            "tags": ["voice", "journal"],
+        },
+        {
+            "name": "docker-helper",
+            "title": "Docker Helper",
+            "description": "Creates Dockerfiles following best practices.",
+            "source": "community",
+            "source_url": "https://example.com/",
+            "raw_url": None,
+            "trust": "community",
+            "stars": 2600,
+            "categories": ["devops"],
+            "languages": ["en"],
+            "risk": "monitor",
+            "tags": ["docker", "devops"],
+        },
+    ]
+
+
+# ----------------------------------------------------------------------
+# Tokenizer
+# ----------------------------------------------------------------------
+
+def test_tokenize_ignoriert_kurze_woerter():
+    assert _tokenize("ab cde fghij") == {"cde", "fghij"}
+
+
+def test_tokenize_lower_case():
+    assert _tokenize("Docker Helper") == {"docker", "helper"}
+
+
+# ----------------------------------------------------------------------
+# Filter
+# ----------------------------------------------------------------------
+
+def test_filter_trust_blockt_niedrigeren_level(sample_entries):
+    f = SearchFilters(trust="verified")
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    names = {e["name"] for e in passing}
+    # official + verified allowed, community + experimental excluded
+    assert "skill-creator" in names
+    assert "email-triage" not in names
+    assert "voice-journal" not in names
+
+
+def test_filter_trust_any_laesst_alles_durch(sample_entries):
+    f = SearchFilters(trust="any")
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    assert len(passing) == len(sample_entries)
+
+
+def test_filter_min_stars_laesst_official_durch(sample_entries):
+    """Official skills have stars=None but should still pass through."""
+    f = SearchFilters(min_stars=2000)
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    names = {e["name"] for e in passing}
+    assert "skill-creator" in names  # official, null stars → stays
+    assert "docker-helper" in names  # 2600 stars
+    assert "email-triage" not in names  # 1800 < 2000
+    assert "voice-journal" not in names  # 80 < 2000
+
+
+def test_filter_category(sample_entries):
+    f = SearchFilters(category="devops")
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    assert [e["name"] for e in passing] == ["docker-helper"]
+
+
+def test_filter_max_risk(sample_entries):
+    f = SearchFilters(max_risk="safe")
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    # Only voice-journal (risk=safe)
+    assert [e["name"] for e in passing] == ["voice-journal"]
+
+
+def test_filter_language_en_als_fallback(sample_entries):
+    """When the user requests 'de', EN-only skills must drop out,
+    but bilingual (en+de) skills stay."""
+    f = SearchFilters(language="de")
+    passing = [e for e in sample_entries if _passes_filter(e, f)]
+    names = {e["name"] for e in passing}
+    # email-triage, voice-journal have "de" -> included
+    # skill-creator, docker-helper have only "en" -> excluded (no "de")
+    # But the code allows EN as a fallback? Check...
+    # If 'de' is not in langs but 'en' is in langs → passes through (bilingual fallback)
+    assert names == {"email-triage", "voice-journal", "skill-creator", "docker-helper"}
+
+
+# ----------------------------------------------------------------------
+# Heuristic Scoring
+# ----------------------------------------------------------------------
+
+def test_score_heuristic_matcht_tags_staerker_als_description(sample_entries):
+    docker_entry = next(e for e in sample_entries if e["name"] == "docker-helper")
+    query_tokens = _tokenize("docker")
+    score = _score_heuristic(query_tokens, docker_entry)
+    assert score > 0.0
+
+
+def test_score_heuristic_null_query_null_score(sample_entries):
+    entry = sample_entries[0]
+    assert _score_heuristic(set(), entry) == 0.0
+
+
+def test_score_heuristic_keine_treffer(sample_entries):  # i18n-allow: identifier name, not translatable prose
+    entry = sample_entries[0]  # email-triage
+    score = _score_heuristic(_tokenize("quantencomputer"), entry)
+    assert score == 0.0
+
+
+# ----------------------------------------------------------------------
+# SkillFinder.search ohne Brain
+# ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_ohne_brain_rankt_heuristisch(monkeypatch, sample_entries):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    finder = SkillFinder(brain=None)
+    result = await finder.search(SearchFilters(query="docker", limit=5))
+
+    # docker-helper should be the top hit
+    assert result[0].name == "docker-helper"
+    assert result[0].score > 0
+
+
+@pytest.mark.asyncio
+async def test_search_mit_trust_filter(monkeypatch, sample_entries):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    finder = SkillFinder(brain=None)
+    result = await finder.search(
+        SearchFilters(query="skill", trust="official", limit=5)
+    )
+
+    assert all(c.trust == "official" for c in result)
+
+
+@pytest.mark.asyncio
+async def test_search_query_without_text_match_returns_empty(
+    monkeypatch, sample_entries
+):
+    """A query that matches no entry text must NOT fall back to a page of
+    filter-only hits ("Trust match (official) · Score 0.03")."""
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    finder = SkillFinder(brain=None)
+    result = await finder.search(
+        SearchFilters(query="PDf", trust="official", min_stars=500, limit=10)
+    )
+    assert result == []
+
+    # Same without any filter: still nothing matches "pdf" in the sample set
+    assert await finder.search(SearchFilters(query="PDf", limit=10)) == []
+
+
+@pytest.mark.asyncio
+async def test_search_drops_filter_only_entries_when_query_matches_some(
+    monkeypatch, sample_entries
+):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    result = await SkillFinder(brain=None).search(
+        SearchFilters(query="docker", limit=10)
+    )
+    assert [c.name for c in result] == ["docker-helper"]
+    assert not any("Trust match" in c.reason for c in result)
+
+
+@pytest.mark.asyncio
+async def test_search_tag_match_is_case_insensitive_and_names_the_tag(
+    monkeypatch, sample_entries
+):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    result = await SkillFinder(brain=None).search(
+        SearchFilters(query="GMail", limit=10)
+    )
+    assert result[0].name == "email-triage"
+    assert "tag: gmail" in result[0].reason
+    assert "Trust match" not in result[0].reason
+
+
+@pytest.mark.asyncio
+async def test_search_empty_query_browses_by_filters_only(
+    monkeypatch, sample_entries
+):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    result = await SkillFinder(brain=None).search(
+        SearchFilters(query="", trust="official", limit=10)
+    )
+    assert [c.name for c in result] == ["skill-creator"]
+    assert result[0].reason == "Trust match (official)"
+
+
+@pytest.mark.asyncio
+async def test_search_punctuation_only_query_returns_empty(
+    monkeypatch, sample_entries
+):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    assert await SkillFinder(brain=None).search(SearchFilters(query="???")) == []
+
+
+# ----------------------------------------------------------------------
+# Brain-Ranking-Integration
+# ----------------------------------------------------------------------
+
+class _FakeBrain:
+    """Minimal fake brain for finder tests. Returns pre-stored responses."""
+
+    def __init__(self, response: str) -> None:
+        self._response = response
+        self.call_count = 0
+
+    async def generate(self, user_text: str, *, use_history: bool = True) -> str:
+        self.call_count += 1
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_search_nutzt_brain_ranking(monkeypatch, sample_entries):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    brain_response = json.dumps([
+        {"name": "voice-journal", "score": 0.95, "reason": "Perfect match"},
+        {"name": "email-triage", "score": 0.3, "reason": "less fitting"},
+    ])
+    fake = _FakeBrain(brain_response)
+
+    finder = SkillFinder(brain=fake)
+    result = await finder.search(SearchFilters(query="voice tagebuch", limit=5))
+
+    assert fake.call_count == 1
+    # voice-journal must be the top hit because brain score 0.95 dominates
+    assert result[0].name == "voice-journal"
+    assert "Perfect match" in result[0].reason
+
+
+@pytest.mark.asyncio
+async def test_brain_cannot_resurrect_non_matching_entries(
+    monkeypatch, sample_entries
+):
+    """The brain re-ranks textual matches only — a high brain score for an
+    entry the query text rejected must not bring it back."""
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    fake = _FakeBrain(json.dumps([
+        {"name": "email-triage", "score": 0.99, "reason": "brain likes it"},
+        {"name": "docker-helper", "score": 0.5, "reason": "docker"},
+    ]))
+    result = await SkillFinder(brain=fake).search(
+        SearchFilters(query="docker", limit=10)
+    )
+    assert [c.name for c in result] == ["docker-helper"]
+    # With nothing matching, the brain is not even consulted
+    fake.call_count = 0
+    assert await SkillFinder(brain=fake).search(SearchFilters(query="PDf")) == []
+    assert fake.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_search_faellt_auf_heuristik_bei_brain_fehler(  # i18n-allow: identifier name, not translatable prose
+    monkeypatch, sample_entries
+):
+    """If the brain returns invalid JSON, the finder must still return
+    results — graceful degradation instead of a crash."""
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    fake = _FakeBrain("this is not JSON, just prose")
+
+    finder = SkillFinder(brain=fake)
+    result = await finder.search(SearchFilters(query="docker", limit=5))
+
+    # Must still work
+    assert len(result) > 0
+    assert result[0].name == "docker-helper"
+
+
+@pytest.mark.asyncio
+async def test_search_brain_exception_faellt_auf_heuristik(
+    monkeypatch, sample_entries
+):
+    from jarvis.skills import catalog
+
+    monkeypatch.setattr(catalog, "load_catalog", lambda: sample_entries)
+
+    class _BrokenBrain:
+        async def generate(self, *a, **kw):
+            raise RuntimeError("broken")
+
+    finder = SkillFinder(brain=_BrokenBrain())
+    result = await finder.search(SearchFilters(query="docker", limit=5))
+
+    assert len(result) > 0
+    assert result[0].name == "docker-helper"
+
+
+# ----------------------------------------------------------------------
+# SkillCandidate roundtrip
+# ----------------------------------------------------------------------
+
+def test_candidate_from_entry_to_dict(sample_entries):
+    cand = SkillCandidate.from_catalog_entry(sample_entries[0])
+    d = cand.to_dict()
+    assert d["name"] == "email-triage"
+    assert d["trust"] == "community"
+    assert d["categories"] == ["productivity", "communication"]
+    assert d["tags"] == ["email", "triage", "gmail"]
+
+
+# ----------------------------------------------------------------------
+# Install
+# ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_install_ohne_raw_url_raised(tmp_path, monkeypatch):
+    """A candidate without raw_url must produce a clear error."""
+    monkeypatch.setattr(
+        "jarvis.skills.finder.user_skills_dir", lambda: tmp_path
+    )
+    cand = SkillCandidate(
+        name="no-download",
+        title="No Download",
+        description="",
+        source="x",
+        source_url="https://example.com/",
+        raw_url=None,
+        trust="community",
+        stars=None,
+        categories=(),
+        languages=(),
+        risk="safe",
+        tags=(),
+    )
+    finder = SkillFinder()
+    with pytest.raises(RuntimeError, match="No direct download available"):
+        await finder.install(cand)

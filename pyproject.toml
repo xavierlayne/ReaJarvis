@@ -1,0 +1,994 @@
+[build-system]
+# setuptools>=77 is the floor for the PEP 639 license expression below; the
+# TOML-table form it replaces is deprecated and scheduled for removal. The
+# floor is raised to 83 because every setuptools < 83.0.0 carries a published
+# advisory (Dependabot #85) — a build-time-only exposure, but the pin costs
+# nothing and 83 still satisfies the PEP 639 requirement above.
+requires = ["setuptools>=83", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-jarvis"
+version = "3.0.0"
+description = "Turn your computer into an AI agent that coordinates apps, tools, models, and other agents"
+requires-python = ">=3.11,<3.15"
+readme = "README.md"
+# Apache-2.0 from 2.0.0 on. Releases up to 1.6.0 shipped MIT and stay MIT —
+# docs/licensing.md has the reasoning and what is still owed at the release.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Ruben Lütke" }]  # i18n-allow: maintainer proper name (umlaut)
+keywords = [
+    "voice-assistant",
+    "ai-agent",
+    "agents",
+    "llm",
+    "orchestrator",
+    "speech-to-text",
+    "text-to-speech",
+    "wake-word",
+    "computer-use",
+    "automation",
+]
+# No "License :: OSI Approved ::" classifier: PEP 639 forbids pairing one with
+# the SPDX `license` expression above, and setuptools rejects the combination.
+# The OS list is exhaustive on purpose — every feature ships on all three
+# (CLAUDE.md §3), including a headless Linux server with no screen or audio.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "tzdata>=2025.2",  # IANA rules on Windows and minimal Linux installs
+    "anthropic>=0.96",
+    "openai>=1.30",  # 1.30+ is the minimum version required for stream_options (June 2024)
+    "google-genai>=1.0",
+    # Async client and web-stack security fixes from AnyIO 4.14.2 onward.
+    "anyio>=4.14.2",
+    # Lazy-imported by jarvis/brain/structured_output_parser.py to recover
+    # malformed vision JSON; without it the repair path silently degrades on
+    # every fresh install (found 2026-07-18, was never declared).
+    "json-repair>=0.30",
+    # The code editor detects the encoding of non-UTF-8 text files with it
+    # (lazy import); already installed through requests, declared because
+    # Jarvis imports it directly.
+    "charset-normalizer>=3.4",
+    # The code editor's Python completions, hovers and go-to-definition
+    # (static analysis, lazy import; pure Python).
+    "jedi>=0.19",
+    # The code editor's delete moves files to the system trash (Recycle Bin,
+    # macOS Trash, freedesktop trash) instead of erasing them; pure Python.
+    "Send2Trash>=1.8.3",
+    # Current security fixes on every architecture. The reviewed native index
+    # supplies Intel macOS and Windows ARM64 wheels without end-user compilers.
+    "cryptography>=50.0.2",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "structlog>=24.4",
+    "loguru>=0.7",
+    "keyring>=25.5",
+    # SSH to the user's own servers and virtual machines (Settings -> Computers).
+    # Pure Python on top of cryptography, so it installs on every OS cell and a
+    # headless python:3.11-slim without a system ssh client. The bcrypt extra
+    # is what unlocks a passphrase-protected OpenSSH key (ssh-keygen's default
+    # format), so a user's own protected key can be added at all.
+    "asyncssh[bcrypt]>=2.24.0",
+    # Security floor for a transitive dependency (mcp, twilio): 2.13.0 carries
+    # ten advisories fixed in 2.14.0 (CVE-2026-101917, CVE-2026-102265..102274).
+    "pyjwt>=2.14.0",
+    # Security floor for a transitive dependency (requests, httpx stacks):
+    # 2.7.0 carries CVE-2026-97687..97689, fixed in 2.8.0.
+    "urllib3>=2.8.0",
+    "sounddevice>=0.5",  # PortAudio binding; needs system libportaudio2 on Linux
+    # ChatGPT-Live (Codex subscription voice) carries audio ONLY on a WebRTC
+    # media track — its protocol has no audio event at all. Jarvis owns that
+    # peer in-process so the existing pipeline (wake word, echo guard,
+    # barge-in, Orb) keeps working. Upstream has no compiler-free Windows ARM64
+    # dependency chain, so that cell uses the existing honest unavailable state
+    # while every other voice path remains available.
+    "aiortc>=1.13; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    # aiortc's broad PyAV range otherwise resolves a release without Apple-
+    # Silicon wheels. 15.1 is inside its supported range and carries the full
+    # CPython 3.11-3.14 macOS ARM64 wheel matrix.
+    "av==15.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # NumPy 2.1 is the conservative runtime branch everywhere it ships. Its
+    # Windows ARM64 wheel gap is permanent, though, so that architecture uses
+    # the first compatible branch with official CPython 3.11+ ARM64 wheels.
+    # Without the split, pip attempts a native source build and a stock Windows
+    # ARM64 install fails before Jarvis can offer its cloud/browser fallbacks.
+    "numpy>=1.26,<2.2; python_version < '3.14' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "numpy>=2.3.5,<2.4; python_version >= '3.14' or (sys_platform == 'win32' and platform_machine == 'ARM64')",
+    "scipy>=1.14",
+    # Browser voice reuses jarvis.telephony.audio's streaming resampler even
+    # when Twilio is not installed. Python 3.13 removed stdlib audioop, so the
+    # backport belongs in BASE rather than only in the [telephony] extra.
+    "audioop-lts; python_version>='3.13'",
+    # Wake-word runtime — BASE, not opt-in. The word-agnostic openWakeWord
+    # backbones (melspectrogram, embedding) ship in every wheel
+    # (jarvis/assets/wakeword/) so a user-trained custom wake model loads
+    # offline; NO named wake model ships (design 2026-07-07). openwakeword +
+    # CPU onnxruntime are tiny (~15 MB), torch-free and platform-universal
+    # (onnxruntime ships CPU wheels for win/mac/manylinux; the lockfile guard
+    # bans only torch/ctranslate2/faster-whisper/onnxruntime-GPU, not CPU
+    # onnxruntime). The VAD already runs Silero via onnxruntime
+    # (jarvis/audio/vad.py), so base carrying it is proven. Both are
+    # lazy-imported in openwakeword_provider.py.
+    # openWakeWord 0.6 hard-depends on tflite-runtime on Linux. Its wheels stop
+    # at CPython 3.11, and the ARM64 wheel requires a newer glibc than the
+    # supported manylinux_2_28 floor. macOS CPython 3.14 likewise lacks a usable
+    # ONNX Runtime wheel. Vosk, browser voice, cloud STT, and energy endpointing
+    # remain working fallbacks on the excluded cells.
+    "openwakeword>=0.6; sys_platform != 'linux' and (sys_platform != 'darwin' or (python_version < '3.14' and platform_machine == 'arm64'))",
+    "openwakeword>=0.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version < '3.12'",
+    # ONNX Runtime 1.24+ raises the macOS deployment floor and has no usable
+    # CPython 3.14 artifact for the supported baseline. Keep 1.23 on macOS
+    # 3.11-3.13; other operating systems use the current CPU line. The portable
+    # energy VAD is the explicit macOS 3.14 fallback.
+    # arm64-only on macOS: no Intel-mac onnxruntime wheels anymore (BUG-061);
+    # Silero VAD degrades to WebRTC VAD there (ships in [local-voice]/[full]);
+    # bare base installs degrade to portable energy endpointing.
+    "onnxruntime>=1.17,<1.24; sys_platform == 'darwin' and python_version < '3.14' and platform_machine == 'arm64'",
+    "onnxruntime>=1.17; sys_platform != 'darwin'",
+    # Any-word wake keyword spotting (vosk_kws engine, design spec 2026-07-05):
+    # Vosk is Apache-2.0, torch-free, ~7 MB wheel with bundled libvosk, official
+    # CPU wheels for macOS and Linux x86+ARM plus Windows x86/x64. Upstream does
+    # not ship Windows ARM64, so that one target skips Vosk and retains the
+    # ONNX/browser/cloud wake paths. Each per-language model is ~45 MB and is
+    # fetched into data/wake_models/vosk/<lang>/, NOT bundled. The advertised
+    # full installer caches every onboarding language; headless/base setup keeps
+    # only its configured language.
+    # Lazy-imported in vosk_kws_provider.py; base `import jarvis` stays clean.
+    # CAP below 0.3.45: that release ships NO macOS wheel (linux/win only), so a
+    # floor above 0.3.44 bricks every Mac install (AP-23; caught by the CI
+    # fresh-install smoke's macOS leg 2026-07-07). 0.3.44 is the newest release
+    # with wheels for ALL supported OSes (macosx_10_6_universal2 + linux + win).
+    "vosk>=0.3.44,<0.3.45; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    # The default VAD runs the bundled Silero ONNX model through base CPU
+    # onnxruntime. WebRTC VAD and the local Whisper path (faster-whisper) stay
+    # in the [local-voice] extra per the cloud-first doctrine (CLAUDE.md). All
+    # optional engines are lazy-imported, so the base `import jarvis` stays
+    # clean without them.
+    # Local STT removed 2026-05-18 — Groq Whisper API is the new default.
+    # google-cloud-texttospeech was removed: no runtime module imports it, and
+    # its unused gRPC stack prevented compiler-free Windows ARM64 installs.
+    "elevenlabs>=1.5",  # cloud TTS (pure-Python HTTP SDK) — safe in base
+    # chromadb removed 2026-06-28: it had ZERO importers in jarvis/ (vestige of the
+    # soft-disabled legacy curator), pulled a large transitive tree, and carried a
+    # critical advisory with no fixed release. The Wiki is the live memory tier.
+    # sentence-transformers was removed 2026-07-01 for the same reason (ZERO
+    # importers in jarvis/) — it only dragged in torch + a large transformers/HF
+    # tree. It is gone from [local-voice] too, not relocated.
+    # Desktop-only packages (global-hotkeys, pywinauto, pywin32, pystray,
+    # pywebview, pywinpty, win10toast-click, pyautogui, mss) live in the [desktop]
+    # extras group per the cloud-first doctrine (CLAUDE.md). The base install must
+    # boot on a headless Linux VPS without them.
+    "psutil>=6.1",
+    # Floor 12.3.0: a large batch of Pillow image-decoder advisories (JPEG2000
+    # scratch-buffer DoS, McIdas AREA mmap out-of-bounds read, RankFilter/
+    # ImagingExpand heap overflow, and the CVE-2026-54058..59205 cluster) affect
+    # every release through 12.2.x and are all fixed in 12.3.0 — never resolve
+    # lower (Dependabot Pillow alerts).
+    "pillow>=12.3.0",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "prometheus-client>=0.21",
+    "httpx>=0.27",
+    # 9.14.4 newly requires Brotli, which has no Windows ARM64 wheel. 9.14.3
+    # retains the same key-free multi-engine search surface without that native
+    # dependency; bump only when the full target matrix proves the replacement.
+    "ddgs==9.14.3",
+    "aiofiles>=24.1",
+    "aiolimiter>=1.1",
+    "tenacity>=9.0",
+    # Floor 1.28.1: three high-severity advisories in the MCP SDK's HTTP/WS
+    # transports (missing Host/Origin validation, unverified session
+    # principal, cross-client task access) are fixed there — never resolve
+    # lower (Dependabot #48-#51).
+    # Ceiling <2: mcp 2.0.0 removes the low-level Server decorator API
+    # (@server.list_tools / @server.call_tool become constructor parameters)
+    # and stops auto-wrapping return values, which breaks
+    # jarvis/missions/workers/broker_stdio.py at import time. Lift the
+    # ceiling only together with a deliberate 2.x migration of that adapter.
+    "mcp>=1.28.1,<2",
+    "rich>=13.9",
+    # jarvisctl control CLI (jarvis/cli_ctl/): Typer command surface + platformdirs
+    # for cross-platform per-user config/cache dirs. Pure-Python, VPS-safe.
+    "typer>=0.12",
+    "platformdirs>=4",
+    # click is imported directly by jarvis/cli_ctl (__main__.py + dynamic.py). It
+    # used to arrive transitively via typer, but modern typer no longer guarantees
+    # it, so declare it explicitly — otherwise the jarvisctl CLI fails to import on
+    # a clean install.
+    "click>=8.1",
+    # Desktop-App (Phase 1a) — cross-platform pieces stay in base.
+    "fastapi>=0.115",
+    # Plain uvicorn uses its portable asyncio/h11 implementation. The standard
+    # speed extra is optional and pulled source-only httptools on Windows ARM64.
+    "uvicorn>=0.32",
+    "websockets>=13",
+    "filelock>=3.16",
+    "jsonschema>=4.23",
+    "packaging>=24.0",
+    # Skill-System + MCP (Phase 1c). The loaders already parse frontmatter via
+    # PyYAML, so the redundant python-frontmatter wrapper is not required.
+    # Server-side markdown→HTML for the Outputs "view in browser" action
+    # (pure-Python; the /view route degrades to <pre> if it is ever absent).
+    "markdown>=3.5",
+    "num2words>=0.5.13",  # deterministic number->words for the voice path (spoken-safe)
+    "jinja2>=3.1",
+    "croniter>=6.0",
+    # Floor 3.1.60 includes the earlier command-injection fixes and the fixes
+    # for PYSEC-2026-3982, PYSEC-2026-3983, and PYSEC-2026-3984.
+    "gitpython>=3.1.60",
+    # Missing native observers degrade to the registries' existing no-op/polling
+    # behavior instead of turning installation into a compiler exercise.
+    "watchdog>=5.0; (sys_platform != 'darwin' or python_version < '3.14') and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    # Atomic TOML edits from the desktop app (Phase 1b: provider persistence)
+    "tomlkit>=0.12",
+    # === F-FRIENDS [F0+F1] · feature/friends-section · ruben-2026-04-30 ===
+    # Phase F0 — async SQLite for FriendRegistry (previously transitive via chromadb).
+    "aiosqlite>=0.21",
+    # Document text extraction (jarvis/documents/extract.py) and the Agentic
+    # IDE's drop analysis: pypdf is the one non-stdlib parser those need, and
+    # it is a pure-Python universal wheel. Lazy-imported, with honest
+    # per-file degradation when absent.
+    "pypdf>=6.16.1",
+    # Phase F1 — Telegram channel bot via long-polling (ChannelAdapter).
+    "python-telegram-bot>=22,<23",
+]
+
+# These are the sidebar of the PyPI project page — for many visitors the first
+# and only place they meet the project, so every route out of it is listed.
+[project.urls]
+Homepage = "https://github.com/PersonalJarvis/PersonalJarvis"
+Repository = "https://github.com/PersonalJarvis/PersonalJarvis"
+Issues = "https://github.com/PersonalJarvis/PersonalJarvis/issues"
+Documentation = "https://github.com/PersonalJarvis/PersonalJarvis/blob/main/README.md"
+Changelog = "https://github.com/PersonalJarvis/PersonalJarvis/blob/main/CHANGELOG.md"
+Discord = "https://discord.gg/x7USduHxbc"
+
+[project.optional-dependencies]
+# Optional message transports; the base application remains headless-friendly.
+trigger-streams = ["aiokafka>=0.12,<1", "aio-pika>=9,<10", "paho-mqtt>=2.1,<3", "redis>=5,<9"]
+dev = [
+    # Pull the runtime extras the test suite exercises. The local-voice + desktop
+    # packages were base dependencies until the cloud-first split; tests still
+    # construct them, so the dev/CI environment keeps them via this self-reference
+    # while the base install stays lean.
+    "personal-jarvis[desktop,local-voice]",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.100",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pyinstaller>=6.11",
+]
+# "Everything" in one shot — the ONE advertised install profile (design spec
+# 2026-07-07): desktop app + telephony + chat channels + local voice models.
+# Each sub-extra carries its own platform markers, so `pip install .[full]`
+# quietly skips what does not apply to the OS. Every profile remains torch-free.
+# The cloud-first BASE install (plain `pip install .`) is still the internal
+# native-engine-minimal floor for CI and tiny headless servers; users are pointed
+# at [full].
+full = [
+    "personal-jarvis[desktop,desktop-macos,telephony,channels,local-voice]",
+]
+# Twilio telephony voice agent (call Jarvis on a phone number). Optional extra
+# per the cloud-first doctrine: the base install must boot without it, and the
+# telephony routes degrade gracefully when it is absent (AD-T8). BASE carries
+# audioop-lts on Python 3.13+ because browser voice shares the resampler.
+telephony = [
+    # Stream/Connect TwiML, RequestValidator and the REST client used here are
+    # stable since 8.x; verified green against the installed 8.11.0.
+    "twilio>=8.0",
+]
+# Chat-channel bot libraries. Cloud-first doctrine (CLAUDE.md, RULE #1): the
+# base install must boot on a headless Linux VPS without these, so discord.py is
+# an OPTIONAL extra. `jarvis.channels.discord` lazy-imports it and degrades to a
+# clear English ChannelStartError when absent. (python-telegram-bot is a
+# grandfathered base dependency above; new channel libs go here instead.)
+# Discord runs fine headless on a VPS, so this is intentionally NOT in [desktop].
+channels = [
+    "discord.py>=2,<3",
+]
+# Desktop / tray / overlay extras. Cloud-first doctrine (CLAUDE.md): the base
+# install must boot on a headless Linux VPS without these. Windows-only
+# packages carry an explicit ``sys_platform`` marker so a ``pip install
+# .[desktop]`` on Linux quietly skips them (pystray + pywebview still
+# install, since they ship Linux wheels and benefit Linux desktop users).
+desktop = [
+    "global-hotkeys>=0.1.7; sys_platform == 'win32'",
+    "pywinauto>=0.6.9; sys_platform == 'win32'",
+    "pywin32>=308; sys_platform == 'win32'",
+    "pywinpty>=2.0; sys_platform == 'win32'",
+    # win10toast-click depends on pywin32; only one release on PyPI (0.1.2),
+    # so the version floor is relaxed from the original >=0.1.3 pin which
+    # no PyPI version satisfies.
+    "win10toast-click>=0.1.2; sys_platform == 'win32'",
+    # Per-app audio ducking ("Mute music while dictating", Taskbar section):
+    # Windows Core Audio session control. comtypes is pycaw's COM backend.
+    "pycaw>=20240210; sys_platform == 'win32'",
+    "comtypes>=1.2; sys_platform == 'win32'",
+    # OS media session (jarvis/platform/media_session.py): read "now playing"
+    # and steer play/pause/next of the browser or the YouTube Music app through
+    # WinRT GlobalSystemMediaTransportControlsSessionManager. PyWinRT ships one
+    # wheel per namespace; the four below are exactly what the module touches.
+    # Absent, the module degrades to media keys (control only, no reading).
+    "winrt-runtime>=3.2; sys_platform == 'win32'",
+    "winrt-Windows.Foundation>=3.2; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections>=3.2; sys_platform == 'win32'",
+    "winrt-Windows.Media.Control>=3.2; sys_platform == 'win32'",
+    "pystray>=0.19",
+    "pywebview>=5.3",
+    # macOS Computer-Use keyboard actuation and Windows AppShot key events.
+    # macOS global hotkeys use a listen-only Quartz event tap (BUG-077).
+    # Linux retains pyautogui/no-op fallbacks to avoid compiling evdev against
+    # host kernel headers on stock headless images. Windows AppShot shortcuts
+    # use key events so brief taps are never polled away. ptyprocess is the
+    # POSIX terminal backend; Windows keeps pywinpty above.
+    "pynput>=1.7; sys_platform == 'darwin' or sys_platform == 'win32'",
+    "ptyprocess>=0.7; sys_platform != 'win32'",
+    # Screen capture (mss) + desktop input automation (pyautogui) — all-platform
+    # desktop deps that need a display (useless on a headless VPS). Both are
+    # lazy-imported everywhere, so the base install degrades to a graceful English
+    # no-op when they are absent.
+    "pyautogui>=0.9.54",
+    "mss>=10.0",
+    # Computer-Use screen indicator (jarvis/cu/indicator): the yellow glow
+    # border + "Esc to cancel" pill rendered by a small PySide6 sidecar
+    # process. Essentials only (QtCore/QtGui/QtWidgets — no WebEngine).
+    # Imported ONLY inside the sidecar; the controller probes for it and
+    # degrades to a logged no-op when absent (headless/base install).
+    # EXCLUDED on aarch64 Linux entirely: no PySide6 release >=6.7 publishes
+    # an aarch64 wheel at the advertised glibc/manylinux_2_28 floor (verified
+    # 2026-07-18 across 6.7..6.11.1 — aarch64 wheels start at manylinux_2_39),
+    # so the dep is unsatisfiable there for every CPython. The indicator's
+    # probe already degrades to a logged no-op where PySide6 is absent.
+    "pyside6-essentials>=6.7; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    # Streaming desktop capture; Wayland uses the user-approved ScreenCast portal.
+    "pyside6-addons>=6.7; sys_platform != 'linux' or platform_machine != 'aarch64'",
+    "av>=14; sys_platform != 'win32' or platform_machine != 'ARM64'",
+    # Opt-in screen-recording output loopback; never imported during base boot.
+    "SoundCard>=0.4.6; sys_platform == 'win32' or sys_platform == 'linux'",
+    # Drag-drop ONTO the floating overlay (bar/mascot): the cross-platform tkdnd
+    # Tcl extension, with bundled binaries for Windows / macOS / Linux. Registered
+    # onto the live Tk root in place (jarvis/overlay/drop_target.py). All-platform
+    # desktop dep; absent → the overlay drop degrades to a logged no-op while the
+    # in-app web dock (POST /api/chat/drop) still carries the feature everywhere.
+    # PIN ==0.4.2 (verified on real Windows/macOS-arm64/Linux GitHub runners,
+    # 2026-06-22): from 0.4.4.1 onward the osx-arm64 binary is the Tcl-9 build
+    # (libtcl9tkdnd2.9.5.dylib) which fails to load on the standard Tcl-8.6 Python
+    # ("incompatible stubs mechanism") — breaking the overlay drop on Apple
+    # Silicon. 0.4.2 ships the Tcl-8 osx-arm64 binary that loads on all three OSes.
+    "tkinterdnd2==0.4.2",
+]
+# macOS accessibility / overlay extras (Wave 2, AD-14). pyobjc frameworks back
+# the macOS AX-tree UI-element-click source (Wave 2.1) and are macOS-only, so
+# every entry carries a ``sys_platform == 'darwin'`` marker — a
+# ``pip install .[desktop-macos]`` on Windows/Linux quietly skips them, and the
+# base install never pulls them in. Linux's AT-SPI uses distro-packaged pyatspi
+# (``apt install python3-pyatspi gir1.2-atspi-2.0``), surfaced via the
+# ``capabilities.has_ax_tree`` runtime probe — it is NEVER a pip dependency.
+# Linux DESKTOP input extras — deliberately opt-in and NOT part of [full].
+#
+# Global hotkeys on Linux/X11 need pynput, and pynput hard-requires ``evdev``,
+# which ships source-only and compiles against the kernel headers. Pulling that
+# into [full] would break the one advertised install path on a stock
+# python:3.11-slim image — exactly what the cloud-first rule forbids. So it
+# lives here: a Linux desktop user who wants a global dictation/call shortcut
+# installs ``personal-jarvis[desktop-linux]`` (needs a C compiler and
+# linux-headers), and everyone else gets the honest, logged no-op instead of a
+# failed install.
+#
+# Wayland is a separate matter and this extra does NOT fix it: Wayland blocks
+# global key grabs by design, so shortcuts there belong to the compositor.
+# See docs/os-parity.md.
+desktop-linux = [
+    "pynput>=1.7; sys_platform == 'linux'",
+]
+desktop-macos = [
+    # The managed-install app bundle keeps a native Mach-O launcher: a shell
+    # CFBundleExecutable that execs external Python has no stable TCC
+    # identity. The launcher is compiled at install time from the in-repo
+    # stub (jarvis/setup/macos_stub_launcher.c, shipped as package data) with
+    # the Xcode Command Line Tools' clang, keeping the interpreter inside the
+    # app process while source/dependencies remain in the managed checkout —
+    # py2app is no longer a dependency, and the stub also links against
+    # non-framework (uv standalone) interpreters that py2app never supported.
+    "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-Accessibility>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=10; sys_platform == 'darwin'",
+    # Native per-window Computer-Use capture (SCScreenshotManager by
+    # CGWindowID); runtime-probed — an absent framework degrades to rect grabs.
+    "pyobjc-framework-ScreenCaptureKit>=10; sys_platform == 'darwin'",
+]
+# Local (offline) voice engines. Optional per the cloud-first doctrine
+# (CLAUDE.md §3): this extra ships with the advertised [full] profile (design
+# 2026-07-07) and remains individually opt-in for base installs. Every package
+# here is lazy-imported in its provider, so the base `import jarvis` and the
+# headless server boot without them.
+#
+# None of Jarvis's runtime paths require torch. VAD runs the bundled Silero ONNX
+# model (jarvis/assets/vad/silero_vad.onnx) through base CPU onnxruntime, STT uses
+# ctranslate2 (faster-whisper), and wake uses onnxruntime/TFLite. The redundant
+# `silero-vad` package was removed from every profile because its loader pulled
+# torch even though Jarvis never used that loader. Both [local-voice] and [full]
+# must remain torch-free and must not require a GPU.
+# `sentence-transformers` was removed 2026-07-01: it had ZERO importers in jarvis/
+# (an embedding vestige) yet dragged in torch + a large transformers/HF tree.
+# openwakeword + onnxruntime moved to BASE 2026-07-04 (torch-free, ~15 MB) so the
+# always-on neural wake fires out-of-the-box on any machine — they are NO LONGER
+# here. The Silero VAD *model* moved to BASE too (2026-07-04): it is bundled as an
+# ~2.2 MB MIT asset under jarvis/assets/vad/ and run torch-free via onnxruntime, so
+# end-of-speech detection also works out-of-the-box. A partial checkout without
+# that required asset fails honestly instead of pulling a second model package.
+# This extra therefore covers only alternate local paths: WebRTC VAD and
+# faster-whisper (the local-Whisper wake/STT accuracy path — previously pulled on demand by the
+# in-app "enable local speech" installer, now preinstalled via [full] per the
+# 2026-07-07 one-full-install decision; the in-app installer remains as the
+# recovery path for base installs). pvporcupine was removed 2026-07-07: never
+# imported anywhere, proprietary-keyed, ships branded built-in keywords.
+local-voice = [
+    # Neither WebRTC VAD nor CTranslate2 publishes a Windows ARM64 wheel, and
+    # WebRTC VAD has no CPython 3.14 wheel. Faster Whisper also pulls ONNX
+    # Runtime, whose supported-macOS CPython 3.14 wheel does not exist. The
+    # energy VAD plus cloud/browser speech remain available on those cells.
+    "webrtcvad-wheels>=2.0; python_version < '3.14' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
+    "faster-whisper>=1.0; (sys_platform != 'win32' or platform_machine != 'ARM64') and (sys_platform != 'darwin' or python_version < '3.14')",
+    # PyAV 16+ raised its Apple-Silicon deployment floor to macOS 14
+    # (macosx_14_0_arm64 wheels). 15.1 is the last line that keeps the supported
+    # macOS 13 floor, and it publishes that wheel for the whole CPython 3.11-3.14
+    # matrix — verified against the PyPI file list for av 15.1.0, which carries
+    # cp311/cp312/cp313/cp314 macosx_13_0_arm64. An earlier comment here claimed
+    # 3.11-3.13 and is what made this pin look like a 3.14 install break; it is
+    # not one. Base pins the identical requirement unconditionally for that cell,
+    # so this line only restates it for an extras-only resolve.
+    "av==15.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # ONNX-Runtime speech stack (Apache-2.0, torch-free) powering the on-device
+    # Nemotron recogniser and the Piper voices. The >=1.13.3 floor is
+    # LOAD-BEARING, not hygiene: multilingual Nemotron needs the prompt_index
+    # encoder input added in that release, and an older wheel loads the same
+    # files and then transcribes every language as English. Kept in step with
+    # jarvis/speech/local_models.py::SHERPA_ONNX_PACKAGE, which the in-app
+    # installer asks pip for.
+    # Upstream publishes no Windows ARM64 wheel. The providers already expose
+    # an honest unavailable state when the optional runtime is absent.
+    "sherpa-onnx>=1.13.3; sys_platform != 'win32' or platform_machine != 'ARM64'",
+]
+# GPU runtime for the on-device CTranslate2 recognizer (faster-whisper): the
+# cuBLAS 12 / cuDNN 9 wheels ctranslate2 4.x links against. Opt-in and OUTSIDE
+# [full] on purpose — ~700 MB that only a CUDA desktop can use, and [full] stays
+# portable to every cell of the install matrix. Without it the recognizer
+# self-heals onto the CPU and the provider card says so (and offers this install
+# from inside the app). Mirrored by jarvis/plugins/stt/fwhisper.py::
+# GPU_LIBRARY_PACKAGES, which the in-app installer asks pip for; a test pins the
+# two together. macOS has no CUDA, hence the marker.
+cuda = [
+    "nvidia-cublas-cu12>=12.4,<13; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12>=9,<10; sys_platform != 'darwin'",
+]
+# Objective TTS evaluation suite (jarvis/speech/tts_eval): round-trip ASR WER via
+# faster-whisper (CPU). onnxruntime + numpy are already in base; the DNSMOS MOS
+# and speaker-drift backends attach their own models at runtime. Opt-in dev/CI
+# tooling — never on the voice hot path, never in the base install (faster-whisper
+# pulls ctranslate2, which the lockfile guard bans from base).
+tts-eval = [
+    "faster-whisper>=1.0; (sys_platform != 'win32' or platform_machine != 'ARM64') and (sys_platform != 'darwin' or python_version < '3.14')",
+    # Same Apple-Silicon macOS 13 floor as [local-voice]; see the note there for
+    # why this carries no python_version guard.
+    "av==15.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+# Same entry point under the product name, so `personal-jarvis` in a terminal
+# starts (and `personal-jarvis update` updates) the app exactly like `jarvis`.
+# Never add a `personaljarvis` alias: Windows paths ignore case, and the venv's
+# Scripts folder already holds `PersonalJarvis.exe`, the branded launcher.
+personal-jarvis = "jarvis.__main__:main"
+# Phase 8.5 — Review-Pipeline-Run-GC (Plan §6.5).
+jarvis-review-gc = "jarvis.cli.review_gc:main"
+# Phase 8.6 — Review-Pipeline-Eval-Harness (Plan §6.6).
+jarvis-review-eval = "jarvis.cli.review_eval:main"
+# jarvisctl — control CLI for a running Personal Jarvis instance.
+jarvisctl = "jarvis.cli_ctl.__main__:main"
+jctl = "jarvis.cli_ctl.__main__:main"
+
+# Plugin entry points — all slots are already declared.
+# New plugins are discovered without any core changes.
+
+[project.entry-points."jarvis.wakeword"]
+openwakeword = "jarvis.plugins.wake.openwakeword_provider:OpenWakeWordProvider"
+
+[project.entry-points."jarvis.turn"]
+# Phase L turn-detection providers are not implemented yet — slot kept for forward
+# discovery; no provider ships until the streaming work lands.
+
+[project.entry-points."jarvis.stt"]
+# Local, keyless on-device transcription (faster-whisper / CTranslate2, torch-free).
+# Registered so the provider list, the activation gate and the runtime resolve it
+# the same way they resolve a cloud provider; whether it can actually RUN is a
+# separate question answered by jarvis.speech.local_models (engine installed +
+# checkpoint downloaded), never assumed from the entry-point's presence.
+faster-whisper = "jarvis.plugins.stt.fwhisper:FasterWhisperProvider"
+# Local streaming transcription (NVIDIA Nemotron 3.5 via sherpa-onnx / ONNX
+# Runtime). Multilingual and CPU-only; same readiness rule as above.
+nemotron-local = "jarvis.plugins.stt.nemotron_local:NemotronLocalSTT"
+groq-api = "jarvis.plugins.stt.groq_api:GroqWhisperAPI"
+# OpenRouter cloud transcription — reuses the shared openrouter_api_key.
+openrouter-stt = "jarvis.plugins.stt.openrouter_stt:OpenRouterSTT"
+# OpenAI Whisper cloud transcription — reuses the shared openai_api_key.
+openai-api = "jarvis.plugins.stt.openai_api:OpenAIWhisperAPI"
+# Gemini cloud transcription (google-genai inline audio) — reuses the shared
+# Gemini AI-Studio key; the Gemini-only downloader gets voice input with no
+# second credential.
+gemini-api = "jarvis.plugins.stt.gemini_api:GeminiSTT"
+# Deepgram Nova-3 cloud transcription. Batch REST, not the WebSocket streaming
+# lane: nothing in the speech pipeline consumes interim transcripts yet, so a
+# socket would add complexity and deliver no lower latency. Uses its own
+# deepgram_api_key, which the setup wizard already knows how to store.
+deepgram-api = "jarvis.plugins.stt.deepgram_api:DeepgramSTT"
+# Same recognizer on Google Cloud Vertex AI — reuses the shared Vertex
+# credential, so setting Vertex up once serves brain, voice input and voice out.
+vertex-stt = "jarvis.plugins.stt.gemini_api:VertexSTT"
+
+[project.entry-points."jarvis.tts"]
+# Local, keyless neural speech (Piper VITS voices via sherpa-onnx / ONNX
+# Runtime). The voices are plain ONNX files, deliberately NOT loaded through the
+# GPL-3 piper1-gpl library, so this repo stays free of GPL obligations.
+piper-local = "jarvis.plugins.tts.piper_local:PiperLocalTTS"
+inworld = "jarvis.plugins.tts.inworld_tts:InworldTTS"
+elevenlabs = "jarvis.plugins.tts.elevenlabs_tts:ElevenLabsTTS"
+gemini-flash-tts = "jarvis.plugins.tts.gemini_flash_tts:GeminiFlashTTS"
+# Same voices on Google Cloud Vertex AI. Worth its own card beyond billing:
+# the AI-Studio TTS preview model is hard-capped at 100 requests/day, which a
+# production voice cannot live inside — a Cloud project has no preview cap.
+vertex-tts = "jarvis.plugins.tts.gemini_flash_tts:VertexTTS"
+grok-voice = "jarvis.plugins.tts.grok_voice_tts:GrokVoiceTTS"
+# Phase L.4 — Streaming-TTS mit niedriger TTFB.
+cartesia = "jarvis.plugins.tts.cartesia_tts:CartesiaTTS"
+# OpenRouter cloud speech synthesis — reuses the shared openrouter_api_key.
+openrouter-tts = "jarvis.plugins.tts.openrouter_tts:OpenRouterTTS"
+
+[project.entry-points."jarvis.brain"]
+claude-api = "jarvis.plugins.brain.claude_api:ClaudeAPIBrain"
+openrouter = "jarvis.plugins.brain.openrouter:OpenRouterBrain"
+nvidia = "jarvis.plugins.brain.nvidia:NvidiaBrain"
+openai = "jarvis.plugins.brain.openai:OpenAIBrain"
+gemini = "jarvis.plugins.brain.gemini:GeminiBrain"
+# Google Cloud Vertex AI — the same Gemini models on Google's enterprise
+# endpoint, billed against a Cloud project instead of an AI Studio account.
+# A family of its own (not a Gemini routing detail) because the two accounts
+# bill separately and an install may hold both credentials at once.
+vertex = "jarvis.plugins.brain.vertex:VertexBrain"
+codex = "jarvis.plugins.brain.codex:CodexBrain"
+antigravity = "jarvis.plugins.brain.antigravity:AntigravityBrain"
+# Anthropic subscription (Claude CLI, print mode). Sibling of codex/antigravity:
+# spends a plan login instead of a per-token key. Too slow to start (~10-12 s)
+# for a voice tier; it serves callers whose OUTPUT is the product.
+claude-cli = "jarvis.plugins.brain.claude_cli:ClaudeCliBrain"
+grok = "jarvis.plugins.brain.grok:GrokBrain"
+# Keyless LOCAL providers (2026-07-25, local-first mandate): both talk to
+# self-hosted servers and are deliberately absent from
+# PROVIDER_SECRET_CANDIDATES. local-openai covers HuggingFace transformers
+# serve, llama.cpp llama-server, vLLM, and LM Studio with one adapter.
+ollama = "jarvis.plugins.brain.ollama:OllamaBrain"
+local-openai = "jarvis.plugins.brain.local_openai:LocalOpenAIBrain"
+
+[project.entry-points."jarvis.harness"]
+python-script = "jarvis.plugins.harness.python_script:PythonScriptHarness"
+# Phase 5 — in-process screenshot/click/keyboard computer-use loop (ADR-0008).
+screenshot = "jarvis.plugins.harness.computer_use:ComputerUseHarness"
+
+[project.entry-points."jarvis.channel"]
+# Transport adapter between the UI layer and the orchestrator (Plan §17.3).
+# Web channel is the first; Telegram/WhatsApp follow in Phase 8+.
+web = "jarvis.channels.web:WebChannel"
+# === F-FRIENDS [F1] · feature/friends-section · ruben-2026-04-30 ===
+# Phase F1 — bidirectional Telegram bot channel (long polling).
+# Token via Credential Manager (Key "telegram_bot_token" / ENV TELEGRAM_BOT_TOKEN).
+telegram = "jarvis.channels.telegram:TelegramChannel"
+# Bidirectional Discord bot channel (gateway). Mirrors Telegram: a DM/guild
+# message is bridged into the normal Jarvis chat path. discord.py lives in the
+# optional [channels] extra; token via Credential Manager (key "discord_bot_token"
+# / ENV DISCORD_BOT_TOKEN). Enable [Message Content Intent] in the bot settings.
+discord = "jarvis.channels.discord:DiscordChannel"
+
+[project.entry-points."jarvis.realtime"]
+# Provider-neutral speech-to-speech plugins. Every adapter loads lazily; the
+# orchestrator chooses a credential-ready family and crosses families on failure.
+# The former codex-subscription-realtime adapter was removed 2026-08-10: the
+# Codex app-server realtime surface is experimental, has no turn-boundary or
+# tool events, and never held a dependable call. The ChatGPT plan keeps voice
+# through the stable classic-pipeline composition (voice.profile =
+# "codex-subscription-voice"), which uses the audited app-server TEXT protocol.
+openai-realtime = "jarvis.plugins.realtime.openai_realtime:OpenAIRealtimeProvider"
+openai-live = "jarvis.plugins.realtime.openai_live:OpenAILiveProvider"
+openai-live-subscription = "jarvis.plugins.realtime.openai_subscription_live:OpenAISubscriptionLiveProvider"
+gemini-live = "jarvis.plugins.realtime.gemini_live:GeminiLiveProvider"
+# Same duplex socket on Google Cloud Vertex AI. A DISTINCT credential family:
+# a Cloud project and an AI Studio account fail independently, so crossing
+# between them on a terminal auth/billing error is a real fallback (AP-22).
+vertex-live = "jarvis.plugins.realtime.gemini_live:VertexLiveProvider"
+# Self-hosted endpoint speaking the same realtime protocol — the local option
+# this tier lacked entirely. Keyless; only ever used when explicitly selected
+# with a server URL configured.
+local-realtime = "jarvis.plugins.realtime.openai_realtime:LocalRealtimeProvider"
+# The Jarvis-owned local voice engine (ADR-0037): a child worker in its own
+# environment, set up from the Local voice card. Keyless, never an ambient
+# fallback; replaces local-realtime at cutover (P5).
+local-voice = "jarvis.plugins.realtime.local_voice:LocalVoiceProvider"
+
+[project.entry-points."jarvis.tool"]
+live-screen-snapshot = "jarvis.plugins.tool.live_screen:LiveScreenTool"
+open-app = "jarvis.plugins.tool.open_app:OpenAppTool"
+type-text = "jarvis.plugins.tool.type_text:TypeTextTool"
+hotkey = "jarvis.plugins.tool.hotkey:HotkeyTool"
+click = "jarvis.plugins.tool.click:ClickTool"
+run-shell = "jarvis.plugins.tool.run_shell:RunShellTool"
+search-web = "jarvis.plugins.tool.search_web:SearchWebTool"
+# Gmail (marketplace plugin, 2026-06-01) — read + send mail via the Gmail REST
+# API using the marketplace-stored OAuth token. Router-tier (persona-mandate
+# set), risk_tier "ask": send is consequential. A direct safe/ask-gated action,
+# never a spawn (AP-5/AP-14). See docs/superpowers/specs/2026-06-01-marketplace-coming-soon-plugins-design.md.
+gmail = "jarvis.plugins.tool.gmail_rest:GmailRestTool"
+# Vercel (marketplace plugin, 2026-06-07) — read projects/deployments via the
+# Vercel REST API using the marketplace-stored PAT. Native tool because Vercel's
+# catalog entry used the never-implemented rest_wrapper transport (zero tools);
+# router-tier, risk_tier "monitor" (read-only). A direct gated action, never a
+# spawn (AP-5/AP-14). See docs/superpowers/plans/2026-06-07-plugin-skill-pairing-reachability.md.
+vercel = "jarvis.plugins.tool.vercel_rest:VercelRestTool"
+# Home Assistant (marketplace plugin, 2026-07-25) — list/read entities and call
+# services over the documented REST API. Native rather than MCP on purpose:
+# Home Assistant declined dynamic client registration and its MCP server is
+# scoped to its own Assist pipeline, so it exposes conversation instead of the
+# entity/service surface a voice assistant needs. risk_tier "ask" because a
+# service call physically changes something in the user's home.
+home_assistant = "jarvis.plugins.tool.home_assistant_rest:HomeAssistantRestTool"
+# Google Calendar (marketplace plugin, 2026-06-27) — read/create/update/delete
+# calendar events. The bot logic is a dependency-free Node script
+# (calendar_bot.mjs); this Python entry point is the OAuth bridge that reuses
+# the marketplace token + refresh loop (so the connection "never expires").
+# Router-tier, full autonomy: writes are "monitor" (audited, no prompt), never a
+# spawn (AP-5/AP-14). Entry-point name matches the catalog native_tool +
+# token-store key "google_calendar".
+google_calendar = "jarvis.plugins.tool.google_calendar_rest:GoogleCalendarRestTool"
+# Google Drive (marketplace plugin, 2026-07-23) — list/read/create/share/delete
+# files via the Drive REST API v3 using the marketplace-stored OAuth token.
+# Native tool because Google's hosted Drive MCP (drivemcp.googleapis.com) is a
+# Workspace Developer-Preview server that answers every data-plane call with 403
+# for consumer @gmail.com accounts (forensic 2026-07-23); the raw REST API works
+# with the same token. Router-tier, per-action risk gating (reads safe, writes
+# monitored, share/delete ask), never a spawn (AP-5/AP-14). Entry-point name
+# matches the catalog native_tool + token-store key "google_drive".
+google_drive = "jarvis.plugins.tool.drive_rest:DriveRestTool"
+# Spotify (marketplace plugin, 2026-08-17) — play/pause/skip/volume/search over
+# the Spotify Web API using the marketplace-stored OAuth token. Native because
+# Spotify ships NO MCP server and no agent integration at all; the community
+# servers want a plaintext client secret in a config file plus a terminal auth
+# step, which would trade the keyring-backed connect button for a worse flow
+# (AP-2). Router-tier, risk_tier "monitor" — audible and instantly reversible,
+# so it is audited without prompting. Never a spawn (AP-5/AP-14). Entry-point
+# name matches the catalog native_tool + token-store key "spotify".
+spotify = "jarvis.plugins.tool.spotify_rest:SpotifyRestTool"
+# YouTube Music (marketplace plugin, 2026-08-18) — search/play/like/playlists
+# over the official YouTube Data API v3 (Google publishes NO YouTube Music API;
+# the community "APIs" are reverse-engineered private clients outside YouTube's
+# terms, so they stay out) plus the OS media session for pause/skip/now-playing
+# (jarvis/platform/media_session.py). Playing opens a music.youtube.com deep
+# link in the user's browser — their own account and Premium — because YouTube
+# has no remote-playback API. Router-tier, risk_tier "monitor" (audible,
+# instantly reversible; every write is undoable in the app). Never a spawn
+# (AP-5/AP-14). Entry-point name matches the catalog native_tool + token-store
+# key "youtube_music".
+youtube_music = "jarvis.plugins.tool.youtube_music_rest:YouTubeMusicRestTool"
+# Slack (marketplace plugin, 2026-10-05) — search/read/post over the Slack Web
+# API with the marketplace-stored user token. Native rather than Slack's hosted
+# MCP server: Slack admits only Marketplace-listed or internal apps to that
+# server, and the shared publisher app is a distributed but unlisted app.
+# Router-tier; reads are "safe", posting keeps "ask" (echo-confirm). Never a
+# spawn (AP-5/AP-14). Entry-point name matches the catalog native_tool +
+# token-store key "slack".
+slack = "jarvis.plugins.tool.slack_rest:SlackRestTool"
+screen-snapshot = "jarvis.plugins.tool.screen_snapshot:ScreenSnapshotTool"
+move-mouse = "jarvis.plugins.tool.move_mouse:MoveMouseTool"
+switch-window = "jarvis.plugins.tool.switch_window:SwitchWindowTool"
+read-visible-ui-state = "jarvis.plugins.tool.read_visible_ui_state:ReadVisibleUIStateTool"
+wait-for-ui-state = "jarvis.plugins.tool.wait_for_ui_state:WaitForUIStateTool"
+# Multi-step computer-use primitives (Set-of-Marks ReAct loop).
+click-element = "jarvis.plugins.tool.click_element:ClickElementTool"
+scroll = "jarvis.plugins.tool.scroll:ScrollTool"
+wait-for-element = "jarvis.plugins.tool.wait_for_element:WaitForElementTool"
+remember = "jarvis.plugins.tool.remember:RememberTool"
+dispatch-to-harness = "jarvis.plugins.tool.dispatch_to_harness:DispatchToHarnessTool"
+# Computer-Use (Wave 1, 2026-05-29) — first-class router tool to drive the live
+# desktop via the in-process computer-use harness. Router-tier only (in
+# ROUTER_TOOLS); a direct safe-gated action, never a spawn (AP-5/AP-14).
+computer-use = "jarvis.plugins.tool.computer_use_tool:ComputerUseTool"
+whoami = "jarvis.plugins.tool.whoami:WhoAmITool"
+# Phase 5 — privileged operations through named-pipe IPC to the UAC helper.
+dispatch-to-admin = "jarvis.plugins.tool.dispatch_to_admin:DispatchToAdminTool"
+# Phase 5.5 — tiered routing (Router Brain -> heavy worker and parallel harnesses).
+# spawn-worker dispatches a Mission-Manager-backed direct Opus worker
+# (ClaudeDirectWorker). Legacy names: spawn-sub-jarvis -> spawn-openclaw (internal
+# name only, never a live entry point) -> spawn-worker.
+multi-spawn = "jarvis.plugins.tool.multi_spawn:MultiSpawnTool"
+spawn-worker = "jarvis.plugins.tool.spawn_worker:SpawnWorkerTool"
+# Legacy Phase-8.4 review entry point. It is intentionally not model-visible;
+# production review belongs to the Mission Manager lifecycle (ADR-0011).
+dispatch-with-review = "jarvis.plugins.tool.dispatch_with_review:DispatchWithReviewTool"
+# CLI integration: the virtual loader expands to one CliTool instance per
+# connected CLI (cli_gcloud, cli_gh, cli_supabase, and so on).
+# Router-tier only (in ROUTER_TOOLS); the loader resolves the shared,
+# bus-connected CliToolRegistry so the brain and the safety layer see the
+# same connected CLIs. See ADR-0011 amendment "CLI-Integration".
+cli-tools = "jarvis.clis.loader:CliToolLoader"
+plugin-tools = "jarvis.marketplace.plugin_loader:PluginToolLoader"
+# Router-tier only (in ROUTER_TOOLS); expands to one MCPToolAdapter per tool
+# of each connected and running MCP server. Reads client._tools_cache
+# synchronously — no network I/O, never a spawn (AP-5/AP-14). Live-refresh
+# via BrainToolsChanged when a server connects/disconnects. See ADR-0011
+# amendment "MCP-Tools Virtual Loader".
+mcp-tools = "jarvis.mcp.loader:McpToolLoader"
+# NOTE (2026-05-24): the former ``spawn-cli-worker`` entry point was REMOVED.
+# It pointed at jarvis.plugins.tool.spawn_cli_worker:SpawnCliWorkerTool, a file
+# that never existed (dead entry point). Single-step CLI work is now served
+# directly by the connected ``cli_<name>`` tools (the ``cli-tools`` loader);
+# heavy multi-step CLI work is already covered by ``spawn_worker`` (the
+# mission worker has shell + CLI access). A dedicated spawn-cli-worker would be
+# redundant surface and a new D9 recursion vector to police, so it was dropped
+# rather than re-implemented.
+# Self-Verification-Tools (Phase 5.5)
+verify-via-curl = "jarvis.plugins.tool.verify_via_curl:VerifyViaCurlTool"
+verify-localhost = "jarvis.plugins.tool.verify_localhost:VerifyLocalhostTool"
+start-preview-server = "jarvis.plugins.tool.start_preview_server:StartPreviewServerTool"
+# AI Pointer — resolve the element under the mouse cursor via the OS
+# accessibility tree (router-tier, read-only). Pull path for deictic questions.
+inspect-pointer = "jarvis.plugins.tool.inspect_pointer:InspectPointerTool"
+# UI navigation (2026-06-02) — switch the active sidebar section by voice/chat
+# ("zeig die Socials", "open settings"). Router-tier, risk safe (pure UI move).
+# Publishes NavigateSidebar; the frontend switches the section. Never a spawn
+# (AP-5/AP-14). See ADR-0011 amendment "Navigate tool".
+navigate = "jarvis.plugins.tool.navigate:NavigateTool"
+# On-demand artifact (2026-08-23) — build one self-contained HTML page when
+# the user explicitly asks to SEE something ("visualisier mir das", "mach mir
+# ein Dashboard", "build me an artifact"). Router-tier dispatch to the mission
+# stack (a worker on the strongest model writes the page), risk monitor like
+# spawn-worker; publishes NavigateSidebar. ASK-ONLY — withheld from the tool
+# set on every turn that did not ask (jarvis/brain/artifact_gate.py). Never in
+# a worker set (AP-5/AP-14).
+create-artifact = "jarvis.plugins.tool.create_artifact:CreateArtifactTool"
+# Command Registry executor (2026-07-09) — run ONE curated app command
+# (provider switch, wake word, language, volume, missions/tasks, restart)
+# through the SAME REST endpoint the UI uses, in-process via ASGI. Enum-
+# constrained + schema-validated; dangerous commands confirm (risk "ask").
+# Never a spawn (AP-5/AP-14). See ADR-0011 amendment "app-command tool".
+app-command = "jarvis.plugins.tool.app_command:AppCommandTool"
+# Every app action (2026-09-29): search + run any REST operation of the app
+# under the person's per-action policy. See ADR-0011 amendment "Every app action".
+find-app-action = "jarvis.plugins.tool.app_action:FindAppActionTool"
+run-app-action = "jarvis.plugins.tool.app_action:RunAppActionTool"
+# Agent society voice tools (2026-09-02): ONE typed ASSIGN to a named agent
+# with an immediate spoken ack, and a read-only status answer. Router-tier
+# only (ADR-0011 amendment); never in a worker set (AP-5/AP-14).
+delegate-to-agent = "jarvis.plugins.tool.delegate_to_agent:DelegateToAgentTool"
+society-status = "jarvis.plugins.tool.delegate_to_agent:SocietyStatusTool"
+message-agent = "jarvis.plugins.tool.message_agent:LeadMessageAgentTool"
+# Skills-Brain-Integration — Brain-callable executor for installed user skills.
+run-skill = "jarvis.plugins.tool.run_skill:RunSkillTool"
+# Phase B5 — long-term wiki recall (router-tier, read-only).
+wiki-recall = "jarvis.plugins.tool.wiki_recall:WikiRecallTool"
+# Phase B5 follow-up — full-page reader (router-tier, read-only).
+wiki-page-read = "jarvis.plugins.tool.wiki_page_read:WikiPageReadTool"
+# Grounded vault listing (2026-07-14) — deterministic "what is in my wiki"
+# answer in one round (router-tier, read-only).
+wiki-list = "jarvis.plugins.tool.wiki_list:WikiListTool"
+# Phase B5 follow-up — deterministic ingest tool (router-tier, write).
+wiki-ingest = "jarvis.plugins.tool.wiki_ingest:WikiIngestTool"
+# Profile-write (2026-05-30) — deterministic writer for the structured USER.md
+# clusters (the Knowledge matrix + per-turn system-prompt source). Router-tier,
+# write, monitor. Closes the gap left by the soft-disabled legacy Curator.
+update-profile = "jarvis.plugins.tool.profile_update:UpdateProfileTool"
+# NOTE (2026-07-25): `spawn-skill-author` used to be registered here and was a
+# PHANTOM — a registration that made three docs claim the tool was live while it
+# could never load. It is absent from ROUTER_TOOLS (the only allow-set, so
+# factory.py filtered it out), and its __init__ requires a `runner=` argument
+# the entry-point loader cannot supply, so the tempting one-line "just add it to
+# ROUTER_TOOLS" fix raises TypeError at tool load. Enforced by
+# tests/unit/brain/test_router_tool_entrypoint_parity.py.
+# create-skill (2026-08-18) — the brain-reachable authoring path that note
+# said was unnecessary. It was: the voice turn "erstell mir einen neuen Skill
+# …" (2026-08-18 17:51) had no tool to write a skill and died on three
+# `jarvisctl --help` rounds. Unlike the phantom, this tool takes only what the
+# loader can give (bus, config) and resolves the registry + brain lazily. It
+# calls the SAME SkillCreatorService the UI dialog and `jarvisctl skills
+# create` use, so the AP-15 draft guard is enforced in ONE place (`commit`
+# forces state=draft). Router-tier, monitor, never a spawn (AP-5/AP-14). See
+# ADR-0011 amendment "create-skill router tool".
+create-skill = "jarvis.plugins.tool.create_skill:CreateSkillTool"
+# App-Control (2026-05-31) — gives the brain a complete overview of the Desktop
+# App and lets it change settings/providers/MCP by voice/chat. Router-tier;
+# direct safe/ask-gated actions, never a spawn (AP-5/AP-14). describe is read-only
+# safe; switch-provider + manage-mcp-server are ask (echo-confirm). Raw secret
+# values are never accepted (AP-2). See ADR-0011 amendment "App-Control Tools" +
+# docs/superpowers/specs/2026-05-31-app-control-tools-design.md.
+describe-app-settings = "jarvis.plugins.tool.describe_app_settings:DescribeAppSettingsTool"
+switch-provider = "jarvis.plugins.tool.switch_provider:SwitchProviderTool"
+manage-mcp-server = "jarvis.plugins.tool.manage_mcp_server:ManageMcpServerTool"
+# Masked key preview (2026-05-31, user mandate) — speaks first 3 + last 3 chars of
+# a stored API key ("AIz...xQ2"), never the full value. monitor-tier (logged, no
+# nag). Narrow, safe exception to AP-2; the full-key refusal lives in router.py.
+reveal-key-preview = "jarvis.plugins.tool.reveal_key_preview:RevealKeyPreviewTool"
+# Chunk B jarvis-contacts (2026-06-02) — three contact-action router tools.
+# contact-lookup (safe, read) resolves a name/alias to e-mail/phone/address;
+# contact-upsert (monitor, deterministic write) saves a contact by voice;
+# call-contact (ask, echo-confirm) places a real outbound call via the telephony
+# engine. Direct safe/monitor/ask-gated actions, never a spawn (AP-5/AP-14); they
+# degrade to a clean no-op when Chunk A's ContactStore / Chunk C's telephony
+# engine is absent. See ADR-0011 amendment "Contacts Tools".
+contact-lookup = "jarvis.plugins.tool.contact_lookup:ContactLookupTool"
+contact-upsert = "jarvis.plugins.tool.contact_upsert:ContactUpsertTool"
+call-contact = "jarvis.plugins.tool.call_contact:CallContactTool"
+
+[tool.setuptools.packages.find]
+where = ["."]
+# ``conductor`` is the scheduled-jobs engine behind /api/conductor/* and the
+# ``jarvis conductor`` commands. Left out, it imported only when the app ran
+# with the checkout as its working directory (run.bat), so the console script,
+# autostart and every wheel install served no Conductor API at all.
+include = ["jarvis*", "conductor*"]
+exclude = ["*.__pycache__", "*.__pycache__.*"]
+
+[tool.setuptools.exclude-package-data]
+# Resource globs must never distribute interpreter caches or their build paths.
+"*" = ["*.pyc", "*.pyo", "**/__pycache__/*"]
+
+[tool.setuptools.package-data]
+# Read via Path(__file__) by conductor.core.store / conductor.core.seed.
+conductor = ["core/schema.sql", "seed/*.yaml"]
+jarvis = [
+    "ui/web/dist/**/*",
+    "ui/web/dist/*",
+    "assets/**/*",
+    # The original brand marks (+ their LOGOS.md provenance ledgers) the
+    # artifact brief inlines for a worker (jarvis/artifacts/brand_marks.py).
+    # Read via repo_root() at dispatch time, so a wheel install needs them too.
+    "ui/web/frontend/src/assets/providers/*",
+    "ui/web/frontend/src/assets/brands/*",
+    # Node bot scripts shipped alongside their Python bridge tools (e.g. the
+    # google_calendar bot). Not Python, so packages.find won't pick them up.
+    "plugins/tool/*.mjs",
+    # AP-23 wave-2 finding 6: runtime data files read via `Path(__file__)` at
+    # first use, missing from wheel installs — masked today only because
+    # every dev install is editable (source tree == package tree).
+    # SQLite bootstrap schemas + versioned migrations
+    # (board/memory/missions/sessions/tasks/workflows). Every `.sql` file
+    # under the package is a runtime schema/migration, never source config,
+    # so one broad glob is safe (audited 2026-07-07: 9 files total).
+    "**/*.sql",
+    # Voice persona (brain/persona_loader.py), skill-authoring import
+    # allowlist (skills/authoring/draft_writer.py), Jarvis-Agent critic
+    # verdict JSON-schema (core/review/spawns.py).
+    "brain/JARVIS_PERSONA.md",
+    "skills/safe_imports.txt",
+    "core/review/verdict_schema.json",
+    "society/mars/definition.json",
+    # The Hermes / OpenClaw releases setup installs and accepts
+    # (agent_runtimes/versions.py); without it setup falls back to latest.
+    "agent_runtimes/runtime-versions.json",
+    # Seed catalogs (CLI tools / skills / marketplace plugins) — named
+    # explicitly rather than a repo-wide "**/*.json" glob, which would also
+    # sweep in jarvis/ui/web/frontend's SOURCE config (package.json,
+    # tsconfig.json, .claude/settings.local.json — never meant to ship).
+    "clis/catalog/seed_catalog.json",
+    "skills/catalog/seed_catalog.json",
+    "marketplace/seed_catalog.json",
+    "marketplace/plugins/*/plugin.json",
+    "marketplace/plugins/*/mcp.json",
+    # Marketplace "how to use this plugin" cards shown in the UI
+    # (marketplace/usage_cards/loader.py).
+    "marketplace/usage_cards/*.md",
+    # Wiki bootstrap templates for a new vault (memory/wiki/__init__.py's
+    # TEMPLATES_DIR + integration.py's schema.md read).
+    "memory/wiki/templates/*.md",
+    # Built-in desktop pets and the sprite-sheet template, read at runtime via
+    # Path(__file__) (jarvis/ui/pets/loader.py). Scoped to the two file kinds
+    # a pet folder holds.
+    "ui/pets/builtin/*/*.json",
+    "ui/pets/builtin/*/*.png",
+    "ui/pets/template/*.json",
+    "ui/pets/template/*.png",
+    # Built-in skills: SKILL.md plus their reference/asset/script support
+    # files (e.g. skill-creator ships references/, scripts/, agents/,
+    # assets/ alongside its SKILL.md). Extension-scoped rather than
+    # "skills/builtin/**/*" so a stray local __pycache__ never rides along.
+    "skills/builtin/**/*.md",
+    "skills/builtin/**/*.txt",
+    # In-repo C source for the macOS stub launcher, compiled at install time
+    # by jarvis/setup/macos_app_bundle.py (BUG-060 stable TCC identity).
+    "setup/*.c",
+    # Vendored upstream patch + pinned package set for the managed
+    # local-realtime server install (realtime/local_server/patching.py and
+    # install.py read them via Path(__file__)).
+    "realtime/local_server/patches/*.patch",
+    "realtime/local_server/pins/*.txt",
+    # Pinned package set of the local voice engine's own environment
+    # (realtime/local_voice_setup.py reads it via Path(__file__)).
+    "voice_engine/requirements-engine.txt",
+]
+
+[tool.setuptools.data-files]
+"share/personal-jarvis/docs" = ["docs/product/**/*.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "A"]
+ignore = ["S101", "S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+# Telephony tests parse our OWN generated TwiML (trusted input, not untrusted
+# network data) and use the literal word "secret" / fake fixture tokens that
+# bandit flags as hardcoded passwords. Both are false positives in a test
+# context; the production modules stay under the strict ruleset.
+"tests/unit/telephony/*.py" = ["S105", "S106", "S314"]
+# call-contact tests assert on fake Twilio auth-token fixture literals (e.g.
+# "tok_real_secret") that bandit flags as hardcoded passwords — a false
+# positive in a test context, same carve-out as the telephony tests above.
+"tests/unit/plugins/tool/test_call_contact.py" = ["S105", "S106"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "phase5: Phase 5 integration tests (run in isolation with `pytest -m phase5`).",
+    "skip_ci: tests that need real desktop/admin/live clicking — not run in CI.",
+    "e2e: Phase 7 end-to-end tests (Plan §7.6; run manually with `pytest -m e2e`).",
+    "voice_latency: Phase L voice-latency tests (Plan §6.1; run manually with `pytest -m voice_latency`).",
+    "eval: Phase 8.6 evaluation harness and golden-query suite (run manually with `pytest -m eval`).",
+    "slow: Long-running evaluation and E2E tests excluded by `pytest -m 'not slow'`.",
+    "integration: Integration tests that spawn real subprocesses or hit live external services (e.g. Codex CLI ChatGPT OAuth). Self-skip when prerequisites are missing; run explicitly via `pytest -m integration`.",
+    "real_tcc_gate: opts a Computer-Use test back into the real macOS Screen-Recording gate that tests/unit/cu/conftest.py neutralizes by default.",
+]
+
+# Only cryptography may resolve through the reviewed native wheel index.
+[[tool.uv.index]]
+name = "native-crypto"
+url = "https://personaljarvis.github.io/PersonalJarvis/native-crypto/50.0.2-1/simple/"
+explicit = true
+
+[tool.uv.sources]
+cryptography = { index = "native-crypto" }
+
+# sherpa-onnx wheels disagree on their metadata: the linux_armv7l wheel bundles
+# the native core, every other wheel requires sherpa-onnx-core of the same
+# version. The universal lock read the armv7l metadata and dropped the core, so
+# an install from uv.lock left the speech runtime without its native library.
+# CI installs from the lock (scripts/ci/install_locked.py) and refuses the
+# unpinned core, so a sherpa-onnx bump without updating this entry fails loudly.
+[[tool.uv.dependency-metadata]]
+name = "sherpa-onnx"
+version = "1.13.4"
+requires-dist = ["sherpa-onnx-core==1.13.4"]

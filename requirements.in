@@ -1,0 +1,202 @@
+# Personal Jarvis — top-level runtime dependencies (Wave 6).
+#
+# This file mirrors pyproject.toml. Compile the hash-pinned, PLATFORM-UNIVERSAL
+# requirements.txt from pyproject.toml with the explicit native crypto source.
+# Use the exact command recorded in requirements.txt's header; install/README.md
+# explains the scoped index and the browser helper's separate lock.
+# Re-generate it after every bump. `--universal` is load-bearing: it emits
+# per-OS environment markers (`; sys_platform == 'win32'`, `== 'linux'`, …)
+# so ONE lockfile installs cleanly on Windows, macOS AND Linux — each OS pulls
+# only the wheels that apply to it. A non-universal (single-OS) lockfile bakes
+# one machine's platform wheels in and bricks `pip install --require-hashes`
+# everywhere else.
+#
+# Versions mirror `pyproject.toml [project].dependencies`. Keep them in
+# lockstep — a divergence between this file and pyproject.toml is a bug
+# (enforced by scripts/ci/check_requirements_sync.py).
+# `verify-wave6.sh` re-installs from the resulting `requirements.txt`
+# with `pip install --require-hashes`, so unpinned/unhashed entries
+# fail-closed.
+
+# Core LLM clients
+anthropic>=0.96
+openai>=1.30
+google-genai>=1.0
+# Security floor for async clients and the web stack (CVE-2026-63374,
+# CVE-2026-64847, CVE-2026-63349).
+anyio>=4.14.2
+# Lazy-imported by jarvis/brain/structured_output_parser.py to recover
+# malformed vision JSON; without it the repair path silently degrades on
+# every fresh install (found 2026-07-18, was never declared).
+json-repair>=0.30
+# The code editor detects the encoding of non-UTF-8 text files with it
+# (lazy import); already installed through requests, declared because
+# Jarvis imports it directly.
+charset-normalizer>=3.4
+# The code editor's Python completions, hovers and go-to-definition
+# (static analysis, lazy import; pure Python).
+jedi>=0.19
+# The code editor's delete moves files to the system trash (Recycle Bin,
+# macOS Trash, freedesktop trash) instead of erasing them; pure Python.
+Send2Trash>=1.8.3
+# Current crypto on every platform; installer/native index supplies missing wheels.
+cryptography>=50.0.2
+
+# Config & settings
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6
+pyyaml>=6.0
+
+# Logging
+structlog>=24.4
+loguru>=0.7
+
+# Secrets (Windows Credential Manager / Linux Secret Service)
+keyring>=25.5
+
+# SSH to the user's own servers and virtual machines (Settings -> Computers)
+asyncssh[bcrypt]>=2.24.0
+
+# Security floor for a transitive dependency (mcp, twilio): 2.13.0 carries
+# ten advisories fixed in 2.14.0.
+pyjwt>=2.14.0
+
+# Security floor for a transitive dependency: 2.7.0 carries
+# CVE-2026-97687..97689, fixed in 2.8.0.
+urllib3>=2.8.0
+
+# Audio I/O
+sounddevice>=0.5
+# Upstream's native dependencies do not publish Windows ARM64 wheels. The
+# WebRTC transport capability-probes this dependency and degrades honestly.
+aiortc>=1.13; sys_platform != 'win32' or platform_machine != 'ARM64'
+# Keep aiortc on the Apple-Silicon PyAV line with CPython 3.11-3.14 wheels.
+av==15.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+# NumPy 2.1 has no Windows ARM64 wheels. Use the first official ARM64-wheel
+# branch there so a stock machine never falls into an unavailable native build.
+numpy>=1.26,<2.2; python_version < '3.14' and (sys_platform != 'win32' or platform_machine != 'ARM64')
+numpy>=2.3.5,<2.4; python_version >= '3.14' or (sys_platform == 'win32' and platform_machine == 'ARM64')
+scipy>=1.14
+# Browser voice shares the telephony resampler. Python 3.13 removed stdlib
+# audioop, so the backport is a conditional base dependency, not telephony-only.
+audioop-lts; python_version>='3.13'
+# Always-on neural wake word — BASE (2026-07-04). The pretrained ONNX models ship
+# in every wheel already; openwakeword + CPU onnxruntime are the tiny (~15 MB),
+# torch-free runtime that runs them, so "Hey Jarvis" fires out-of-the-box on any
+# machine incl. a headless CPU VPS. CPU onnxruntime is universal and NOT on the
+# lockfile forbidden list (only torch/ctranslate2/faster-whisper/onnxruntime-gpu
+# are). See pyproject.toml note.
+openwakeword>=0.6; sys_platform != 'linux' and (sys_platform != 'darwin' or (python_version < '3.14' and platform_machine == 'arm64'))
+openwakeword>=0.6; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version < '3.12'
+# macOS 3.11-3.13 uses the last branch compatible with the supported deployment
+# floor. macOS 3.14 uses Vosk/energy; other operating systems use current ONNX.
+# arm64-only on macOS: onnxruntime stopped shipping Intel-mac wheels (the last
+# x86_64 builds also require older Pythons), so a pinned version bricked the
+# whole base install on Intel Macs. Silero VAD degrades to WebRTC VAD there
+# (ships in [local-voice]/[full]); bare base installs degrade to portable
+# energy endpointing.
+onnxruntime>=1.17,<1.24; sys_platform == 'darwin' and python_version < '3.14' and platform_machine == 'arm64'
+onnxruntime>=1.17; sys_platform != 'darwin'
+# Any-word wake keyword spotting (vosk_kws engine, 2026-07-05): torch-free,
+# Apache-2.0, CPU wheels on macOS/Linux and Windows x86/x64; per-language model
+# fetched at setup, not bundled. Windows ARM64 has no upstream wheel and skips
+# this engine in favor of the ONNX/browser/cloud paths. CAP below 0.3.45: that
+# release ships NO macOS wheel (AP-23).
+vosk>=0.3.44,<0.3.45; sys_platform != 'win32' or platform_machine != 'ARM64'
+# The bundled Silero VAD uses CPU onnxruntime declared above. The redundant
+# silero-vad package is intentionally absent from every profile because its
+# loader pulls torch. WebRTC VAD and faster-whisper remain in the pyproject.toml
+# [local-voice] extra. Torch must never land in the base lockfile: it can pull a
+# multi-GB, GPU-specific CUDA wheel stack (nvidia-*), which bricks portable
+# installation for arbitrary machines.
+
+# TTS. The unused google-cloud-texttospeech/grpc stack was removed; no runtime
+# module imported it.
+elevenlabs>=1.5
+
+# Memory
+# chromadb removed 2026-06-28 — unused in jarvis/ (legacy-curator vestige),
+# critical advisory with no fixed release. See pyproject.toml note.
+# sentence-transformers was removed entirely because no runtime path imports it;
+# keeping an unused embedding stack would reintroduce torch.
+
+# Cross-platform desktop helpers
+# pyautogui + mss are desktop-only (need a display) and live in the
+# pyproject.toml [desktop] extra, NOT the base lockfile.
+psutil>=6.1
+# Floor 12.3.0: a large batch of Pillow image-decoder advisories (JPEG2000
+# scratch-buffer DoS, McIdas AREA mmap out-of-bounds read, RankFilter/
+# ImagingExpand heap overflow, and the CVE-2026-54058..59205 cluster) affect
+# every release through 12.2.x and are all fixed in 12.3.0 — never resolve lower.
+pillow>=12.3.0
+
+# Observability
+opentelemetry-api>=1.28
+opentelemetry-sdk>=1.28
+prometheus-client>=0.21
+
+# HTTP / async
+httpx>=0.27
+aiofiles>=24.1
+aiolimiter>=1.1
+tenacity>=9.0
+
+# Web search — real DuckDuckGo SERP for the search_web tool (key-free, pure
+# Python, cross-platform). Lazy-imported, so a minimal install without it
+# degrades to the DuckDuckGo Instant-Answer fallback.
+# CAP at 9.14.3: 9.14.4 hardened its dependency to `httpx[brotli,http2,socks]`,
+# and `brotli` publishes NO Windows-ARM64 wheel in any release (checked through
+# 1.2.0) — `brotlicffi` only covers non-CPython, so the CPython branch has no
+# escape hatch. Taking the bump would force a source build on win-arm64 and
+# break `pip install --require-hashes` there (AP-23). Lift this the moment
+# brotli ships a win-arm64 wheel or ddgs drops the mandatory extra.
+ddgs==9.14.3
+
+# MCP (Model Context Protocol)
+# Floor 1.28.1: three high-severity advisories in the MCP SDK's HTTP/WS
+# transports (missing Host/Origin validation, unverified session principal,
+# cross-client task access) are fixed there — never resolve lower
+# (Dependabot #48-#51).
+mcp>=1.28.1,<2
+
+# CLI (setup wizard + jarvisctl control CLI)
+rich>=13.9
+typer>=0.12
+platformdirs>=4
+# click is imported directly by jarvis/cli_ctl; modern typer no longer
+# guarantees it transitively, so declare it explicitly.
+click>=8.1
+
+# Desktop-App (Phase 1a) — cross-platform pieces stay in base.
+fastapi>=0.115
+uvicorn>=0.32
+websockets>=13
+filelock>=3.16
+jsonschema>=4.23
+packaging>=24.0
+
+# Skill-System + MCP (Phase 1c). PyYAML is the frontmatter parser.
+# Server-side markdown→HTML for the Outputs "view in browser" action.
+markdown>=3.5
+# Deterministic number->words for the voice path (spoken-safe).
+num2words>=0.5.13
+jinja2>=3.1
+croniter>=6.0
+# Floor 3.1.60 includes the earlier command-injection fixes and the fixes for
+# PYSEC-2026-3982, PYSEC-2026-3983, and PYSEC-2026-3984.
+gitpython>=3.1.60
+watchdog>=5.0; (sys_platform != 'darwin' or python_version < '3.14') and (sys_platform != 'win32' or platform_machine != 'ARM64')
+
+# Atomic TOML edits (Phase 1b)
+tomlkit>=0.12
+
+# F-FRIENDS [F0+F1] — async SQLite + Telegram channel
+aiosqlite>=0.21
+# Document text extraction + Agentic IDE drop analysis (pure-Python, lazy-imported)
+# >=6.16.1: PYSEC-2026-3910/-3911/-3913 are fixed there (pip-audit gate);
+# 6.15 closed PYSEC-2026-3655/-3656 before it.
+pypdf>=6.16.1
+python-telegram-bot>=22,<23
+
+# Portable IANA timezone data for calendar routines.
+tzdata>=2025.2

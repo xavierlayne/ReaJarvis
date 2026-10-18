@@ -1,0 +1,541 @@
+"""The marketplace catalog must ship a tracked package seed.
+
+`data/plugin_catalog.json` is gitignored runtime state — a fresh clone or a
+headless VPS has no such file. Without a tracked seed the marketplace would be
+empty there (a cloud-first violation). So `load_catalog` reads the user-editable
+`data/` override when present, else the tracked `seed_catalog.json` shipped in
+the package.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from jarvis.marketplace import catalog_data
+from jarvis.marketplace.catalog_data import clear_cache, load_catalog
+
+
+def test_package_seed_exists_and_is_valid() -> None:
+    clear_cache()
+    cat = load_catalog(catalog_data._PACKAGE_SEED_PATH)
+    ids = {p.id for p in cat.plugins}
+    assert {"github", "notion", "linear"} <= ids
+
+
+def test_every_seed_category_is_declared_in_the_display_order() -> None:
+    """`category` is a free string so a taxonomy change cannot break a user's
+    local catalog on upgrade. This is what still catches a typo in the seed."""
+    from jarvis.marketplace.catalog import CATEGORY_ORDER
+
+    used = {p.category for p in _seed().plugins}
+    assert used <= set(CATEGORY_ORDER), (
+        f"seed categories missing from CATEGORY_ORDER: {sorted(used - set(CATEGORY_ORDER))}"
+    )
+
+
+def test_acceptance_labels_match_across_python_typescript_and_the_api() -> None:
+    """`acceptance` crosses Python -> JSON -> TS -> UI; one drifted value would
+    hide or misplace the Preview badge."""
+    from typing import get_args
+
+    from jarvis.marketplace.catalog import Acceptance, PluginSpec
+
+    labels = set(get_args(Acceptance))
+    assert labels == {"verified", "preview"}
+    assert PluginSpec.model_fields["acceptance"].default == "preview"
+    view = (
+        Path(__file__).resolve().parents[3] / "jarvis/ui/web/frontend/src/views/PluginsView.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'type Acceptance = "verified" | "preview";' in view
+    assert 'acceptance: p.acceptance ?? "preview"' in view
+    for plugin in _seed().plugins:
+        dumped = plugin.model_dump(mode="json")
+        assert dumped["acceptance"] in labels, plugin.id
+
+
+def test_every_seed_plugin_states_its_longevity_note_when_limited() -> None:
+    """A `provider_limited` card must say HOW often the user has to come back —
+    the badge alone would be a warning without an answer."""
+    limited = [p for p in _seed().plugins if p.longevity == "provider_limited"]
+    assert limited, "the Google family is provider-limited; this test would be vacuous"
+    for plugin in limited:
+        assert plugin.longevity_note, f"{plugin.id} is provider_limited without a note"
+
+
+def test_developer_connectors_use_hosted_mcp_without_local_runtimes() -> None:
+    catalog = _seed()
+    github = catalog.by_id("github")
+    supabase = catalog.by_id("supabase")
+
+    assert github is not None and github.mcp_server == {
+        "transport": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "auth_header_template": ("Authorization: Bearer $plugin_github_access_token"),
+    }
+    assert supabase is not None and supabase.mcp_server == {
+        "transport": "http",
+        "url": "https://mcp.supabase.com/mcp?read_only=true",
+        "auth_header_template": ("Authorization: Bearer $plugin_supabase_access_token"),
+    }
+
+
+def test_falls_back_to_seed_when_no_data_override(monkeypatch, tmp_path) -> None:
+    clear_cache()
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", tmp_path / "absent.json")
+    cat = load_catalog()
+    ids = {p.id for p in cat.plugins}
+    assert "linear" in ids, "fresh install must get connectors from the package seed"
+    clear_cache()
+
+
+def test_override_keeps_connection_details_but_not_presentation(monkeypatch, tmp_path) -> None:
+    """The user's own OAuth client survives; the product's own copy does not.
+
+    A local catalog may legitimately carry a user's own OAuth client id. It
+    must NOT freeze the card's category, wording or logo, or a taxonomy change
+    would land on fresh installs only.
+    """
+    clear_cache()
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    seed_slack = next(item for item in seed["plugins"] if item["id"] == "slack")
+    local_slack = json.loads(json.dumps(seed_slack))
+    local_slack["description"] = "stale local wording"
+    local_slack["category"] = "Retired Category"
+    local_slack["auth"]["client_id"] = "1234.my-own-slack-client"
+    override = tmp_path / "plugin_catalog.json"
+    override.write_text(
+        json.dumps({"version": 9, "schema_version": "ovr", "plugins": [local_slack]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+
+    slack = load_catalog().by_id("slack")
+
+    assert slack.auth.client_id == "1234.my-own-slack-client"
+    assert slack.description == seed_slack["description"]
+    assert slack.category == seed_slack["category"]
+    clear_cache()
+
+
+def test_slack_runs_the_native_web_api_tool() -> None:
+    """Slack's hosted MCP server admits only Marketplace-listed or internal
+    apps, so the shared (unlisted) app runs the native Web API tool."""
+    slack = _seed().by_id("slack")
+    assert slack is not None
+    assert slack.native_tool == "slack"
+    assert slack.mcp_server is None
+    assert {"search:read", "channels:read", "groups:read", "im:read", "mpim:read"} <= set(
+        slack.auth.scopes
+    )
+    assert not {"canvases:read", "canvases:write"} & set(slack.auth.scopes)
+
+
+_FIRST_SLACK_SCOPES = [
+    "chat:write",
+    "users:read",
+    "users:read.email",
+    "search:read.public",
+    "search:read.private",
+    "search:read.im",
+    "search:read.mpim",
+    "channels:history",
+    "groups:history",
+    "im:history",
+    "mpim:history",
+]
+_SECOND_SLACK_SCOPES = [
+    *_FIRST_SLACK_SCOPES,
+    "channels:read",
+    "groups:read",
+    "im:read",
+    "mpim:read",
+    "canvases:read",
+    "canvases:write",
+]
+_HOSTED_SLACK_MCP = {
+    "transport": "http",
+    "url": "https://mcp.slack.com/mcp",
+    "auth_header_template": "Authorization: Bearer ${plugin_slack_access_token}",
+}
+
+
+@pytest.mark.parametrize("legacy", [_FIRST_SLACK_SCOPES, _SECOND_SLACK_SCOPES])
+@pytest.mark.parametrize("custom", [None, "scopes", "client", "redirect", "server"])
+def test_slack_scope_upgrade_preserves_custom_auth_and_disk(
+    monkeypatch, tmp_path, custom, legacy
+) -> None:
+    clear_cache()
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    plugin = next(item for item in seed["plugins"] if item["id"] == "slack")
+    plugin.pop("native_tool", None)
+    plugin["mcp_server"] = json.loads(json.dumps(_HOSTED_SLACK_MCP))
+    plugin["auth"] = {
+        "mode": "oauth_pkce_loopback",
+        "authorization_url": "https://slack.com/oauth/v2/authorize",
+        "token_url": "https://slack.com/api/oauth.v2.access",
+        "revocation_url": "https://slack.com/api/auth.revoke",
+        "client_id": "REPLACE_WITH_JARVIS_SLACK_APP_CLIENT_ID",
+        "callback_port": 3118,
+        "scopes": list(legacy),
+        "user_scopes_only": True,
+        "refresh_supported": True,
+        "refresh_token_ttl_days": 30,
+    }
+    if custom == "scopes":
+        plugin["auth"]["scopes"] = ["chat:write"]
+    elif custom == "client":
+        plugin["auth"]["client_id"] = "custom-client"
+    elif custom == "redirect":
+        plugin["auth"]["callback_port"] = 3999
+    elif custom == "server":
+        plugin["mcp_server"]["url"] = "https://custom.example.test/mcp"
+    override = tmp_path / "plugin_catalog.json"
+    content = json.dumps({"version": 1, "schema_version": "old", "plugins": [plugin]})
+    override.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+
+    slack = load_catalog().by_id("slack")
+
+    assert slack is not None
+    assert slack.native_tool == "slack"
+    if custom:
+        from jarvis.marketplace.catalog import PluginCatalog
+
+        expected = PluginCatalog.model_validate(json.loads(content)).by_id("slack")
+        assert slack.auth == expected.auth
+        assert slack.mcp_server == expected.mcp_server
+    else:
+        assert slack.auth == _seed().by_id("slack").auth
+        assert slack.mcp_server is None
+    assert override.read_text(encoding="utf-8") == content
+    clear_cache()
+
+
+def test_stale_override_still_receives_plugins_added_to_the_seed(monkeypatch, tmp_path) -> None:
+    """A new seed connector must reach installs that already have a data/ override.
+
+    Before the merge the override replaced the seed wholesale, so a plugin
+    added to the shipped catalog appeared only on FRESH installs while every
+    existing machine — including the one it was developed on — kept serving its
+    frozen list. The tests stayed green because they read the seed directly.
+    """
+    clear_cache()
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    stale = [item for item in seed["plugins"] if item["id"] == "github"]
+    override = tmp_path / "plugin_catalog.json"
+    override.write_text(
+        json.dumps({"version": 1, "schema_version": "old", "plugins": stale}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+
+    ids = {p.id for p in load_catalog().plugins}
+
+    assert "github" in ids, "the override's own entry must survive"
+    assert {p["id"] for p in seed["plugins"]} <= ids, (
+        "every seed plugin must surface through a stale override"
+    )
+    clear_cache()
+
+
+def test_default_override_migrates_only_exact_obsolete_mcp_launchers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    clear_cache()
+    override = tmp_path / "plugin_catalog.json"
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    github = next(item for item in seed["plugins"] if item["id"] == "github")
+    supabase = next(item for item in seed["plugins"] if item["id"] == "supabase")
+    github["mcp_server"] = {
+        "transport": "stdio",
+        "install": [
+            "docker",
+            "run",
+            "-i",
+            "--rm",
+            "-e",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "ghcr.io/github/github-mcp-server",
+        ],
+        "env_template": {"GITHUB_PERSONAL_ACCESS_TOKEN": "$plugin_github_access_token"},
+    }
+    supabase["mcp_server"] = {
+        "transport": "stdio",
+        "install": [
+            "npx",
+            "-y",
+            "@supabase/mcp-server-supabase@latest",
+            "--read-only",
+            "--access-token",
+            "$plugin_supabase_access_token",
+        ],
+        "env_template": {},
+    }
+    override.write_text(json.dumps(seed), encoding="utf-8")
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+
+    catalog = load_catalog()
+
+    assert catalog.by_id("github").mcp_server["transport"] == "http"
+    assert catalog.by_id("supabase").mcp_server["transport"] == "http"
+    clear_cache()
+
+
+def test_default_override_migrates_only_exact_obsolete_oauth_discovery(
+    monkeypatch, tmp_path
+) -> None:
+    clear_cache()
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    clickup = next(item for item in seed["plugins"] if item["id"] == "clickup")
+    canva = next(item for item in seed["plugins"] if item["id"] == "canva")
+    clickup["auth"]["discovery_url"] = (
+        "https://mcp.clickup.com/.well-known/oauth-authorization-server"
+    )
+    custom = "https://oauth.example.test/custom-protected-resource"
+    canva["auth"]["discovery_url"] = custom
+    override = tmp_path / "plugin_catalog.json"
+    override.write_text(
+        json.dumps({"version": 1, "schema_version": "old", "plugins": [clickup, canva]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+
+    catalog = load_catalog()
+
+    assert catalog.by_id("clickup").auth.discovery_url == (
+        "https://mcp.clickup.com/.well-known/oauth-protected-resource"
+    )
+    assert catalog.by_id("canva").auth.discovery_url == custom
+    clear_cache()
+
+
+def test_seed_dcr_connectors_begin_at_protected_resource_metadata() -> None:
+    catalog = _seed()
+    expected = {
+        "clickup": "https://mcp.clickup.com/.well-known/oauth-protected-resource",
+        "canva": "https://mcp.canva.com/.well-known/oauth-protected-resource",
+        "airtable": "https://mcp.airtable.com/.well-known/oauth-protected-resource",
+        "cal_com": "https://mcp.cal.com/.well-known/oauth-protected-resource",
+        "higgsfield": "https://mcp.higgsfield.ai/.well-known/oauth-protected-resource/mcp",
+    }
+    assert {
+        plugin_id: catalog.by_id(plugin_id).auth.discovery_url for plugin_id in expected
+    } == expected
+
+
+def _seed():
+    """Load the tracked package seed directly (independent of any data/ override)."""
+    clear_cache()
+    return load_catalog(catalog_data._PACKAGE_SEED_PATH)
+
+
+@pytest.mark.parametrize("plugin_id", ["vercel", "supabase", "stripe"])
+def test_developer_browser_oauth_uses_official_hosted_mcp(plugin_id) -> None:
+    spec = _seed().by_id(plugin_id)
+    assert spec is not None
+    assert spec.auth.mode == "hosted_mcp_oauth_dcr"
+    assert spec.auth.refresh_supported
+    assert spec.fallback_auth.mode == "pat_paste"
+    assert spec.mcp_server is not None
+    assert spec.mcp_server["transport"] == "http"
+    assert spec.mcp_server["url"] == spec.auth.mcp_url
+
+
+@pytest.mark.parametrize("plugin_id", ["github", "vercel", "supabase", "stripe"])
+@pytest.mark.parametrize("custom", [None, "auth", "mcp"])
+def test_legacy_pat_override_migrates_only_unchanged_builtin(
+    monkeypatch, tmp_path, plugin_id, custom
+) -> None:
+    clear_cache()
+    seed = json.loads(catalog_data._PACKAGE_SEED_PATH.read_text(encoding="utf-8"))
+    plugin = next(item for item in seed["plugins"] if item["id"] == plugin_id)
+    plugin["auth"] = dict(plugin["fallback_auth"])
+    if plugin_id == "github":
+        plugin["auth"].pop("token_prefixes", None)
+        plugin["auth"]["instruction_md"] = (
+            "1. The link below opens GitHub with the right scopes "
+            "(repo, workflow, read:user) already ticked.\n"
+            "2. Pick an expiration (90 days is a sensible default), then click 'Generate token'.\n"
+            "3. Copy the token (shown only once) and paste it below.\n"
+            "4. If your repos sit behind SAML SSO, click 'Configure SSO' "
+            "next to the new token after creation."
+        )
+    if plugin_id == "vercel":
+        plugin.pop("mcp_server", None)
+    if custom == "auth":
+        plugin["auth"]["validation_endpoint"] = "https://custom.example.test/user"
+    if custom == "mcp":
+        plugin["mcp_server"] = {"transport": "http", "url": "https://custom.example.test/mcp"}
+    override = tmp_path / "plugin_catalog.json"
+    content = json.dumps({"version": 1, "schema_version": "old", "plugins": [plugin]})
+    override.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(catalog_data, "_DEFAULT_CATALOG_PATH", override)
+    result = load_catalog().by_id(plugin_id)
+    if custom:
+        assert result.auth.mode == "pat_paste"
+        if custom == "auth":
+            assert result.auth.validation_endpoint == "https://custom.example.test/user"
+        else:
+            assert result.mcp_server["url"] == "https://custom.example.test/mcp"
+    else:
+        assert result.auth.mode == (
+            "oauth_device_flow" if plugin_id == "github" else "hosted_mcp_oauth_dcr"
+        )
+    assert override.read_text(encoding="utf-8") == content
+    clear_cache()
+
+
+def test_cloudflare_is_dcr_one_click_with_http_mcp() -> None:
+    spec = _seed().by_id("cloudflare")
+    assert spec is not None
+    assert spec.display_name == "Cloudflare"
+    assert spec.auth.mode == "hosted_mcp_oauth_dcr"
+    assert spec.auth.mcp_url == "https://observability.mcp.cloudflare.com/mcp"
+    assert spec.mcp_server["url"] == "https://observability.mcp.cloudflare.com/mcp"
+
+
+def test_discord_uses_browser_identity_with_bot_token_fallback() -> None:
+    # AD-3 (2026-06-09): connecting Discord enables the in-repo bidirectional
+    # channel (like Telegram), not a competing mcp-discord server that would
+    # open a second Discord gateway over the same bot token.
+    spec = _seed().by_id("discord")
+    assert spec is not None
+    assert spec.display_name == "Discord"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert spec.fallback_auth is not None
+    assert spec.fallback_auth.mode == "pat_paste"
+    assert spec.fallback_auth.auth_scheme == "bot"
+    assert spec.mcp_server is None
+
+
+def test_telegram_is_pat_telegram_path_no_mcp() -> None:
+    spec = _seed().by_id("telegram")
+    assert spec is not None
+    assert spec.display_name == "Telegram"
+    assert spec.auth.mode == "pat_paste"
+    assert spec.auth.auth_scheme == "telegram_path"
+    assert "{token}" in spec.auth.validation_endpoint
+    # Telegram reuses the in-repo channel, not an MCP server.
+    assert spec.mcp_server is None
+
+
+def test_asana_is_pkce_loopback_with_resource_and_http_mcp() -> None:
+    spec = _seed().by_id("asana")
+    assert spec is not None
+    assert spec.display_name == "Asana"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert spec.auth.resource == "https://mcp.asana.com/v2"
+    assert spec.mcp_server["url"] == "https://mcp.asana.com/v2/mcp"
+
+
+def test_google_drive_uses_full_drive_scope_via_native_tool() -> None:
+    # 2026-07-23: Drive moved off Google's hosted Drive MCP (a Workspace
+    # Developer-Preview endpoint that 403s consumer @gmail.com accounts on every
+    # data-plane call) onto a native REST tool. The catalog therefore carries a
+    # native_tool + NO mcp_server, and the full 'drive' scope (all files, per the
+    # "voller Zugriff" mandate) rather than the app-scoped drive.file.
+    spec = _seed().by_id("google_drive")
+    assert spec is not None
+    assert spec.display_name == "Google Drive"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert spec.auth.scopes == ["https://www.googleapis.com/auth/drive"]
+    assert spec.native_tool == "google_drive"
+    assert spec.mcp_server is None
+    assert spec.auth.scope_separator == "space"
+    assert spec.auth.callback_path == ""
+    assert spec.auth.offline_access is True
+
+
+def test_gmail_pkce_loopback_full_mail_scope() -> None:
+    # 2026-07-23: Gmail widened to the full mail.google.com scope (read + send +
+    # organize + delete) so the native tool's modify/trash/delete actions have
+    # the grant they need ("voller Zugriff" mandate).
+    spec = _seed().by_id("gmail")
+    assert spec is not None
+    assert spec.display_name == "Gmail"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert "https://mail.google.com/" in spec.auth.scopes
+    assert spec.auth.scope_separator == "space"
+    assert spec.auth.callback_path == ""
+    assert spec.auth.offline_access is True
+    assert spec.native_tool == "gmail"
+
+
+def test_higgsfield_is_dcr_one_click_with_http_mcp() -> None:
+    spec = _seed().by_id("higgsfield")
+    assert spec is not None
+    assert spec.display_name == "Higgsfield"
+    assert spec.category == "Media & Creativity"
+    assert spec.auth.mode == "hosted_mcp_oauth_dcr"
+    assert spec.auth.mcp_url == "https://mcp.higgsfield.ai/mcp"
+    assert spec.auth.refresh_supported is True
+    assert spec.mcp_server is not None
+    assert spec.mcp_server["transport"] == "http"
+    assert spec.mcp_server["url"] == "https://mcp.higgsfield.ai/mcp"
+    assert spec.native_tool is None
+
+
+def test_unlisted_shopify_manifest_keeps_its_pkce_configuration() -> None:
+    # 2026-09-21: Shopify publishes no DCR registration_endpoint, so the
+    # first (DCR) attempt failed at connect with "provider request failed".
+    # The plugin uses Authorization Code + PKCE loopback against the
+    # publisher-shared app, with the RFC 8707 resource indicator the MCP
+    # server requires.
+    from jarvis.marketplace.catalog import PluginSpec
+
+    assert _seed().by_id("shopify") is None
+    manifest_path = (
+        Path(__file__).resolve().parents[3]
+        / "jarvis/marketplace/drafts/shopify/plugin.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    spec = PluginSpec.model_validate({
+        "id": manifest["name"],
+        "description": manifest["description"],
+        **manifest["extensions"]["io.github.personaljarvis"],
+    })
+    assert spec.display_name == "Shopify"
+    assert spec.category == "Knowledge & Reading"
+    assert spec.oauth_client_family == "shopify"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert spec.auth.authorization_url == "https://setup.shopify.com/oauth/authorize"
+    assert spec.auth.token_url == "https://setup.shopify.com/oauth/token"  # noqa: S105 - URL, not a credential
+    assert spec.auth.callback_port == 3130
+    assert spec.auth.scopes == [
+        "read_products",
+        "read_orders",
+        "read_customers",
+        "read_discounts",
+    ]
+    assert spec.auth.resource == "https://setup.shopify.com/mcp"
+    assert spec.auth.refresh_supported is True
+    assert spec.fallback_auth is None
+    assert spec.mcp_server is not None
+    assert spec.mcp_server["transport"] == "http"
+    assert spec.mcp_server["url"] == "https://setup.shopify.com/mcp"
+    assert spec.native_tool is None
+
+
+def test_youtube_music_joins_the_google_client_family_as_native_tool() -> None:
+    # 2026-08-18: Google publishes no YouTube Music API, so the plugin rides the
+    # official YouTube Data API v3 through the SHARED Google OAuth client (one
+    # Cloud project covers Gmail, Drive, Calendar and YouTube Music) — a native
+    # tool, no MCP server, and its own loopback port so a connect never collides
+    # with a sibling Google plugin's listener.
+    spec = _seed().by_id("youtube_music")
+    assert spec is not None
+    assert spec.display_name == "YouTube Music"
+    assert spec.oauth_client_family == "google"
+    assert spec.auth.mode == "oauth_pkce_loopback"
+    assert spec.auth.scopes == ["https://www.googleapis.com/auth/youtube"]
+    assert spec.auth.client_id == "REPLACE_WITH_JARVIS_GOOGLE_CLIENT_ID"
+    assert spec.auth.offline_access is True
+    assert spec.native_tool == "youtube_music"
+    assert spec.mcp_server is None
+    assert spec.longevity == "provider_limited"
+    ports = [p.auth.callback_port for p in _seed().plugins if getattr(p.auth, "callback_port", 0)]
+    assert ports.count(spec.auth.callback_port) == 1

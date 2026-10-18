@@ -1,0 +1,248 @@
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { resetConnectBudgetForTests } from "./connectBudget";
+import {
+  entryAssets,
+  HOLDING_ATTRIBUTE,
+  HOLDING_MARKER,
+  looksBootable,
+  reloadWhenServable,
+  type SafeReloadDeps,
+  browserSafeReloadDeps,
+  REQUEST_TIMEOUT_MS,
+} from "./safeReload";
+
+/** The real entry document this app ships — the one every reload fetches. */
+function realIndexHtml(): string {
+  let dir = process.cwd();
+  for (;;) {
+    const candidate = resolve(dir, "index.html");
+    if (existsSync(candidate)) return readFileSync(candidate, "utf8");
+    const up = dirname(dir);
+    if (up === dir)
+      throw new Error("index.html not found above " + process.cwd());
+    dir = up;
+  }
+}
+
+const INDEX = `<!doctype html><html><head>
+<script type="module" crossorigin src="/assets/index-abc123.js"></script>
+<link rel="stylesheet" href="/assets/index-def456.css">
+</head><body><div id="root"></div></body></html>`;
+
+/**
+ * A deps double whose timers run immediately, so a test can watch the retry
+ * loop converge without a clock. `defer` is counted rather than delayed —
+ * what matters is that it keeps asking and does NOT reload.
+ */
+function harness(pages: string[], assets: (url: string) => boolean) {
+  let reloads = 0;
+  let waits = 0;
+  const asked: string[] = [];
+  const deps: SafeReloadDeps = {
+    fetchIndex: () =>
+      Promise.resolve(pages.length > 1 ? pages.shift()! : pages[0]),
+    assetOk: (url) => {
+      asked.push(url);
+      return Promise.resolve(assets(url));
+    },
+    reload: () => {
+      reloads += 1;
+    },
+    defer: (fn) => {
+      waits += 1;
+      // Bounded so a test that never converges fails instead of hanging.
+      if (waits < 12) void Promise.resolve().then(fn);
+    },
+  };
+  return {
+    deps,
+    reloads: () => reloads,
+    waits: () => waits,
+    asked: () => asked,
+  };
+}
+
+/** Let every queued microtask (the fetch chains) run. */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+describe("entryAssets", () => {
+  test("finds every hashed build output once", () => {
+    expect(entryAssets(INDEX)).toEqual([
+      "/assets/index-abc123.js",
+      "/assets/index-def456.css",
+    ]);
+  });
+
+  test("a document with no build outputs yields nothing", () => {
+    expect(entryAssets("<html><body>nothing here</body></html>")).toEqual([]);
+  });
+});
+
+describe("looksBootable", () => {
+  test("a real index is bootable", () => {
+    expect(looksBootable(INDEX)).toBe(true);
+  });
+
+  test("a failed request is not", () => {
+    expect(looksBootable("")).toBe(false);
+  });
+
+  test("the server's holding page is not — it says a build is in flight", () => {
+    expect(
+      looksBootable(`<html><div data-state="${HOLDING_MARKER}"></div></html>`),
+    ).toBe(false);
+  });
+
+  test("the REAL index.html is, although its inline watchdog names the marker", () => {
+    // The regression of 2026-08-22/23: index.html carries a watchdog script
+    // that spells out the holding marker, a check for the bare word took every
+    // genuine build for the holding page, and no window ever reloaded again.
+    // Only the attribute form on the holding page's element counts — and the
+    // real document must never contain that form.
+    const source = realIndexHtml();
+    expect(source).toContain(HOLDING_MARKER);
+    expect(source).not.toContain(HOLDING_ATTRIBUTE);
+    // What Vite makes of it: the same document with hashed entry assets.
+    const built = source.replace(
+      "</head>",
+      '<script type="module" crossorigin src="/assets/index-abc123.js"></script></head>',
+    );
+    expect(entryAssets(built).length).toBeGreaterThan(0);
+    expect(looksBootable(built)).toBe(true);
+  });
+});
+
+describe("reloadWhenServable", () => {
+  test("coalesces repeated recovery requests while the server is unavailable", async () => {
+    const h = harness(["", INDEX], () => true);
+    for (let i = 0; i < 10; i += 1) reloadWhenServable(h.deps);
+    await settle();
+    expect(h.waits()).toBe(1);
+    expect(h.reloads()).toBe(1);
+  });
+  test("a whole build on disk is reloaded into", async () => {
+    const h = harness([INDEX], () => true);
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(1);
+    expect(h.asked()).toEqual([
+      "/assets/index-abc123.js",
+      "/assets/index-def456.css",
+    ]);
+  });
+
+  test("an index whose entry bundle 404s is NOT reloaded into", async () => {
+    // The 1.8 s window a real rebuild opens: index.html still on disk, its
+    // assets already deleted. This is the black window, and the whole point.
+    const h = harness([INDEX], (url) => !url.endsWith(".js"));
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(0);
+    expect(h.waits()).toBeGreaterThan(0);
+  });
+
+  test("the holding page is waited out, never reloaded into", async () => {
+    const h = harness(
+      [`<html><div data-state="${HOLDING_MARKER}"></div></html>`],
+      () => true,
+    );
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(0);
+  });
+
+  test("a server that is not answering keeps the page that is on screen", async () => {
+    const h = harness([""], () => true);
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(0);
+    expect(h.waits()).toBeGreaterThan(0);
+  });
+
+  test("it reloads as soon as the build lands, not before", async () => {
+    const pages = [
+      `<html><div data-state="${HOLDING_MARKER}"></div></html>`,
+      `<html><div data-state="${HOLDING_MARKER}"></div></html>`,
+      INDEX,
+    ];
+    const h = harness(pages, () => true);
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(1);
+  });
+
+  test("a held window waits with a whole build ready, then reloads", async () => {
+    // A live call or a streaming reply owns the document; the reload must wait
+    // until it is over instead of hanging it up.
+    let held = true;
+    const h = harness([INDEX], () => true);
+    h.deps.held = () => {
+      const now = held;
+      held = false;
+      return now;
+    };
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.waits()).toBe(1);
+    expect(h.reloads()).toBe(1);
+  });
+
+  test("a hold that never lifts never reloads", async () => {
+    const h = harness([INDEX], () => true);
+    h.deps.held = () => true;
+    reloadWhenServable(h.deps);
+    await settle();
+    expect(h.reloads()).toBe(0);
+    expect(h.waits()).toBeGreaterThan(1);
+  });
+
+  test("a fetch that throws is a retry, never a reload", async () => {
+    let reloads = 0;
+    let waits = 0;
+    const deps: SafeReloadDeps = {
+      fetchIndex: () => Promise.reject(new Error("connection refused")),
+      assetOk: () => Promise.resolve(true),
+      reload: () => {
+        reloads += 1;
+      },
+      defer: () => {
+        waits += 1;
+      },
+    };
+    reloadWhenServable(deps);
+    await settle();
+    expect(reloads).toBe(0);
+    expect(waits).toBe(1);
+  });
+});
+
+describe("browser recovery requests", () => {
+  afterEach(() => {
+    resetConnectBudgetForTests();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  test.each(["headers", "body", "asset"])("bounds a stalled %s request even when abort is ignored", async (phase) => {
+    vi.useFakeTimers();
+    const pending = new Promise<Response>(() => undefined);
+    const fetcher = vi.fn(() => phase === "body"
+      ? Promise.resolve({ ok: true, text: () => new Promise<string>(() => undefined) })
+      : pending);
+    vi.stubGlobal("fetch", fetcher);
+    const deps = browserSafeReloadDeps();
+    const result = phase === "asset" ? deps.assetOk("/assets/index-12345678.js") : deps.fetchIndex();
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+    expect(await result).toBe(phase === "asset" ? false : "");
+    expect(fetcher.mock.calls.length).toBe(1);
+  });
+
+  test("shares automatic recovery dependencies without overriding call holds", () => {
+    const held = () => true;
+    expect(browserSafeReloadDeps({ held })).toBe(browserSafeReloadDeps({ held }));
+    expect(browserSafeReloadDeps({ held })).not.toBe(browserSafeReloadDeps());
+    expect(browserSafeReloadDeps({ held }).held?.()).toBe(true);
+  });
+});

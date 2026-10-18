@@ -1,0 +1,25 @@
+﻿# Demo job 2 — an LLM agent writes a standup note every weekday at 9:00.
+# Default provider: gemini with gemini-3.1-pro (frontier). Requires
+# GEMINI_API_KEY to be set (get a key at https://aistudio.google.com/apikey).
+id: 7b4d7e01-5c11-4c57-9c1d-10cc00000002
+name: Daily Standup
+description: >
+  Weekdays 9:00 — Gemini 3.1 Pro generates a short standup note.
+  Default provider is gemini via a Google AI Studio API key.
+enabled: true
+tags: [demo, agent, gemini]
+spec:
+  type: agent
+  provider: gemini
+  model: gemini-3.1-pro
+  system_prompt: >
+    You are a terse, to-the-point work coach. No introduction,
+    no small talk — just the note itself.
+  user_prompt: >
+    Write a 3-point standup note for today. Each point at most
+    one sentence. Topic: focused work on a software project.
+  max_output_tokens: 400
+  temperature: 0.7
+schedule:
+  type: cron
+  expression: 0 9 * * 1-5

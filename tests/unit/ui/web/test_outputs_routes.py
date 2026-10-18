@@ -1,0 +1,1858 @@
+"""REST-route tests for the Outputs view (`/api/outputs`).
+
+Focus: H1 bug — `_mission_status_lookup` previously used the names of
+``tasks/<task_id>/`` subdirectories as the ``WHERE id LIKE 'prefix%'``
+input. Those names are ``Step.task_id`` UUIDs (a fresh UUIDv7 minted per
+step by the Kontrollierer), not the ``mission_id`` the
+Mission-Manager persists in ``missions.id``. The lookup therefore never
+matched and every ``mission_<short>/`` directory rendered as
+``status="unknown"`` in the UI.
+
+The fix derives the mission-id prefix from the dir-name itself
+(``mission_<mission_id[:13]>``). These tests cover both regression
+guards: that ``mission_<short>`` dirs resolve to the right status from
+the DB, and that worktree slug-style dirs stay un-enriched (their
+embedded random ``hex[:8]`` is decoupled from any mission UUID by
+design).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator
+from pathlib import Path
+from unittest.mock import patch
+
+import aiosqlite
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from jarvis.missions.standalone_run import MARKER_NAME as STANDALONE_MARKER_NAME
+from jarvis.missions.standalone_run import write_marker as write_standalone_marker
+from jarvis.ui.web.outputs_routes import (
+    _is_deliverable_relpath,
+    _mission_id_prefix_for_dir,
+    _parse_slug,
+)
+from jarvis.ui.web.outputs_routes import (
+    router as outputs_router,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_openers_cache_between_tests():
+    """The opener list is memoized per process; clear it around every test so
+    the editor-detection cases don't see each other's cached result."""
+    from jarvis.ui.web import outputs_routes
+
+    outputs_routes._reset_openers_cache()
+    yield
+    outputs_routes._reset_openers_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_editor_installs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Editor detection probes standard install paths first; keep the test
+    machine's own VS Code or Cursor out so only the stubbed resolver decides."""
+    from jarvis.ui.web import outputs_routes
+
+    monkeypatch.setattr(outputs_routes, "_editor_install_candidates", lambda app_id: [])
+
+
+# --- Stubs -------------------------------------------------------------------
+
+
+class _StubStore:
+    """Mimics ``MissionEventStore`` enough for ``_mission_status_lookup``.
+
+    The route only touches ``mgr.store.conn.execute(...)`` so we only need
+    a connection with a missions table populated to fake-DB shape.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self.conn = conn
+
+
+class _StubManager:
+    def __init__(self, store: _StubStore) -> None:
+        self.store = store
+
+
+@pytest_asyncio.fixture
+async def db_conn() -> AsyncIterator[aiosqlite.Connection]:
+    conn = await aiosqlite.connect(":memory:", isolation_level=None)
+    await conn.execute(
+        "CREATE TABLE missions ("
+        "id TEXT PRIMARY KEY, prompt TEXT NOT NULL, state TEXT NOT NULL, "
+        "language TEXT NOT NULL DEFAULT 'de', created_ms INTEGER NOT NULL, "
+        "updated_ms INTEGER NOT NULL, iteration INTEGER NOT NULL DEFAULT 0, "
+        "cost_usd REAL NOT NULL DEFAULT 0.0)"
+    )
+    # The continuation-link lookup reads MissionDispatched events; mirror the
+    # subset of the real `mission_events` schema the route helper touches.
+    await conn.execute(
+        "CREATE TABLE mission_events ("
+        "seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, "
+        "event_type TEXT NOT NULL, payload_json TEXT NOT NULL)"
+    )
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+@pytest.fixture
+def app(tmp_path: Path, db_conn: aiosqlite.Connection) -> FastAPI:
+    app = FastAPI()
+    app.include_router(outputs_router)
+    app.state.outputs_root = tmp_path
+    app.state.mission_manager = _StubManager(_StubStore(db_conn))
+    return app
+
+
+# --- Helpers -----------------------------------------------------------------
+
+
+def _make_mission_dir(root: Path, mission_id: str) -> Path:
+    """Create a ``mission_<mission_id[:13]>`` dir as the Kontrollierer does."""
+    d = root / f"mission_{mission_id[:13]}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _make_worktree_dir(root: Path, utterance: str = "test-task", short: str | None = None) -> Path:
+    """Create a worktree slug-style dir as ``WorktreeManager.create`` does."""
+    short = short or "deadbeef"
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    d = root / f"{ts}__{utterance}__{short}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _seed(path: Path, content: str = "x") -> Path:
+    """Write ``content`` to ``path``, creating parent dirs (``mkdir -p``).
+
+    ``Path.write_text`` does NOT create missing parents — it raises
+    ``FileNotFoundError``. The artifact-filter tests lay down deeply nested
+    mission scaffolding (``tasks/<id>/artifacts/files/...``, ``claude_config/
+    projects/...``), so they all go through this helper.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+async def _insert_mission(
+    conn: aiosqlite.Connection,
+    *,
+    mission_id: str,
+    state: str,
+    prompt: str = "test prompt",
+    created_ms: int | None = None,
+    updated_ms: int | None = None,
+) -> None:
+    created_ms = created_ms or int(time.time() * 1000) - 5000
+    updated_ms = updated_ms or int(time.time() * 1000)
+    await conn.execute(
+        "INSERT INTO missions (id, prompt, state, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?)",
+        (mission_id, prompt, state, created_ms, updated_ms),
+    )
+
+
+async def _insert_dispatch_event(
+    conn: aiosqlite.Connection,
+    *,
+    child_id: str,
+    parent_id: str,
+) -> None:
+    """Record the child's ``MissionDispatched`` event carrying its parent link.
+
+    Mirrors what ``mgr.dispatch(parent_mission_id=...)`` persists on a re-run:
+    the parent→child edge lives only in the dispatch event payload (the
+    ``missions`` header has no parent column).
+    """
+    payload = json.dumps(
+        {
+            "event_type": "MissionDispatched",
+            "prompt": "task",
+            "parent_mission_id": parent_id,
+            "priority": 0,
+            "language": "en",
+        }
+    )
+    await conn.execute(
+        "INSERT INTO mission_events (mission_id, event_type, payload_json) VALUES (?, ?, ?)",
+        (child_id, "MissionDispatched", payload),
+    )
+
+
+async def _insert_terminal_event(
+    conn: aiosqlite.Connection,
+    *,
+    mission_id: str,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    await conn.execute(
+        "INSERT INTO mission_events (mission_id, event_type, payload_json) "
+        "VALUES (?, ?, ?)",
+        (mission_id, event_type, json.dumps(payload)),
+    )
+
+
+# --- _parse_slug + _mission_id_prefix_for_dir unit tests ---------------------
+
+
+def test_parse_slug_mission_dir() -> None:
+    parsed = _parse_slug("mission_019e3600-a84e")
+    assert parsed["short"] == "019e3600-a84e"
+    assert parsed["utterance"] is None
+    assert parsed["started_at"] is None
+
+
+def test_parse_slug_worktree_dir() -> None:
+    parsed = _parse_slug("20260518T120000__refactor-router__deadbeef")
+    assert parsed["short"] == "deadbeef"
+    assert parsed["utterance"] == "Refactor router"
+    assert parsed["started_at"] is not None
+
+
+def test_parse_slug_unknown_returns_nones() -> None:
+    parsed = _parse_slug("random-dir-name")
+    assert parsed == {"started_at": None, "utterance": None, "short": None}
+
+
+def test_mission_id_prefix_for_persistent_dir() -> None:
+    """The mission_<short> dir-name yields its short as the LIKE-prefix."""
+    assert _mission_id_prefix_for_dir("mission_019e3600-a84e") == "019e3600-a84e"
+
+
+def test_mission_id_prefix_for_worktree_dir_is_none() -> None:
+    """Worktree slug dirs embed a random hex[:8] — no mission-id mapping."""
+    assert _mission_id_prefix_for_dir("20260518T120000__refactor-router__deadbeef") is None
+
+
+def test_mission_id_prefix_for_random_dir_is_none() -> None:
+    assert _mission_id_prefix_for_dir("unrelated-folder") is None
+
+
+def test_mission_id_prefix_rejects_too_short_prefix() -> None:
+    """Six char floor matches the SQL LIKE guard in _mission_status_lookup."""
+    assert _mission_id_prefix_for_dir("mission_abcde") is None  # 5 chars
+    assert _mission_id_prefix_for_dir("mission_abcdef") == "abcdef"  # 6 OK
+
+
+# --- /api/outputs route tests ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_empty_root(app: FastAPI) -> None:
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    assert r.status_code == 200
+    assert r.json() == {"sessions": []}
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_counts_artifacts_off_the_event_loop(
+    app: FastAPI,
+    db_conn: aiosqlite.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep archive walk must not freeze HTTP and WebSocket handling."""
+    mission_id = "019e3600-a84e-7000-8000-000000000123"
+    session = _make_mission_dir(tmp_path, mission_id)
+    _seed(session / "tasks" / "task-1" / "artifacts" / "files" / "report.md")
+    await _insert_mission(db_conn, mission_id=mission_id, state="completed")
+
+    from jarvis.ui.web import outputs_routes
+
+    original = outputs_routes._count_deliverables
+
+    def assert_worker_thread(path: Path) -> int:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return original(path)
+
+    monkeypatch.setattr(outputs_routes, "_count_deliverables", assert_worker_thread)
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    assert response.status_code == 200
+    assert response.json()["sessions"][0]["artifact_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_includes_legacy_sessions_when_canonical_root_exists(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """A newly-created canonical root must not hide retained mission history."""
+    canonical = tmp_path / "jarvis-agent-outputs"
+    legacy = tmp_path / "sub-agents-outputs"
+    canonical.mkdir()
+    legacy.mkdir()
+    mission_id = "019e3600-a84e-7000-8000-000000000099"
+    legacy_session = _make_mission_dir(legacy, mission_id)
+    _seed(
+        legacy_session / "tasks" / "task-1" / "artifacts" / "files" / "report.md",
+        "legacy output",
+    )
+    app.state.outputs_root = canonical
+    app.state.outputs_roots = (canonical, legacy)
+
+    with TestClient(app) as client:
+        listing = client.get("/api/outputs")
+        artifacts = client.get(f"/api/outputs/{legacy_session.name}/artifacts")
+
+    assert listing.status_code == 200
+    assert [session["slug"] for session in listing.json()["sessions"]] == [
+        legacy_session.name
+    ]
+    assert artifacts.status_code == 200
+    assert [item["path"] for item in artifacts.json()["files"]] == [
+        "tasks/task-1/artifacts/files/report.md"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_root_wins_when_both_roots_contain_the_same_slug(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    canonical = tmp_path / "jarvis-agent-outputs"
+    legacy = tmp_path / "sub-agents-outputs"
+    canonical.mkdir()
+    legacy.mkdir()
+    mission_id = "019e3600-a84e-7000-8000-000000000098"
+    canonical_session = _make_mission_dir(canonical, mission_id)
+    legacy_session = _make_mission_dir(legacy, mission_id)
+    rel = Path("tasks/task-1/artifacts/files/report.md")
+    _seed(canonical_session / rel, "canonical output")
+    _seed(legacy_session / rel, "legacy output")
+    app.state.outputs_root = canonical
+    app.state.outputs_roots = (canonical, legacy)
+
+    with TestClient(app) as client:
+        listing = client.get("/api/outputs")
+        raw = client.get(f"/api/outputs/{canonical_session.name}/files/{rel.as_posix()}/raw")
+
+    assert len(listing.json()["sessions"]) == 1
+    assert raw.status_code == 200
+    assert raw.json()["text"] == "canonical output"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_mission_dir_resolves_status_from_db(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """H1 regression: mission_<short>/ dirs must NOT render as unknown."""
+    mission_id = "019e3600-a84e-7000-8000-000000000001"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+
+    assert r.status_code == 200
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    sess = sessions[0]
+    assert sess["slug"] == f"mission_{mission_id[:13]}"
+    assert sess["status"] == "success", (
+        f"H1 regression: mission_<short>/ dir should resolve to its DB "
+        f"row (APPROVED→success), got status={sess['status']!r}"
+    )
+    assert sess["utterance"] == "test prompt"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_mission_dir_running_state(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-b000-7000-8000-000000000002"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="RUNNING")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_parked_mission_is_running_and_flags_the_capacity_decision(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A WAITING_CAPACITY mission has not landed (status "running") and tells
+    the Artifacts view to offer wait / approve-paid / cancel for it."""
+    parked = "019e3600-c001-7000-8000-0000000000c1"
+    running = "019e3600-c002-7000-8000-0000000000c2"
+    for mission_id, state in ((parked, "WAITING_CAPACITY"), (running, "RUNNING")):
+        _make_mission_dir(tmp_path, mission_id)
+        await _insert_mission(db_conn, mission_id=mission_id, state=state)
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    by_id = {s["mission_id"]: s for s in r.json()["sessions"]}
+    assert by_id[parked]["status"] == "running"
+    assert by_id[parked]["waiting_capacity"] is True
+    assert by_id[running]["waiting_capacity"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_mission_dir_failed_state(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-c000-7000-8000-000000000003"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="FAILED")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions[0]["status"] == "error"
+    assert sessions[0]["has_partial_output"] is False
+    assert sessions[0]["needs_review"] is False
+    assert sessions[0]["artifact_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_mission_with_deliverable_is_exposed_as_reviewable_partial(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A retained file is not approval, but it is not a content-free error."""
+    mission_id = "019e3600-c100-7000-8000-000000000103"
+    mission_dir = _make_mission_dir(tmp_path, mission_id)
+    _seed(
+        mission_dir / "tasks/task-1/artifacts/files/report.html",
+        "<!doctype html><html><body>Report</body></html>",
+    )
+    await _insert_mission(db_conn, mission_id=mission_id, state="FAILED")
+    await _insert_terminal_event(
+        db_conn,
+        mission_id=mission_id,
+        event_type="MissionFailed",
+        payload={"reason": "critic_loop_exhausted"},
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    assert response.status_code == 200
+    session = response.json()["sessions"][0]
+    assert session["status"] == "error"
+    assert session["terminal_event"] == "MissionFailed"
+    assert session["terminal_reason"] == "critic_loop_exhausted"
+    assert session["error"] == "critic_loop_exhausted"
+    assert session["artifact_count"] == 1
+    assert session["has_partial_output"] is True
+    assert session["needs_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_execution_failure_with_retained_file_stays_failed(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A leftover file does not soften a worker crash into a review outcome."""
+    mission_id = "019e3600-c150-7000-8000-000000000153"
+    mission_dir = _make_mission_dir(tmp_path, mission_id)
+    _seed(mission_dir / "tasks/task-1/artifacts/files/partial.html", "partial")
+    await _insert_mission(db_conn, mission_id=mission_id, state="FAILED")
+    await _insert_terminal_event(
+        db_conn,
+        mission_id=mission_id,
+        event_type="MissionFailed",
+        payload={"reason": "task_error"},
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    session = response.json()["sessions"][0]
+    assert session["status"] == "error"
+    assert session["has_partial_output"] is True
+    assert session["needs_review"] is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_critic_rejection_with_retained_file_stays_failed(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """An explicit rejection is a real terminal decision, not review exhaustion."""
+    mission_id = "019e3600-c175-7000-8000-000000000173"
+    mission_dir = _make_mission_dir(tmp_path, mission_id)
+    _seed(mission_dir / "tasks/task-1/artifacts/files/rejected.html", "partial")
+    await _insert_mission(db_conn, mission_id=mission_id, state="FAILED")
+    await _insert_terminal_event(
+        db_conn,
+        mission_id=mission_id,
+        event_type="MissionFailed",
+        payload={"reason": "critic_rejected"},
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    session = response.json()["sessions"][0]
+    assert session["status"] == "error"
+    assert session["terminal_reason"] == "critic_rejected"
+    assert session["has_partial_output"] is True
+    assert session["needs_review"] is False
+
+
+@pytest.mark.asyncio
+async def test_approved_mission_exposes_signed_summary_without_partial_flag(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-c200-7000-8000-000000000203"
+    mission_dir = _make_mission_dir(tmp_path, mission_id)
+    _seed(mission_dir / "tasks/task-1/artifacts/files/report.md", "# Complete")
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED")
+    await _insert_terminal_event(
+        db_conn,
+        mission_id=mission_id,
+        event_type="MissionApproved",
+        payload={
+            "summary_en": "The report was approved.",
+            "summary_de": "Der Bericht wurde freigegeben.",  # i18n-allow: fixture
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    session = response.json()["sessions"][0]
+    assert session["status"] == "success"
+    assert session["summary"] == "Der Bericht wurde freigegeben."  # i18n-allow: fixture
+    assert session["artifact_count"] == 1
+    assert session["has_partial_output"] is False
+    assert session["needs_review"] is False
+    assert session["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_transition_reason_is_a_legacy_fallback(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-c300-7000-8000-000000000303"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="CANCELLED")
+    await _insert_terminal_event(
+        db_conn,
+        mission_id=mission_id,
+        event_type="MissionStateChanged",
+        payload={"to_state": "CANCELLED", "reason": "app_shutdown"},
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/outputs")
+
+    session = response.json()["sessions"][0]
+    assert session["status"] == "cancelled"
+    assert session["terminal_event"] == "MissionStateChanged"
+    assert session["terminal_reason"] == "app_shutdown"
+    assert session["error"] is None
+
+
+def test_outputs_openapi_exposes_typed_status_and_partial_fields(app: FastAPI) -> None:
+    schema = app.openapi()["components"]["schemas"]["OutputSummary"]
+    status_schema = schema["properties"]["status"]
+    assert status_schema["enum"] == [
+        "running",
+        "success",
+        "error",
+        "cancelled",
+        "unknown",
+    ]
+    assert schema["properties"]["has_partial_output"]["type"] == "boolean"
+    assert schema["properties"]["needs_review"]["type"] == "boolean"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_running_card_carries_mission_id(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """The card must expose the full mission id so the UI can POST
+    ``/api/missions/{id}/cancel`` for the hold-to-abort button."""
+    mission_id = "019e3600-f000-7000-8000-000000000042"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="RUNNING")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions[0]["mission_id"] == mission_id
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_unenriched_card_has_null_mission_id(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A mission dir without a DB row still renders — with mission_id None
+    (the UI then simply offers no abort affordance)."""
+    _make_mission_dir(tmp_path, "019e3600-f200-7000-8000-000000000044")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["mission_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_cancelled_maps_to_cancelled_status(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """CANCELLED is a deliberate user action, not a failure — the card
+    gets its own badge instead of lying with ``error``."""
+    mission_id = "019e3600-f100-7000-8000-000000000043"
+    _make_mission_dir(tmp_path, mission_id)
+    await _insert_mission(db_conn, mission_id=mission_id, state="CANCELLED")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions[0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_cancelled_with_live_child_exposes_continuation(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A CANCELLED card whose re-run child is still running must say so.
+
+    Forensic 2026-06-28 (missions 019f0fa6 → 019f0fac): the user clicked
+    "Continue" on a cancelled mission; that spawned a linked child which ran
+    on (CRITIQUING), but the cancelled card kept showing a "Continue" button
+    with no hint that its work was already live — two visually identical
+    cards, one cancelled + continuable, one running. The list now resolves the
+    live continuation (parent_mission_id in the child's MissionDispatched
+    event) and exposes it so the UI can replace "Continue" with a "running"
+    indicator pointing at the child.
+    """
+    parent = "019f0fa6-4ff6-7bd9-87fd-a32e201b32c9"
+    child = "019f0fac-26a3-7c59-bfa3-385fb1e426fc"
+    _make_mission_dir(tmp_path, parent)
+    _make_mission_dir(tmp_path, child)
+    await _insert_mission(db_conn, mission_id=parent, state="CANCELLED")
+    await _insert_mission(db_conn, mission_id=child, state="CRITIQUING")
+    await _insert_dispatch_event(db_conn, child_id=child, parent_id=parent)
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = {s["slug"]: s for s in r.json()["sessions"]}
+
+    psum = sessions[f"mission_{parent[:13]}"]
+    assert psum["status"] == "cancelled"
+    assert psum["active_child_id"] == child, (
+        "cancelled card must expose its live re-run child so the UI can stop "
+        f"lying with a 'Continue' button, got {psum.get('active_child_id')!r}"
+    )
+    assert psum["active_child_slug"] == f"mission_{child[:13]}"
+
+    # The live child itself is just RUNNING — it has no continuation of its own.
+    csum = sessions[f"mission_{child[:13]}"]
+    assert csum["status"] == "running"
+    assert csum["active_child_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_cancelled_with_terminal_child_keeps_continue(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A re-run child that has itself finished must NOT suppress Continue.
+
+    The guard is a *liveness* signal, not a permanent lock: once the child
+    reaches a terminal state the parent is freely re-runnable again, so the
+    list must report no active continuation (active_child_id stays None) and
+    the UI shows "Continue" once more.
+    """
+    parent = "019f0fb0-1111-7000-8000-000000000001"
+    child = "019f0fb1-2222-7000-8000-000000000002"
+    _make_mission_dir(tmp_path, parent)
+    _make_mission_dir(tmp_path, child)
+    await _insert_mission(db_conn, mission_id=parent, state="CANCELLED")
+    await _insert_mission(db_conn, mission_id=child, state="FAILED")
+    await _insert_dispatch_event(db_conn, child_id=child, parent_id=parent)
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = {s["slug"]: s for s in r.json()["sessions"]}
+    assert sessions[f"mission_{parent[:13]}"]["active_child_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_running_mission_duration_ticks_from_created(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """A RUNNING mission shows now-minus-created, not updated-minus-created.
+
+    Live bug (mission 019eae15-5a31, 2026-06-09): right after dispatch
+    created_ms == updated_ms, so the card rendered "RUNNING 0.0s" and
+    froze there until the next mission event (potentially 20 minutes
+    later). For non-terminal states the duration must be wall-clock
+    elapsed since created_ms — the frontend polls every 3 s, so the
+    badge ticks automatically.
+    """
+    mission_id = "019e3600-d000-7000-8000-000000000004"
+    _make_mission_dir(tmp_path, mission_id)
+    now_ms = int(time.time() * 1000)
+    await _insert_mission(
+        db_conn,
+        mission_id=mission_id,
+        state="RUNNING",
+        created_ms=now_ms - 120_000,
+        updated_ms=now_ms - 120_000,  # fresh dispatch: no events yet
+    )
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sess = r.json()["sessions"][0]
+    assert sess["duration_s"] is not None
+    assert sess["duration_s"] >= 110.0, (
+        f"running mission must tick from created_ms, got {sess['duration_s']}"
+    )
+    # A still-running mission has no completion timestamp.
+    assert sess["completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_terminal_mission_duration_frozen(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """Terminal missions keep updated-minus-created (frozen, not ticking)."""
+    mission_id = "019e3600-e000-7000-8000-000000000005"
+    _make_mission_dir(tmp_path, mission_id)
+    now_ms = int(time.time() * 1000)
+    await _insert_mission(
+        db_conn,
+        mission_id=mission_id,
+        state="FAILED",
+        created_ms=now_ms - 300_000,
+        updated_ms=now_ms - 200_000,
+    )
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sess = r.json()["sessions"][0]
+    assert sess["duration_s"] == pytest.approx(100.0, abs=5.0)
+    assert sess["completed_at"] == pytest.approx((now_ms - 200_000) / 1000.0, abs=5.0)
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_mission_dir_no_db_row_falls_back_to_unknown(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """When the dir exists but no DB row matches the prefix, status is unknown."""
+    mission_id = "019e9999-d000-7000-8000-000000000004"
+    _make_mission_dir(tmp_path, mission_id)
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_hides_worktree_slug_dirs(app: FastAPI, tmp_path: Path) -> None:
+    """Worktree slug dirs (``<ts>__<utterance>__<short>``) are temporary scaffolding
+    created and torn down by ``WorktreeManager``. They have no mission-id mapping
+    so their status would always render as ``unknown`` — together with the
+    canonical ``mission_<short>`` dir for the same task this produced TWO cards
+    per single mission (live regression 2026-05-26: user perceived "two
+    sub-agents for one task"). The Outputs list now hides them so each mission
+    is represented by exactly one card. Power users can still address the
+    worktree dir directly via ``/api/outputs/{slug}/artifacts``.
+    """
+    _make_worktree_dir(tmp_path, utterance="test-fix", short="cafebabe")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions == [], (
+        f"worktree slug dir must not appear in the Outputs list, got {sessions!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_shows_a_marked_standalone_run(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """A slug dir that marked itself standalone is listed — with its label.
+
+    The rule above hides slug dirs because each one duplicates a canonical
+    ``mission_<short>`` sibling. A standalone run (an on-demand visualisation)
+    has no sibling, so hiding it does not de-duplicate anything: it makes a
+    finished, complete run invisible. The marker is the explicit opt-out —
+    see jarvis/missions/standalone_run.py.
+    """
+    run_dir = _make_worktree_dir(tmp_path, utterance="drawn-on-request", short="feedface")
+    write_standalone_marker(
+        run_dir,
+        kind="visualization",
+        utterance="visualisier mir den ablauf",  # i18n-allow: DE test vocabulary
+        title="How a turn is answered",
+    )
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+
+    assert [s["slug"] for s in sessions] == [run_dir.name]
+    # The label is what the user asked, not the directory's slugified echo.
+    assert sessions[0]["utterance"] == "visualisier mir den ablauf"
+    # Nothing about it can still change, so "unknown" would be a false question.
+    assert sessions[0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_still_hides_an_unmarked_neighbour(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """The marker is an opt-in for one directory, not a loosening for all.
+
+    Pinned next to the standalone case because a regression here restores the
+    2026-05-26 "two agents for one task" cards.
+    """
+    marked = _make_worktree_dir(tmp_path, utterance="drawn", short="feedface")
+    write_standalone_marker(marked, kind="visualization", title="Drawn")
+    _make_worktree_dir(tmp_path, utterance="worker-scaffolding", short="cafebabe")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+
+    assert [s["slug"] for s in r.json()["sessions"]] == [marked.name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["chat_media", "chat_image"])
+async def test_list_outputs_leaves_out_chat_attachments(
+    app: FastAPI, tmp_path: Path, kind: str
+) -> None:
+    """A chat's parked media is no artifact.
+
+    Every picture or clip shown in a chat is archived as its own directory so
+    the transcript can serve it; listing those flooded the Artifacts section
+    with untitled "Chat media" rows (2026-09-29). The files stay reachable.
+    """
+    artifact = _make_worktree_dir(tmp_path, utterance="drawn", short="feedface")
+    write_standalone_marker(artifact, kind="visualization", title="Drawn")
+    attachment = tmp_path / "chat-media-0123456789abcdef01234567"
+    files = attachment / "tasks" / "chat" / "artifacts" / "files"
+    files.mkdir(parents=True)
+    (files / "media.png").write_bytes(b"\x89PNG")
+    write_standalone_marker(attachment, kind=kind, title="Chat media")
+
+    with TestClient(app) as client:
+        listed = client.get("/api/outputs")
+        served = client.get(
+            f"/api/outputs/{attachment.name}/files/tasks/chat/artifacts/files/media.png/download"
+        )
+
+    assert [s["slug"] for s in listed.json()["sessions"]] == [artifact.name]
+    assert served.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_tolerates_a_corrupt_marker(app: FastAPI, tmp_path: Path) -> None:
+    """A half-written marker degrades that ONE entry, never the whole listing."""
+    run_dir = _make_worktree_dir(tmp_path, utterance="broken", short="feedface")
+    (run_dir / STANDALONE_MARKER_NAME).write_text("{not json", encoding="utf-8")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+
+    assert r.status_code == 200
+    assert r.json()["sessions"] == []  # falls back to the ordinary hidden case
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_worktree_dir_random_short_does_not_collide(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """Worktree short must not accidentally LIKE-match a real mission_id.
+
+    Regression guard: if we ever revert to "use the dir's parsed short as
+    a LIKE-prefix", a worktree dir whose random hex[:8] happens to be a
+    UUID prefix could resolve to the wrong mission. After the 2026-05-26
+    dedup change worktree-only dirs are hidden from the list — but the
+    regression guard is preserved: even if a worktree slug's random short
+    collides with a real mission's prefix, the worktree must NOT inherit
+    that mission's row. Concretely the list stays empty (the worktree dir
+    is hidden) instead of falsely-resolved.
+    """
+    mission_id = "deadbeef-0000-7000-8000-000000000005"
+    _make_worktree_dir(tmp_path, short="deadbeef")
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert sessions == [], (
+        "worktree slug must remain hidden even when its random short collides "
+        f"with a real mission_id prefix, got {sessions!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_multiple_mission_dirs(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """Each mission_<short>/ dir resolves independently to its own DB row."""
+    mid_a = "019e3600-aaaa-7000-8000-000000000010"
+    mid_b = "019e3600-bbbb-7000-8000-000000000011"
+    _make_mission_dir(tmp_path, mid_a)
+    _make_mission_dir(tmp_path, mid_b)
+    await _insert_mission(db_conn, mission_id=mid_a, state="APPROVED", prompt="task A")
+    await _insert_mission(db_conn, mission_id=mid_b, state="FAILED", prompt="task B")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = {s["slug"]: s for s in r.json()["sessions"]}
+    assert sessions[f"mission_{mid_a[:13]}"]["status"] == "success"
+    assert sessions[f"mission_{mid_a[:13]}"]["utterance"] == "task A"
+    assert sessions[f"mission_{mid_b[:13]}"]["status"] == "error"
+    assert sessions[f"mission_{mid_b[:13]}"]["utterance"] == "task B"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_mission_dir_ignores_task_subdir_names(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    """H1 root cause: the lookup must NOT use tasks/<task_id>/ subdirs.
+
+    Pre-fix, the route walked ``mission_<short>/tasks/<task_id>/`` and
+    used the task_id (a FRESH UUIDv7, disjoint from mission_id) as the
+    DB-prefix. If the fix regressed, this test would either render the
+    status as unknown (good — no false match) OR render the status of a
+    *different* mission whose UUID happens to share the task_id prefix.
+    By inserting a row whose ``id`` matches the task_id prefix but NOT
+    the mission-dir prefix, we prove the lookup uses the dir-name only.
+    """
+    mission_id = "019e3600-d000-7000-8000-000000000020"
+    mission_dir = _make_mission_dir(tmp_path, mission_id)
+    # Mimic the Kontrollierer task tree: ``tasks/<task_id[:13]>/``. The
+    # task_id is intentionally a completely different UUID prefix.
+    task_id_prefix = "feedface-cafe"
+    (mission_dir / "tasks" / task_id_prefix).mkdir(parents=True)
+    # Insert a row keyed off the *task_id* prefix to bait the old lookup.
+    bait_full_id = f"{task_id_prefix}-7000-8000-000000000099"
+    await _insert_mission(
+        db_conn,
+        mission_id=bait_full_id,
+        state="FAILED",
+        prompt="WRONG ROW — should not appear",
+    )
+    # And the correct mission row.
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED", prompt="correct row")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    sess = sessions[0]
+    assert sess["status"] == "success", (
+        "H1 regression: lookup picked up the task_id-prefixed row "
+        "(state=FAILED) instead of the mission-dir's own mission_id row"
+    )
+    assert sess["utterance"] == "correct row"
+
+
+@pytest.mark.asyncio
+async def test_list_outputs_without_mission_manager_stays_functional(
+    tmp_path: Path,
+) -> None:
+    """When Phase-6 is not booted (no mission_manager), the view still works."""
+    app = FastAPI()
+    app.include_router(outputs_router)
+    app.state.outputs_root = tmp_path
+    # NB: no mission_manager set
+    _make_mission_dir(tmp_path, "019e3600-aaaa-7000-8000-000000000030")
+
+    with TestClient(app) as client:
+        r = client.get("/api/outputs")
+    assert r.status_code == 200
+    sessions = r.json()["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["status"] == "unknown"
+
+
+# --- Plan endpoint stub (UI-MED: Plan-UI-Stub) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_output_plan_returns_empty_stub(app: FastAPI, tmp_path: Path) -> None:
+    """The Plan tab is intentionally a placeholder (Welle-4 not plumbed).
+
+    Confirmed as out-of-scope per the B1 brief: returns ``{plan: null,
+    steps: []}`` rather than 404. The UI renders "Single-shot run — no
+    structured plan" for this shape.
+    """
+    _make_mission_dir(tmp_path, "019e3600-eeee-7000-8000-000000000040")
+    with TestClient(app) as client:
+        r = client.get("/api/outputs/mission_019e3600-eeee/plan")
+    assert r.status_code == 200
+    assert r.json() == {"plan": None, "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_get_output_plan_404_for_unknown_slug(app: FastAPI) -> None:
+    with TestClient(app) as client:
+        r = client.get("/api/outputs/nonexistent-slug/plan")
+    assert r.status_code == 404
+
+
+# --- /artifacts deliverable-only filter (live report 2026-05-30) -------------
+# A trivial "make an HTML file" mission rendered 10+ ``claude_config/*`` rows
+# (sessions, policy-limits, settings, projects/*.jsonl, .claude.json, backups)
+# plus the forensic ``diff.patch`` in the Outputs "Results" list — burying the
+# one file the user actually wanted (HelloBot.html). The list endpoint now
+# surfaces ONLY genuine deliverables under ``tasks/<id>/artifacts/files/`` —
+# the exact subtree ``deliver_to_user_folder`` mirrors to the user's Downloads.
+
+
+def test_is_deliverable_relpath() -> None:
+    """The allowlist predicate: only ``tasks/<id>/artifacts/files/<rel>`` wins."""
+    assert _is_deliverable_relpath(("tasks", "019e0000", "artifacts", "files", "out.html"))
+    assert _is_deliverable_relpath(("tasks", "019e0000", "artifacts", "files", "sub", "deep.css"))
+    # Forensic + scaffolding paths are all rejected.
+    assert not _is_deliverable_relpath(("tasks", "019e0000", "artifacts", "diff.patch"))
+    assert not _is_deliverable_relpath(("claude_config", "settings.json"))
+    assert not _is_deliverable_relpath(("claude_config", "sessions", "45552.json"))
+    assert not _is_deliverable_relpath((".codex", "auth.json"))
+    assert not _is_deliverable_relpath(("openclaw_state", "openclaw.json"))
+    assert not _is_deliverable_relpath(("reflections.md",))
+    assert not _is_deliverable_relpath(("tasks", "019e0000", "logs", "x.jsonl"))
+
+
+def test_is_deliverable_relpath_excludes_browser_scratch() -> None:
+    """Defence-in-depth (2026-06-21, mission_019eeb34-bb67): a browser/QA
+    worker's gitignored Chrome user-data profiles re-imported by the archive's
+    --ignored union must NOT show in Outputs even though they live under the
+    allowlisted ``tasks/<id>/artifacts/files/`` subtree. The real deliverable
+    inside the same qa-artifacts/ dir must still pass."""
+    base = ("tasks", "019eeb34-bc50", "artifacts", "files")
+    # Browser scratch — rejected.
+    assert not _is_deliverable_relpath(
+        (*base, "qa-artifacts", "chrome-profile-dd6355b8", "GrShaderCache", "data_2")
+    )
+    assert not _is_deliverable_relpath(
+        (*base, "qa-artifacts", "chrome-profile-dd6355b8", "Last Browser")
+    )
+    assert not _is_deliverable_relpath(
+        (
+            *base,
+            "qa-artifacts",
+            "chrome-profile-dd6355b8",
+            "Default",
+            "Shared Dictionary",
+            "db-journal",
+        )
+    )
+    # Genuine deliverables — including one INSIDE qa-artifacts/ next to junk.
+    assert _is_deliverable_relpath((*base, "index.html"))
+    assert _is_deliverable_relpath((*base, "qa-artifacts", "melbourne-plan-render.png"))
+
+
+def test_is_deliverable_relpath_excludes_uv_cache_scratch() -> None:
+    """A sandbox-local uv cache is process state, never a mission result."""
+    base = ("tasks", "019fa4bc-9110", "artifacts", "files")
+    assert not _is_deliverable_relpath(
+        (*base, ".uv-cache-audit", "wheels-v6", "pypi", "fastapi.lock")
+    )
+    assert not _is_deliverable_relpath(
+        (*base, ".uv-cache-wiki", "builds-v0", ".tmp123", "pyvenv.cfg")
+    )
+    assert _is_deliverable_relpath((*base, "reports", "uv-cache-analysis.md"))
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_hides_uv_cache_from_existing_missions(
+    app: FastAPI, tmp_path: Path
+) -> None:
+    """Read-side filtering repairs missions archived before the source fix."""
+    d = _make_mission_dir(tmp_path, "019fa4bc8d2b")
+    files = d / "tasks" / "019fa4bc-9110" / "artifacts" / "files"
+    _seed(files / ".uv-cache-audit" / "wheels-v6" / "fastapi.lock", "")
+    _seed(files / ".uv-cache-audit" / "builds-v0" / "pyvenv.cfg", "cache")
+    _seed(files / "wiki-audit.md", "# Findings")
+
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/artifacts")
+
+    assert r.status_code == 200
+    assert [item["path"] for item in r.json()["files"]] == [
+        "tasks/019fa4bc-9110/artifacts/files/wiki-audit.md"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_lists_only_deliverables(app: FastAPI, tmp_path: Path) -> None:
+    """Only genuine deliverables are listed; the forensic ``diff.patch`` one
+    level up in ``artifacts/`` is excluded (contract change 2026-05-30)."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    _seed(d / "tasks" / "019e0000" / "artifacts" / "files" / "out.txt", "hello")
+    _seed(d / "tasks" / "019e0000" / "artifacts" / "diff.patch", "diff --git")
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/artifacts")
+    assert r.status_code == 200
+    paths = {f["path"] for f in r.json()["files"]}
+    assert "tasks/019e0000/artifacts/files/out.txt" in paths
+    assert "tasks/019e0000/artifacts/diff.patch" not in paths
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_skips_claude_config_scaffolding(app: FastAPI, tmp_path: Path) -> None:
+    """The isolated ``CLAUDE_CONFIG_DIR`` (``run_dir/claude_config/``) seeded by
+    ``build_worker_env`` must never leak into the Outputs view."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    cfg = d / "claude_config"
+    _seed(cfg / "sessions" / "45552.json", "{}")
+    _seed(cfg / "projects" / "x" / "a.jsonl", "{}\n")
+    _seed(cfg / "backups" / ".claude.json.backup.123", "{}")
+    _seed(cfg / "settings.json", "{}")
+    _seed(cfg / "policy-limits.json", "{}")
+    _seed(cfg / ".claude.json", "{}")
+    _seed(cfg / ".last-cleanup", "x")
+    _seed(
+        d / "tasks" / "019e0000" / "artifacts" / "files" / "HelloBot.html",
+        "<html></html>",
+    )
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/artifacts")
+    assert r.status_code == 200
+    paths = {f["path"] for f in r.json()["files"]}
+    assert paths == {"tasks/019e0000/artifacts/files/HelloBot.html"}, (
+        "only the genuine deliverable may show; all claude_config rows must be "
+        f"filtered. Got: {sorted(paths)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_skips_codex_and_forensics(app: FastAPI, tmp_path: Path) -> None:
+    """``.codex/`` (CODEX_HOME), worker ``logs/`` and ``reflections.md`` are
+    internal scaffolding — only the deliverable survives the listing filter."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    _seed(d / ".codex" / "cache" / "auth.json", "{}")
+    _seed(d / "tasks" / "019e0000" / "logs" / "stream.jsonl", "{}\n")
+    _seed(d / "reflections.md", "notes")
+    _seed(
+        d / "tasks" / "019e0000" / "artifacts" / "files" / "site.html",
+        "<html></html>",
+    )
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/artifacts")
+    assert r.status_code == 200
+    paths = {f["path"] for f in r.json()["files"]}
+    assert paths == {"tasks/019e0000/artifacts/files/site.html"}, sorted(paths)
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_lists_nested_deliverables(app: FastAPI, tmp_path: Path) -> None:
+    """Deliverables in nested sub-dirs under ``artifacts/files/`` are kept."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    _seed(
+        d / "tasks" / "019e0000" / "artifacts" / "files" / "assets" / "logo.svg",
+        "<svg/>",
+    )
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/artifacts")
+    assert r.status_code == 200
+    paths = {f["path"] for f in r.json()["files"]}
+    assert "tasks/019e0000/artifacts/files/assets/logo.svg" in paths
+
+
+@pytest.mark.asyncio
+async def test_raw_serves_deliverable(app: FastAPI, tmp_path: Path) -> None:
+    """The raw-file endpoint returns the contents of a genuine deliverable."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    _seed(d / "tasks" / "019e0000" / "artifacts" / "files" / "out.txt", "payload")
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/files/tasks/019e0000/artifacts/files/out.txt/raw")
+    assert r.status_code == 200
+    assert r.json()["text"] == "payload"
+
+
+@pytest.mark.asyncio
+async def test_raw_404s_for_scaffolding(app: FastAPI, tmp_path: Path) -> None:
+    """Defense-in-depth: a direct raw-fetch of an internal claude_config file
+    must 404 even though the file exists on disk — the same allowlist guards
+    the raw endpoint, so scaffolding can be neither listed nor fetched."""
+    d = _make_mission_dir(tmp_path, "019e3288abcd")
+    _seed(d / "claude_config" / ".claude.json", '{"secret":"x"}')
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/files/claude_config/.claude.json/raw")
+    assert r.status_code == 404
+
+
+# --- /download route (Task 3) -------------------------------------------------
+
+
+def _make_deliverable(root: Path, mission_id: str, name: str, content: str) -> str:
+    """Create tasks/<tid>/artifacts/files/<name> under mission_<id>; return rel path."""
+    files_dir = (
+        root / f"mission_{mission_id[:13]}" / "tasks" / "019edeadbeef" / "artifacts" / "files"
+    )
+    files_dir.mkdir(parents=True, exist_ok=True)
+    (files_dir / name).write_text(content, encoding="utf-8")
+    return f"tasks/019edeadbeef/artifacts/files/{name}"
+
+
+def test_download_sets_attachment_disposition(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/download")
+    assert r.status_code == 200
+    cd = r.headers["content-disposition"]
+    assert cd.startswith("attachment")
+    assert "report.md" in cd
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.text == "# Hi"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("page.html", "<p>x</p>"),
+        ("image.svg", "<svg><script>bad()</script></svg>"),
+    ],
+)
+def test_download_inline_active_document_has_csp(app, filename, content):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", filename, content)
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/download?disposition=inline")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"].startswith("inline")
+    assert "default-src 'none'" in r.headers["content-security-policy"]
+
+
+def test_download_blocks_non_deliverable(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    d = root / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "reflections.md").write_text("secret", encoding="utf-8")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/reflections.md/download")
+    assert r.status_code == 404
+
+
+def test_download_blocks_path_traversal(app):
+    slug = "mission_019ed2dfd0fab"
+    (Path(app.state.outputs_root) / slug).mkdir(parents=True, exist_ok=True)
+    client = TestClient(app)
+    r = client.get(
+        f"/api/outputs/{slug}/files/tasks/x/artifacts/files/..%2f..%2f..%2fsecret/download"
+    )
+    assert r.status_code == 404
+
+
+def test_view_renders_markdown_with_csp(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Heading\n\nbody")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/view")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "<h1>Heading</h1>" in r.text
+    assert "default-src 'none'" in r.headers["content-security-policy"]
+
+
+def test_view_escapes_plain_text(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "x.txt", "<script>bad</script>")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/view")
+    assert r.status_code == 200
+    assert "&lt;script&gt;" in r.text
+    assert "<script>bad</script>" not in r.text
+
+
+def test_capabilities_reports_flag_true(app):
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    r = client.get("/api/outputs/capabilities")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["native_file_actions"] is True
+    assert data["platform"] in ("win32", "darwin", "linux")
+
+
+def test_capabilities_defaults_false_when_unset(app):
+    # The fixture app never sets the flag — must default to False (VPS-safe).
+    client = TestClient(app)
+    r = client.get("/api/outputs/capabilities")
+    assert r.status_code == 200
+    assert r.json()["native_file_actions"] is False
+
+
+# --- /open (session folder in file manager) — cross-platform (Fix 2) --------
+# Previously Windows-only (explorer.exe Popen); non-Windows silently returned
+# opened=false even though open_path.reveal_in_folder already implements
+# Windows/macOS/Linux. The route now delegates to reveal_in_folder everywhere.
+
+
+def test_open_session_folder_calls_reveal_in_folder(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    target = root / slug
+    target.mkdir(parents=True, exist_ok=True)
+    client = TestClient(app)
+    with patch("jarvis.platform.open_path.reveal_in_folder", return_value=True) as rev:
+        r = client.post(f"/api/outputs/{slug}/open")
+    assert r.status_code == 200
+    assert r.json() == {"opened": True, "path": str(target.resolve())}
+    rev.assert_called_once()
+
+
+def test_open_session_folder_reports_failure_honestly(app):
+    """A failed launcher (e.g. no display, broken opener) is reported as
+    opened=false rather than raising — mirrors the other native-action routes."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    (root / slug).mkdir(parents=True, exist_ok=True)
+    client = TestClient(app)
+    with patch("jarvis.platform.open_path.reveal_in_folder", return_value=False):
+        r = client.post(f"/api/outputs/{slug}/open")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["opened"] is False
+    assert body["reason"] == "open failed"
+
+
+def test_open_session_folder_404_for_unknown_slug(app):
+    client = TestClient(app)
+    r = client.post("/api/outputs/does-not-exist/open")
+    assert r.status_code == 404
+
+
+# --- /reveal and /open-native routes (Task 6) --------------------------------
+
+
+def test_reveal_404_when_native_disabled(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = False
+    client = TestClient(app)
+    r = client.post(f"/api/outputs/{slug}/files/{rel}/reveal")
+    assert r.status_code == 404
+
+
+def test_reveal_calls_platform_when_enabled(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    with patch("jarvis.platform.open_path.reveal_in_folder", return_value=True) as rev:
+        r = client.post(f"/api/outputs/{slug}/files/{rel}/reveal")
+    assert r.status_code == 200
+    assert r.json()["opened"] is True
+    rev.assert_called_once()
+
+
+def test_open_native_calls_platform_when_enabled(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    with patch("jarvis.platform.open_path.open_file", return_value=True) as opn:
+        r = client.post(f"/api/outputs/{slug}/files/{rel}/open-native")
+    assert r.status_code == 200
+    assert r.json()["opened"] is True
+    opn.assert_called_once()
+
+
+def test_download_inline_html_has_csp(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "page.html", "<script>bad</script>")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/download?disposition=inline")
+    assert r.status_code == 200
+    assert "default-src 'none'" in r.headers.get("content-security-policy", "")
+
+
+def test_artifact_page_allows_inline_scripts_but_no_network(app):
+    """The Artifacts section frames HTML through ``/page``: the page's own JS
+    runs (the iframe is sandboxed to an opaque origin on the client side), while
+    every way out — network, forms, frames, navigation — stays shut."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(
+        root, "019ed2dfd0fab1234", "dash.html", "<script>document.title='ok'</script>"
+    )
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/page")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    csp = r.headers.get("content-security-policy", "")
+    assert "script-src 'unsafe-inline'" in csp
+    assert "connect-src 'none'" in csp
+    assert "default-src 'none'" in csp
+    assert r.headers.get("cache-control") == "no-store"
+    assert "document.title" in r.text
+
+
+def test_artifact_page_is_sandboxed_even_when_opened_top_level(app):
+    """"Open in browser" loads ``/page`` as a top-level tab, where the app's
+    iframe sandbox does not exist. The header CSP must carry the sandbox itself
+    (scripts only, no same-origin, no popups), or the page runs as the app
+    origin and one ``window.open('/')`` reaches every API route."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(
+        root, "019ed2dfd0fab1234", "escape.html", "<script>window.open('/')</script>"
+    )
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/page")
+    assert r.status_code == 200
+    directives = [d.strip() for d in r.headers["content-security-policy"].split(";")]
+    sandbox = [d for d in directives if d.split(" ")[0] == "sandbox"]
+    assert sandbox == ["sandbox allow-scripts"]
+
+
+@pytest.mark.parametrize(
+    "route",
+    ["view", "download?disposition=inline"],
+)
+def test_worker_html_rendered_inline_is_sandboxed(app, route):
+    """Every inline rendering of a worker file gets an opaque origin, not just
+    a script ban: a top-level tab must never act as the app origin."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    name = "notes.md" if route == "view" else "page.html"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", name, "<b>x</b>")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/{route}")
+    assert r.status_code == 200
+    directives = [d.strip() for d in r.headers["content-security-policy"].split(";")]
+    assert "sandbox" in directives
+
+
+def test_artifact_page_answers_head_probe(app):
+    """The frontend probes ``/page`` with HEAD before framing it. A 405 here
+    made the probe fail on every backend, so the sandboxed page never got its
+    scripts. HEAD must answer like GET — same status and headers, no body."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "probe.html", "<b>probe</b>")
+    client = TestClient(app)
+    r = client.head(f"/api/outputs/{slug}/files/{rel}/page")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "script-src 'unsafe-inline'" in r.headers.get("content-security-policy", "")
+    assert r.content == b""
+
+
+def test_artifact_page_refuses_non_html(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "notes.md", "# not a page")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/page")
+    assert r.status_code == 415
+
+
+def test_download_attachment_html_no_csp_needed(app):
+    # Attachment (download to disk) is not rendered, so no CSP is required.
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "page2.html", "<b>x</b>")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/download")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"].startswith("attachment")
+
+
+def test_view_rejects_oversize_file(app, monkeypatch):
+    import jarvis.ui.web.outputs_routes as oroutes
+
+    monkeypatch.setattr(oroutes, "_VIEW_MAX_BYTES", 4)
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "big.md", "# way too long")
+    client = TestClient(app)
+    r = client.get(f"/api/outputs/{slug}/files/{rel}/view")
+    assert r.status_code == 413
+
+
+# --- "open with" chooser: detection + open-with + preferred-opener -----------
+# Replaces the silent-no-op os.startfile/ShellExecute path: the file is opened
+# in a resolved editor/app via a real subprocess so a window actually appears.
+
+from types import SimpleNamespace  # noqa: E402
+
+from jarvis.plugins.tool.app_resolver import LaunchTarget  # noqa: E402
+
+
+def _fake_resolver_only(*installed: str):
+    """Return a resolve_app_launch_target stub where only *installed* keys map
+    to a real executable; everything else returns the raw-name startfile
+    fallback (= 'not installed')."""
+
+    def _resolve(name: str) -> LaunchTarget:
+        if name in installed:
+            return LaunchTarget("executable", rf"C:\apps\{name}.exe")
+        return LaunchTarget("startfile", name)
+
+    return _resolve
+
+
+def test_openers_native_disabled_returns_empty(app):
+    app.state.native_file_actions = False
+    client = TestClient(app)
+    r = client.get("/api/outputs/openers")
+    assert r.status_code == 200
+    assert r.json()["openers"] == []
+
+
+def test_openers_always_includes_default(app):
+    app.state.native_file_actions = True
+    with (
+        patch(
+            "jarvis.plugins.tool.app_resolver.resolve_app_launch_target",
+            side_effect=_fake_resolver_only(),
+        ),
+        patch("jarvis.ui.web.outputs_routes._resolve_browser_target", return_value=None),
+    ):
+        client = TestClient(app)
+        r = client.get("/api/outputs/openers")
+    ids = {o["id"] for o in r.json()["openers"]}
+    assert "default" in ids
+
+
+def test_openers_detects_installed_editor_only(app):
+    app.state.native_file_actions = True
+    with (
+        patch(
+            "jarvis.plugins.tool.app_resolver.resolve_app_launch_target",
+            side_effect=_fake_resolver_only("code"),
+        ),
+        patch("jarvis.ui.web.outputs_routes._resolve_browser_target", return_value=None),
+    ):
+        client = TestClient(app)
+        r = client.get("/api/outputs/openers")
+    ids = {o["id"] for o in r.json()["openers"]}
+    assert "code" in ids
+    assert "cursor" not in ids  # raw fallback → not installed → hidden
+
+
+def test_openers_result_is_memoized(app):
+    """Resolving the editor candidates walks the Start Menu per not-installed
+    editor — too slow to redo on every open. The list is cached per process, so
+    a second request must serve the cache without re-resolving (the fix for the
+    'open' button taking too long and flashing 'no apps detected')."""
+    from unittest.mock import MagicMock
+
+    app.state.native_file_actions = True
+    resolver = MagicMock(side_effect=_fake_resolver_only("code"))
+    with (
+        patch("jarvis.plugins.tool.app_resolver.resolve_app_launch_target", resolver),
+        patch("jarvis.ui.web.outputs_routes._resolve_browser_target", return_value=None),
+    ):
+        client = TestClient(app)
+        first = client.get("/api/outputs/openers")
+        calls_after_first = resolver.call_count
+        second = client.get("/api/outputs/openers")
+
+    assert first.json() == second.json()
+    assert calls_after_first > 0  # first call did the real resolution
+    assert resolver.call_count == calls_after_first  # second came from the cache
+
+
+def test_open_with_404_when_native_disabled(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = False
+    client = TestClient(app)
+    r = client.post(f"/api/outputs/{slug}/files/{rel}/open-with", json={"opener": "default"})
+    assert r.status_code == 404
+
+
+def test_open_with_default_calls_open_file(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    with patch("jarvis.platform.open_path.open_file", return_value=True) as opn:
+        r = client.post(
+            f"/api/outputs/{slug}/files/{rel}/open-with",
+            json={"opener": "default"},
+        )
+    assert r.status_code == 200
+    assert r.json()["opened"] is True
+    opn.assert_called_once()
+
+
+def test_open_with_editor_calls_open_file_with(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    with (
+        patch(
+            "jarvis.plugins.tool.app_resolver.resolve_app_launch_target",
+            side_effect=_fake_resolver_only("code"),
+        ),
+        patch("jarvis.platform.open_path.open_file_with", return_value=True) as opn,
+    ):
+        r = client.post(
+            f"/api/outputs/{slug}/files/{rel}/open-with",
+            json={"opener": "code"},
+        )
+    assert r.status_code == 200
+    assert r.json()["opened"] is True
+    opn.assert_called_once()
+    # Called with (file_path, kind, value) — the resolved executable.
+    args = opn.call_args.args
+    assert args[1] == "executable"
+    assert args[2].endswith("code.exe")
+
+
+def test_open_with_rejects_unknown_opener(app):
+    """A free-form opener (path/arbitrary string) must be rejected — the server
+    only launches known opener ids, never a client-supplied executable path."""
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "report.md", "# Hi")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    r = client.post(
+        f"/api/outputs/{slug}/files/{rel}/open-with",
+        json={"opener": r"C:\Windows\System32\evil.exe"},
+    )
+    assert r.status_code == 400
+
+
+def test_open_with_blocks_non_deliverable(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    d = root / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "reflections.md").write_text("secret", encoding="utf-8")
+    app.state.native_file_actions = True
+    client = TestClient(app)
+    r = client.post(
+        f"/api/outputs/{slug}/files/reflections.md/open-with",
+        json={"opener": "default"},
+    )
+    assert r.status_code == 404
+
+
+def test_get_preferred_opener_reads_config(app):
+    app.state.config = SimpleNamespace(ui=SimpleNamespace(preferred_opener="code"))
+    client = TestClient(app)
+    r = client.get("/api/outputs/preferred-opener")
+    assert r.status_code == 200
+    assert r.json()["opener"] == "code"
+
+
+def test_get_preferred_opener_defaults_empty(app):
+    # No config on app.state → empty (chooser will prompt).
+    client = TestClient(app)
+    r = client.get("/api/outputs/preferred-opener")
+    assert r.status_code == 200
+    assert r.json()["opener"] == ""
+
+
+def test_put_preferred_opener_persists_and_updates(app):
+    app.state.config = SimpleNamespace(ui=SimpleNamespace(preferred_opener=""))
+    client = TestClient(app)
+    with patch("jarvis.core.config_writer.set_preferred_opener") as setter:
+        r = client.put("/api/outputs/preferred-opener", json={"opener": "code"})
+    assert r.status_code == 200
+    setter.assert_called_once_with("code")
+    assert app.state.config.ui.preferred_opener == "code"
+
+
+def test_put_preferred_opener_rejects_unknown(app):
+    client = TestClient(app)
+    r = client.put("/api/outputs/preferred-opener", json={"opener": "../../evil"})
+    assert r.status_code == 400
+
+
+# --- Mission graph page (`/{slug}/graph`) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_graph_page_renders_branded_node_graph(app, db_conn):
+    """The graph route serves a no-script, brand-themed page of the archive."""
+    mission_id = "019ed2df-d0fa-7cba-a111-222233334444"
+    root = Path(app.state.outputs_root)
+    d = _make_mission_dir(root, mission_id)
+    _seed(d / "tasks" / "019ed2df-d0fb" / "artifacts" / "files" / "guide.html", "<html>")
+    # Scaffolding must never appear on the map (same allowlist as the listing).
+    _seed(d / "claude_config" / "settings.json", "{}")
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED", prompt="build a guide")
+
+    with TestClient(app) as client:
+        r = client.get(f"/api/outputs/{d.name}/graph")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    # Same no-script CSP as the /view route — the page carries zero JS.
+    assert "default-src 'none'" in r.headers["content-security-policy"]
+    assert "<script" not in r.text.lower()
+    assert "#0A0A0A" in r.text and "#FFD60A" in r.text  # brand theme
+    assert "guide.html" in r.text
+    assert "settings.json" not in r.text
+    assert "build a guide" in r.text  # DB prompt fills the missing utterance
+    assert "Success" in r.text  # APPROVED → success pill
+
+
+def test_graph_page_unknown_slug_is_404(app):
+    with TestClient(app) as client:
+        assert client.get("/api/outputs/mission_nope123456/graph").status_code == 404
+
+
+def test_graph_page_traversal_slug_is_rejected(app):
+    with TestClient(app) as client:
+        r = client.get("/api/outputs/..%2F..%2Fetc/graph")
+    assert r.status_code in (400, 404)
+
+
+# --- DELETE routes (Artifacts right-click "Delete") ---------------------------
+
+
+def test_delete_artifact_keeps_run_with_other_deliverables(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    page = _make_deliverable(root, "019ed2dfd0fab1234", "page.html", "<p>x</p>")
+    _make_deliverable(root, "019ed2dfd0fab1234", "notes.md", "# notes")
+    client = TestClient(app)
+
+    r = client.delete(f"/api/outputs/{slug}/files/{page}")
+
+    assert r.status_code == 200
+    assert r.json()["deleted"] == "file"
+    assert not (root / slug / page).exists()
+    assert (root / slug / "tasks/019edeadbeef/artifacts/files/notes.md").is_file()
+
+
+def test_delete_last_artifact_removes_the_whole_run(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    page = _make_deliverable(root, "019ed2dfd0fab1234", "page.html", "<p>x</p>")
+    _seed(root / slug / "reflections.md", "scaffolding")
+    client = TestClient(app)
+
+    r = client.delete(f"/api/outputs/{slug}/files/{page}")
+
+    assert r.status_code == 200
+    assert r.json()["deleted"] == "run"
+    assert not (root / slug).exists()
+
+
+def test_delete_artifact_refuses_scaffolding_and_traversal(app):
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    _seed(root / slug / "reflections.md", "secret")
+    outside = _seed(root / "keep.txt", "keep")
+    client = TestClient(app)
+
+    assert client.delete(f"/api/outputs/{slug}/files/reflections.md").status_code == 404
+    assert (
+        client.delete(
+            f"/api/outputs/{slug}/files/tasks/x/artifacts/files/..%2f..%2f..%2f..%2fkeep.txt"
+        ).status_code
+        == 404
+    )
+    assert (root / slug / "reflections.md").is_file()
+    assert outside.is_file()
+
+
+def test_delete_run_removes_folder_from_every_root(app, tmp_path: Path):
+    canonical = tmp_path / "jarvis-agent-outputs"
+    legacy = tmp_path / "sub-agents-outputs"
+    mission_id = "019e3600-a84e-7000-8000-000000000097"
+    for root in (canonical, legacy):
+        _seed(_make_mission_dir(root, mission_id) / "tasks/t/artifacts/files/a.md", "a")
+    app.state.outputs_root = canonical
+    app.state.outputs_roots = (canonical, legacy)
+    slug = f"mission_{mission_id[:13]}"
+    client = TestClient(app)
+
+    r = client.delete(f"/api/outputs/{slug}")
+
+    assert r.status_code == 200
+    assert not (canonical / slug).exists()
+    assert not (legacy / slug).exists()
+
+
+def test_delete_run_removes_read_only_files(app):
+    import os
+    import stat
+
+    root = Path(app.state.outputs_root)
+    slug = "mission_019ed2dfd0fab"
+    rel = _make_deliverable(root, "019ed2dfd0fab1234", "locked.md", "x")
+    os.chmod(root / slug / rel, stat.S_IREAD)
+    client = TestClient(app)
+
+    r = client.delete(f"/api/outputs/{slug}")
+
+    assert r.status_code == 200
+    assert not (root / slug).exists()
+
+
+def test_delete_unknown_or_escaping_slug_is_refused(app):
+    root = Path(app.state.outputs_root)
+    client = TestClient(app)
+
+    assert client.delete("/api/outputs/mission_0000000000000").status_code == 404
+    assert client.delete("/api/outputs/..").status_code in (400, 404, 405)
+    assert root.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_a_running_mission(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-b000-7000-8000-000000000042"
+    session = _make_mission_dir(tmp_path, mission_id)
+    rel = "tasks/t/artifacts/files/page.html"
+    _seed(session / rel, "<p>x</p>")
+    await _insert_mission(db_conn, mission_id=mission_id, state="RUNNING")
+
+    with TestClient(app) as client:
+        run = client.delete(f"/api/outputs/{session.name}")
+        file = client.delete(f"/api/outputs/{session.name}/files/{rel}")
+
+    assert run.status_code == 409
+    assert file.status_code == 409
+    assert (session / rel).is_file()
+
+
+@pytest.mark.asyncio
+async def test_delete_allows_a_finished_mission(
+    app: FastAPI, tmp_path: Path, db_conn: aiosqlite.Connection
+) -> None:
+    mission_id = "019e3600-b000-7000-8000-000000000043"
+    session = _make_mission_dir(tmp_path, mission_id)
+    _seed(session / "tasks/t/artifacts/files/page.html", "<p>x</p>")
+    await _insert_mission(db_conn, mission_id=mission_id, state="APPROVED")
+
+    with TestClient(app) as client:
+        r = client.delete(f"/api/outputs/{session.name}")
+        listing = client.get("/api/outputs")
+
+    assert r.status_code == 200
+    assert not session.exists()
+    assert listing.json()["sessions"] == []

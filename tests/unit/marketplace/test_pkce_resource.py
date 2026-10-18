@@ -1,0 +1,385 @@
+"""PKCE-loopback authorize/token params for provider-specific extensions."""
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from jarvis.marketplace.auth.oauth_pkce_loopback import (
+    PkceLoopbackConfig,
+    PkceLoopbackHandler,
+    _PendingPkceFlow,
+)
+from jarvis.marketplace.token_store import Tokens
+
+TEST_CLIENT_SECRET = "unit-test-client-secret"  # noqa: S105
+OLD_REFRESH_TOKEN = "old-refresh"  # noqa: S105
+
+
+def _params(**overrides):
+    scopes = overrides.pop("scopes", ["default"])
+    cfg = PkceLoopbackConfig(
+        plugin_id="asana",
+        authorization_url="https://app.asana.com/-/oauth_authorize",
+        token_url="https://app.asana.com/-/oauth_token",  # noqa: S106
+        client_id="cid",
+        callback_port=0,
+        scopes=scopes,
+        **overrides,
+    )
+    h = PkceLoopbackHandler(cfg)
+    return h._authorize_params(
+        redirect_uri="http://127.0.0.1:5/cb", state="s", challenge="c"
+    )
+
+
+def test_resource_param_added_when_set():
+    assert _params(resource="https://mcp.asana.com/v2")["resource"] == (
+        "https://mcp.asana.com/v2"
+    )
+
+
+def test_no_resource_param_when_unset():
+    assert "resource" not in _params()
+
+
+def test_offline_access_adds_access_type_and_prompt():
+    p = _params(offline_access=True)
+    assert p["access_type"] == "offline"
+    assert p["prompt"] == "consent"
+
+
+def test_no_offline_params_by_default():
+    p = _params()
+    assert "access_type" not in p
+    assert "prompt" not in p
+
+
+def test_scope_separator_space_joins_google_scopes():
+    p = _params(
+        scopes=[
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
+        scope_separator="space",
+    )
+    assert p["scope"] == (
+        "https://www.googleapis.com/auth/gmail.readonly "
+        "https://www.googleapis.com/auth/gmail.send"
+    )
+
+
+def test_scope_separator_defaults_to_comma_for_existing_pkce_plugins():
+    p = _params(scopes=["chat:write", "users:read"])
+    assert p["scope"] == "chat:write,users:read"
+
+
+def test_core_pkce_params_always_present():
+    p = _params()
+    assert p["response_type"] == "code"
+    assert p["client_id"] == "cid"
+    assert p["code_challenge"] == "c"
+    assert p["code_challenge_method"] == "S256"
+
+
+def test_shopify_authorize_params_carry_resource_and_comma_scopes():
+    """Regression: Shopify publishes no DCR registration_endpoint, so the
+    plugin must go through PKCE loopback with the RFC 8707 resource
+    indicator and comma-joined read scopes — never back to DCR."""
+    manifest_path = (
+        Path(__file__).resolve().parents[3]
+        / "jarvis/marketplace/drafts/shopify/plugin.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    auth = manifest["extensions"]["io.github.personaljarvis"]["auth"]
+    handler = PkceLoopbackHandler(PkceLoopbackConfig(
+        plugin_id="shopify",
+        authorization_url=auth["authorization_url"],
+        token_url=auth["token_url"],
+        client_id="cid",
+        callback_port=auth["callback_port"],
+        scopes=auth["scopes"],
+        scope_separator=auth["scope_separator"],
+        resource=auth["resource"],
+    ))
+    params = handler._authorize_params(  # noqa: SLF001
+        redirect_uri="http://127.0.0.1:3130/oauth/callback",
+        state="s",
+        challenge="c",
+    )
+    assert params["resource"] == "https://setup.shopify.com/mcp"
+    assert params["scope"] == (
+        "read_products,read_orders,read_customers,read_discounts"
+    )
+    assert params["code_challenge_method"] == "S256"
+    assert params["redirect_uri"] == "http://127.0.0.1:3130/oauth/callback"
+
+
+@pytest.mark.asyncio
+async def test_exchange_includes_client_secret_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured["url"] = url
+        captured["data"] = kwargs["data"]
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600,
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    cfg = PkceLoopbackConfig(
+        plugin_id="google_drive",
+        authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="cid",
+        client_secret=TEST_CLIENT_SECRET,
+        callback_port=0,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    pending = _PendingPkceFlow(
+        config=cfg,
+        callback_server=None,
+        code_verifier="verifier",
+        redirect_uri="http://127.0.0.1:3120",
+    )
+
+    tokens = await PkceLoopbackHandler(cfg)._exchange(pending, code="code")  # noqa: SLF001
+
+    assert captured["url"] == "https://oauth2.googleapis.com/token"
+    assert captured["data"]["client_id"] == "cid"
+    assert captured["data"]["client_secret"] == TEST_CLIENT_SECRET
+    assert captured["data"]["code_verifier"] == "verifier"
+    assert tokens.refresh == "refresh"
+    assert tokens.extra["client_id"] == "cid"
+    assert tokens.extra["client_secret"] == TEST_CLIENT_SECRET
+
+
+@pytest.mark.asyncio
+async def test_refresh_legacy_token_uses_current_client_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured["url"] = url
+        captured["data"] = kwargs["data"]
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "expires_in": 3600,
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    cfg = PkceLoopbackConfig(
+        plugin_id="google_drive",
+        authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="cid",
+        client_secret=TEST_CLIENT_SECRET,
+        callback_port=0,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+
+    tokens = await PkceLoopbackHandler(cfg).refresh(
+        Tokens(access="old-access", refresh=OLD_REFRESH_TOKEN)
+    )
+
+    assert captured["url"] == "https://oauth2.googleapis.com/token"
+    assert captured["data"]["client_id"] == "cid"
+    assert captured["data"]["client_secret"] == TEST_CLIENT_SECRET
+    assert captured["data"]["refresh_token"] == OLD_REFRESH_TOKEN
+    assert tokens.refresh == OLD_REFRESH_TOKEN
+    assert tokens.extra["client_id"] == "cid"
+    assert tokens.extra["client_secret"] == TEST_CLIENT_SECRET
+
+
+@pytest.mark.asyncio
+async def test_refresh_legacy_public_client_binds_client_id_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured["data"] = kwargs["data"]
+        return httpx.Response(
+            200,
+            json={"access_token": "new-access", "expires_in": 3600},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    cfg = PkceLoopbackConfig(
+        plugin_id="google_drive",
+        authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="public-client",
+        callback_port=0,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+
+    tokens = await PkceLoopbackHandler(cfg).refresh(
+        Tokens(
+            access="old-access",
+            refresh=OLD_REFRESH_TOKEN,
+            extra={"provider_hint": "google"},
+        )
+    )
+
+    assert captured["data"]["client_id"] == "public-client"
+    assert "client_secret" not in captured["data"]
+    assert tokens.extra == {
+        "provider_hint": "google",
+        "client_id": "public-client",
+        "token_endpoint_auth_method": "none",
+    }
+    from jarvis.marketplace.catalog_data import load_catalog
+    from jarvis.marketplace.revoke import revoke_tokens
+
+    assert await revoke_tokens(load_catalog().by_id("google_drive"), tokens) == "revoked"
+    assert captured["data"]["token"] == OLD_REFRESH_TOKEN
+    assert "client_secret" not in captured["data"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_issuing_client_after_config_drift_and_keyring_loss(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured["data"] = kwargs["data"]
+        return httpx.Response(
+            200,
+            json={"access_token": "new-access", "expires_in": 3600},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    cfg = PkceLoopbackConfig(
+        plugin_id="google_drive",
+        authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="replacement-client",
+        callback_port=0,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    current = Tokens(
+        access="old-access",
+        refresh=OLD_REFRESH_TOKEN,
+        extra={
+            "client_id": "issuing-client",
+            "client_secret": TEST_CLIENT_SECRET,
+        },
+    )
+
+    tokens = await PkceLoopbackHandler(cfg).refresh(current)
+
+    assert captured["data"]["client_id"] == "issuing-client"
+    assert captured["data"]["client_secret"] == TEST_CLIENT_SECRET
+    assert tokens.refresh == OLD_REFRESH_TOKEN
+    assert tokens.extra["client_id"] == "issuing-client"
+    assert tokens.extra["client_secret"] == TEST_CLIENT_SECRET
+
+
+@pytest.mark.asyncio
+async def test_refresh_bound_public_client_ignores_later_configured_secret(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict = {}
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured["data"] = kwargs["data"]
+        return httpx.Response(
+            200,
+            json={"access_token": "new-access", "expires_in": 3600},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    cfg = PkceLoopbackConfig(
+        plugin_id="google_drive",
+        authorization_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",  # noqa: S106
+        client_id="replacement-client",
+        client_secret="replacement-secret",  # noqa: S106
+        callback_port=0,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    current = Tokens(
+        access="old-access",
+        refresh=OLD_REFRESH_TOKEN,
+        extra={"client_id": "issuing-public-client"},
+    )
+
+    await PkceLoopbackHandler(cfg).refresh(current)
+
+    assert captured["data"]["client_id"] == "issuing-public-client"
+    assert "client_secret" not in captured["data"]
+
+
+@pytest.mark.asyncio
+async def test_figma_exchanges_at_token_url_and_refreshes_at_refresh_url(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Figma takes the code at /v1/oauth/token and the refresh grant at
+    /v1/oauth/refresh, both with the client in an HTTP Basic header."""
+    from jarvis.marketplace.catalog import OAuthPkceLoopbackAuth
+
+    manifest_path = (
+        Path(__file__).resolve().parents[3] / "jarvis/marketplace/plugins/figma/plugin.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    auth = OAuthPkceLoopbackAuth.model_validate(
+        manifest["extensions"]["io.github.personaljarvis"]["auth"]
+    )
+    calls: list[dict] = []
+
+    async def _fake_post(self, url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        calls.append({"url": url, "data": kwargs["data"], "headers": kwargs["headers"]})
+        return httpx.Response(
+            200, json={"access_token": "access", "refresh_token": "refresh", "expires_in": 3600}
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    cfg = PkceLoopbackConfig(
+        plugin_id="figma",
+        authorization_url=auth.authorization_url,
+        token_url=auth.token_url,
+        refresh_url=auth.refresh_url,
+        client_id="cid",
+        client_secret=TEST_CLIENT_SECRET,
+        callback_port=auth.callback_port,
+        scopes=auth.scopes,
+        scope_separator=auth.scope_separator,
+        client_auth_method=auth.client_auth_method,
+    )
+    handler = PkceLoopbackHandler(cfg)
+    pending = _PendingPkceFlow(
+        config=cfg,
+        callback_server=None,
+        code_verifier="verifier",
+        redirect_uri="http://127.0.0.1:3127/oauth/callback",
+    )
+
+    tokens = await handler._exchange(pending, code="code")  # noqa: SLF001
+    await handler.refresh(tokens)
+
+    exchange, refresh = calls
+    assert exchange["url"] == "https://api.figma.com/v1/oauth/token"
+    assert refresh["url"] == "https://api.figma.com/v1/oauth/refresh"
+    for call in calls:
+        assert call["headers"]["Authorization"].startswith("Basic ")
+        assert "client_secret" not in call["data"]
+    assert refresh["data"]["refresh_token"] == "refresh"

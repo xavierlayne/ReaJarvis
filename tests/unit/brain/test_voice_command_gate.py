@@ -1,0 +1,225 @@
+"""VoiceCommandGate — the LIVE deterministic provider-switch / cancel / depth
+detector (wired via BrainManager._detect_switch_intent -> match_voice_command).
+
+Regression guard added 2026-06-08: a voice "switch the brain provider to X" was
+NOT caught by the strict pattern (the "brain provider" filler between the verb
+and "to" broke it), fell through to the router LLM, and the LLM — told in its
+system prompt it had "no authority" to switch — refused with "keine Berechtigung".  # i18n-allow: verbatim quote of the hallucinated runtime output
+The gate must tolerate the natural "den/the [brain] provider/anbieter" filler.
+"""
+from __future__ import annotations
+
+import pytest
+
+from jarvis.brain.voice_command_gate import match_voice_command
+
+
+@pytest.mark.parametrize(
+    "text,target",
+    [
+        # existing, must keep working
+        ("wechsel auf gemini", "gemini"),
+        ("switch to openai", "openai"),
+        ("nutze openai", "openai"),
+        ("wechsle zu claude", "claude"),
+        ("use openrouter", "openrouter"),
+        ("switch to grok", "grok"),
+        # NEW: natural phrasings with a provider-noun filler
+        ("switch the brain provider to gemini", "gemini"),
+        ("wechsel den Brain-Provider auf gemini", "gemini"),  # i18n-allow: German speech-input test vocabulary
+        ("wechsel den Provider auf openrouter", "openrouter"),  # i18n-allow: German speech-input test vocabulary
+        ("wechsle den Anbieter zu openrouter", "openrouter"),
+        ("switch provider to claude", "claude"),
+        ("switch the provider to openai", "openai"),
+        ("wechsel deinen Provider auf gemini", "gemini"),
+    ],
+)
+def test_provider_switch_matches(text: str, target: str) -> None:
+    m = match_voice_command(text)
+    assert m is not None and m.kind == "provider_switch", f"no match for {text!r}"
+    assert m.target == target
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ich gehe auf meinem Weg",
+        "wie spät ist es",  # i18n-allow: German speech-input test vocabulary
+        "erzähl mir was über gemini",  # a mention, not a switch command (i18n-allow)
+    ],
+)
+def test_harmless_does_not_match_provider(text: str) -> None:
+    m = match_voice_command(text)
+    assert m is None or m.kind != "provider_switch"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Kannst du eine HTML-Datei machen, was morgen in Englisch drankommen kann?",  # i18n-allow: German voice-command fixture
+        "Mach mir eine Uebersicht auf Englisch.",  # i18n-allow: German voice-command fixture
+    ],
+)
+def test_artifact_requests_do_not_switch_reply_language(text: str) -> None:
+    m = match_voice_command(text)
+    assert m is None or m.kind != "language_switch"
+
+
+@pytest.mark.parametrize(
+    "text,target",
+    [
+        ("stell auf Englisch um", "en"),  # i18n-allow: German voice-command fixture
+        ("antworte ab jetzt auf Englisch", "en"),  # i18n-allow: German voice-command fixture
+        ("respond in German", "de"),
+    ],
+)
+def test_explicit_reply_language_switch_still_matches(text: str, target: str) -> None:
+    m = match_voice_command(text)
+    assert m is not None and m.kind == "language_switch"
+    assert m.target == target
+
+
+def test_cancel_and_depth_still_work() -> None:
+    assert match_voice_command("jarvis stopp").kind == "cancel"
+    assert match_voice_command("denk gründlich").kind == "depth_deep"  # i18n-allow: German speech-input test vocabulary
+    assert match_voice_command("nimm haiku").kind == "depth_fast"
+
+
+def test_subagent_switch_picks_target_after_preposition_not_source() -> None:
+    """ "von Antigravity auf Codex" must resolve to the TARGET (codex), not the  # i18n-allow: quotes the German test utterance under test
+    mentioned SOURCE (antigravity). Forensic 2026-06-27: the alias-list-ORDER
+    scan returned antigravity (it sits earlier in the list) so the worker was
+    switched to the source the user was switching AWAY from."""
+    m = match_voice_command(
+        "stell den subagent provider von antigravity auf codex um"  # i18n-allow: German speech-input test vocabulary
+    )
+    assert m is not None and m.kind == "subagent_switch"
+    assert m.target == "codex"
+
+
+def test_subagent_switch_longest_alias_after_preposition() -> None:
+    # "openai-codex" must win over its "openai"/"codex" substrings after the prep.
+    m = match_voice_command("wechsel den subagent von gemini auf openai-codex")  # i18n-allow: German speech-input test vocabulary
+    assert m is not None and m.kind == "subagent_switch"
+    assert m.target == "openai-codex"
+
+
+def test_subagent_switch_plain_target() -> None:
+    m = match_voice_command("stell den subagent provider auf gemini")  # i18n-allow: German speech-input test vocabulary
+    assert m is not None and m.kind == "subagent_switch"
+    assert m.target == "gemini"
+
+
+def test_main_provider_switch_from_x_to_y_targets_y() -> None:
+    # "von Gemini auf OpenAI" must target OpenAI (the destination), not fall through. (i18n-allow)
+    m = match_voice_command("wechsel von gemini auf openai")  # i18n-allow: German speech-input test vocabulary
+    assert m is not None and m.kind == "provider_switch"
+    assert m.target == "openai"
+
+
+def test_main_provider_switch_from_x_to_y_english() -> None:
+    m = match_voice_command("switch from claude to gemini")
+    assert m is not None and m.kind == "provider_switch"
+    assert m.target == "gemini"
+
+
+def test_main_provider_switch_plain_still_works() -> None:
+    m = match_voice_command("wechsel auf gemini")
+    assert m is not None and m.kind == "provider_switch"
+    assert m.target == "gemini"
+
+
+def test_main_provider_switch_recognizes_chatgpt_alias() -> None:
+    # "ChatGPT" is the everyday name for the OpenAI brain; the gate must catch it.
+    m = match_voice_command("nutze chatgpt")
+    assert m is not None and m.kind == "provider_switch"
+    assert m.target == "chatgpt"
+
+
+def test_main_provider_switch_recognizes_anthropic_alias() -> None:
+    # "Anthropic" is the everyday name for the claude-api brain.
+    m = match_voice_command("switch to anthropic")
+    assert m is not None and m.kind == "provider_switch"
+    assert m.target == "anthropic"
+
+
+@pytest.mark.parametrize(
+    "text,target",
+    [
+        ("ändere den Provider auf gemini", "gemini"),       # i18n-allow: German voice fixture
+        ("setze den Brain-Provider auf openai", "openai"),  # i18n-allow: German voice fixture
+        ("stell den Provider auf claude", "claude"),        # i18n-allow: German voice fixture
+    ],
+)
+def test_provider_switch_extra_verbs(text: str, target: str) -> None:
+    m = match_voice_command(text)
+    assert m is not None and m.kind == "provider_switch", f"no match for {text!r}"
+    assert m.target == target
+
+
+def test_cancel_recognizes_halt() -> None:
+    m = match_voice_command("halt")
+    assert m is not None and m.kind == "cancel"
+
+
+def test_halt_midsentence_is_not_cancel() -> None:
+    # "das ist halt so" must NOT cancel — halt only at sentence start / after jarvis (i18n-allow)
+    m = match_voice_command("das ist halt so")  # i18n-allow: German speech-input test vocabulary
+    assert m is None or m.kind != "cancel"
+
+
+def test_language_switch_picks_first_language_in_text_not_dict_order() -> None:
+    # "deutsch" appears before "englisch" in the sentence, so the reply language
+    # must be German — not English just because "englisch" sits earlier in the
+    # alias dict (forensic 2026-06-27).
+    m = match_voice_command("antworte auf deutsch und englisch")  # i18n-allow: German speech-input test vocabulary
+    assert m is not None and m.kind == "language_switch"
+    assert m.target == "de"
+
+
+def test_language_switch_single_language_unaffected() -> None:
+    m = match_voice_command("antworte auf englisch")
+    assert m is not None and m.kind == "language_switch"
+    assert m.target == "en"
+
+
+def test_language_switch_survives_live_stt_mistranscript() -> None:
+    m = match_voice_command(
+        "Antworte auf jetzt nur noch auf Englisch."  # i18n-allow: bug transcript
+    )
+    assert m is not None and m.kind == "language_switch"
+    assert m.target == "en"
+
+
+def test_language_switch_needs_its_ingredients_in_one_clause() -> None:
+    """A dictated paragraph must not be assembled into a language command.
+
+    Live 2026-07-28 20:34, coding mode on, six panes open: the user asked for
+    two coding agents to be briefed. The utterance happened to contain
+    "automatisch" (describing a bug — text is NOT inserted automatically), the  # i18n-allow: quoted German transcript token
+    verb "stellen" 408 characters later (from "Rückfragen stellen") and an "in"  # i18n-allow: quoted German transcript tokens
+    before both. The gate searched the WHOLE utterance for each ingredient,
+    assembled them into "switch the reply language to auto", answered the turn
+    and persisted the setting — so ``generate()`` returned before the
+    Agentic-IDE delivery path and no agent was ever briefed, while the live
+    model told the user two of them were working.
+    """
+    m = match_voice_command(
+        "Was mir aufgefallen ist: es funktioniert nicht, dass es dann nicht "  # i18n-allow: bug transcript
+        "automatisch in das Textfeld reingepromptet wird. Sie sollen in der "  # i18n-allow: bug transcript
+        "Codebase nachschauen, und wenn sie das nicht wissen, dann sollen sie "  # i18n-allow: bug transcript
+        "mir Rückfragen stellen."  # i18n-allow: bug transcript
+    )
+    assert m is None or m.kind != "language_switch"
+
+
+def test_language_switch_still_matches_across_ordinary_filler() -> None:
+    """The proximity bound must not cost a normally-spoken switch."""
+    for text, target in (
+        ("wechsle die Sprache bitte mal auf Spanisch", "es"),  # i18n-allow: German speech-input test vocabulary
+        ("stell die Antwortsprache auf automatisch", "auto"),  # i18n-allow: German speech-input test vocabulary
+        ("sprich Spanisch", "es"),  # i18n-allow: German speech-input test vocabulary
+    ):
+        m = match_voice_command(text)
+        assert m is not None and m.kind == "language_switch", text
+        assert m.target == target, text

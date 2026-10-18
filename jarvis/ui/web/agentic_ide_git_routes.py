@@ -1,0 +1,404 @@
+"""REST routes for the Agentic IDE's Git panel.
+
+Endpoints (all under ``/api/agentic-ide/git``)::
+
+    GET  /inspect             Branch, changes, ahead/behind, branches, worktrees
+    GET  /changes             Changed files under a folder, with line counts
+    GET  /diff                One file's change against the last commit
+    GET  /overview            A workspace's branches with merged-into, PR and CI state
+    GET  /branch/contents     A branch's own commits and changed files
+    GET  /branch/diff         How a branch changed one file
+    GET  /branch/editors      Where a branch's checkout can be opened on this computer
+    POST /branch/open         Open a branch's checkout in the file manager or an editor
+    GET  /github/repos        The person's GitHub repositories, for the one-time pick
+    PUT  /github/binding      Remember which GitHub repository a workspace folder is
+    POST /prepare             Git half of opening a workspace or an agent
+    POST /commit              Stage everything and commit
+    POST /push                Push the current branch (sets upstream once)
+    POST /fetch               Fetch every remote
+    POST /pull-request        Open a PR with the GitHub CLI
+    POST /merge               Merge a branch back into its target
+    POST /worktrees/remove    Remove a linked worktree (asks again when dirty)
+    POST /worktrees/prune     Forget worktrees deleted by hand
+
+Every route takes the folder it works on — a workspace folder, a project path
+or a worktree — and runs git in the anyio threadpool (plain ``def`` handlers),
+never on the event loop. Loopback-only like the rest of the IDE API.
+
+A failed git call answers 422 with ``{"detail": {"message", "code"}}`` so the
+UI can offer the follow-up it has for that code (``dirty`` → "remove anyway?").
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+from jarvis.agentic_ide import (
+    branch_contents,
+    git_changes,
+    git_ops,
+    git_overview,
+    github_link,
+    github_status,
+)
+from jarvis.agentic_ide.git_ops import GitError, PrepareMode
+from jarvis.agentic_ide.session import account_home, get_registry
+from jarvis.agentic_ide.session_branches import PaneBranchRecord
+from jarvis.agentic_ide.thread_folders import allowed_thread_folder
+from jarvis.ui.web.surface_security import is_loopback_request
+
+router = APIRouter(prefix="/api/agentic-ide/git", tags=["agentic-ide-git"])
+
+
+def _fail(exc: GitError) -> HTTPException:
+    return HTTPException(status_code=422, detail={"message": str(exc), "code": exc.code})
+
+
+class FolderRequest(BaseModel):
+    folder: str = Field(..., min_length=1, description="Folder inside the repository")
+
+
+class PrepareRequest(FolderRequest):
+    mode: PrepareMode = "current"
+    branch: str = Field("", max_length=200)
+    base: str = Field("", max_length=400, description="Base branch/commit, or worktree path")
+
+
+class CommitRequest(FolderRequest):
+    message: str = Field(..., min_length=1, max_length=5000)
+
+
+class PullRequestRequest(FolderRequest):
+    title: str = Field("", max_length=300)
+    draft: bool = False
+
+
+class MergeRequest(FolderRequest):
+    into: str = Field("", max_length=200, description="Target branch; default branch if empty")
+
+
+class RemoveWorktreeRequest(FolderRequest):
+    worktree: str = Field(..., min_length=1)
+    force: bool = False
+    delete_branch: bool = False
+
+
+@router.get("/inspect", summary="Git status, branches and worktrees of a folder")
+def inspect_folder(folder: str = Query(..., min_length=1)) -> dict:
+    try:
+        return git_ops.inspect(folder).to_dict()
+    except GitError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/changes", summary="Changed files under a folder, with line counts")
+def folder_changes(folder: str = Query(..., min_length=1)) -> dict:
+    """What a thread's diff panel lists — the same reading as a workspace's
+    Changes tab, for a folder no workspace has open (a thread's worktree).
+
+    Only a folder inside a connected project or an open workspace is read.
+    """
+    return asdict(git_changes.workspace_changes(_thread_folder(folder)))
+
+
+def _thread_folder(folder: str) -> Path:
+    path = allowed_thread_folder(folder)
+    if path is None:
+        raise HTTPException(
+            status_code=403, detail="This folder is not part of a connected project."
+        )
+    return path
+
+
+@router.get("/diff", summary="How one file under a folder differs from the last commit")
+def folder_file_diff(
+    folder: str = Query(..., min_length=1), path: str = Query(..., min_length=1)
+) -> dict:
+    try:
+        return asdict(git_changes.file_diff(_thread_folder(folder), path))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+@router.get("/overview", summary="Branches of a workspace's repository with PR and CI state")
+def workspace_overview(
+    workspace_id: str = Query(..., min_length=1),
+    refresh: bool = Query(False, description="Re-read GitHub now instead of the cached answer"),
+) -> dict:
+    """What the IDE's Git tab lists: every branch, what it is merged into, its
+    pull requests and its CI — local git always, GitHub through ``gh`` when it
+    is installed and signed in (cached per repository, see ``git_overview``).
+
+    Workspace-scoped on purpose: the folder comes from the open workspace, so
+    this cannot be pointed at an arbitrary path on the machine.
+    """
+    session = get_registry().get(workspace_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    # The tab polls again soon while GitHub's first read is still loading.
+    return git_overview.overview(session.folder, refresh=refresh, wait_for_github=False).to_dict()
+
+
+@router.get("/session-status", summary="Current GitHub branch, pull request and CI status per pane")
+def session_github_status(workspace_id: str = Query(..., min_length=1)) -> dict:
+    """Read GitHub state only for a branch this pane demonstrably created."""
+    session = get_registry().get(workspace_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    records = [
+        PaneBranchRecord(
+            pane=pane.name,
+            history_id=pane.history_id,
+            folder=pane.cwd(session.folder),
+            agent=pane.agent,
+            session_id=pane.resume.id if pane.resume else "",
+            home=account_home(pane.agent, pane.account),
+            created_branch=pane.branch,
+            started_at=pane.resume.captured_at if pane.resume else 0,
+        )
+        for pane in session.terminals
+        if not pane.computer_id
+    ]
+    return {"panes": github_status.statuses(records)}
+
+
+# The editors a branch's checkout is offered in, when installed.
+_BRANCH_EDITORS = ("code", "cursor")
+
+
+def _native_actions(request: Request) -> bool:
+    """Opening a folder acts on the screen of the computer running Jarvis."""
+    return is_loopback_request(request.scope) and bool(
+        getattr(request.app.state, "native_file_actions", False)
+    )
+
+
+def _workspace_folder(workspace_id: str) -> Path:
+    session = get_registry().get(workspace_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    return Path(session.folder)
+
+
+@router.get("/branch/contents", summary="A branch's own commits and changed files")
+def branch_contents_route(
+    workspace_id: str = Query(..., min_length=1),
+    branch: str = Query(..., min_length=1, max_length=300),
+    base: str = Query("", max_length=300, description="The default branch to compare with"),
+    remote: bool = Query(False, description="Read origin/<branch> (a GitHub-only branch)"),
+) -> dict:
+    """What the Git tab shows when a branch row is folded open."""
+    folder = _workspace_folder(workspace_id)
+    return branch_contents.branch_contents(folder, branch, base, remote=remote).to_dict()
+
+
+@router.get("/branch/diff", summary="How a branch changed one file")
+def branch_diff_route(
+    workspace_id: str = Query(..., min_length=1),
+    branch: str = Query(..., min_length=1, max_length=300),
+    path: str = Query(..., min_length=1, max_length=1000),
+    base: str = Query("", max_length=300),
+    remote: bool = Query(False),
+) -> dict:
+    folder = _workspace_folder(workspace_id)
+    try:
+        diff = branch_contents.branch_file_diff(folder, branch, base, path, remote=remote)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return asdict(diff)
+
+
+@router.get("/branch/editors", summary="Where a branch's checkout can be opened")
+def branch_editors(request: Request) -> dict:
+    """The file manager and the installed editors; empty on a headless host."""
+    if not _native_actions(request):
+        return {"file_manager": False, "editors": []}
+    from jarvis.ui.web import outputs_routes
+
+    labels = dict(outputs_routes._OPENER_EDITORS)
+    installed = {entry["id"] for entry in outputs_routes._available_openers()}
+    editors = [{"id": oid, "label": labels[oid]} for oid in _BRANCH_EDITORS if oid in installed]
+    return {"file_manager": True, "editors": editors}
+
+
+class OpenBranchRequest(BaseModel):
+    workspace_id: str = Field(..., min_length=1)
+    branch: str = Field(..., min_length=1, max_length=300)
+    target: str = Field(
+        "folder", min_length=1, max_length=40, description='"folder" or an editor id'
+    )
+
+
+@router.post("/branch/open", summary="Open a branch's checkout in the file manager or an editor")
+def open_branch(request: Request, req: OpenBranchRequest) -> dict:
+    """Open the folder a branch is checked out in.
+
+    The folder comes from git's own worktree list for the open workspace, never
+    from the client, and ``target`` is a closed id — this cannot open an
+    arbitrary path or launch an arbitrary program.
+    """
+    if not _native_actions(request):
+        raise HTTPException(status_code=404, detail="Folders can only be opened on this computer.")
+    session = get_registry().get(req.workspace_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    folder = git_overview.branch_checkout(session.folder, req.branch)
+    if folder is None:
+        raise HTTPException(
+            status_code=404, detail="This branch is not checked out on this computer."
+        )
+    from jarvis.platform import open_path
+
+    if req.target == "folder":
+        return {"opened": bool(open_path.open_file(folder)), "path": str(folder)}
+    if req.target not in _BRANCH_EDITORS:
+        raise HTTPException(status_code=400, detail="Unknown editor.")
+    from jarvis.ui.web import outputs_routes
+
+    resolved = outputs_routes._resolve_opener(req.target)
+    if resolved is None:
+        raise HTTPException(status_code=409, detail="That editor is not installed.")
+    kind, value = resolved
+    return {"opened": bool(open_path.open_file_with(folder, kind, value)), "path": str(folder)}
+
+
+class BindingRequest(BaseModel):
+    workspace_id: str = Field(..., min_length=1)
+    repo: str = Field("", max_length=200, description="owner/name; empty forgets the choice")
+
+
+@router.get("/github/repos", summary="The person's GitHub repositories")
+def github_repositories(refresh: bool = Query(False)) -> dict:
+    """What the Git tab's one-time "which repository is this folder?" list shows.
+
+    Uses the existing GitHub connection (Plugins → GitHub, else the GitHub
+    CLI's login). ``connected=false`` when there is none — the tab then offers
+    to connect instead of an empty list.
+    """
+    cred = github_link.credential()
+    if cred is None:
+        return {"connected": False, "source": "", "login": "", "repos": [], "reason": ""}
+    try:
+        login, repos = github_link.list_repositories(cred, refresh=refresh)
+    except github_link.GitHubError as exc:
+        # The GitHub error is returned to the UI as the reason field.
+        return {
+            "connected": exc.code != "not_connected",
+            "source": cred.source,
+            "login": "",
+            "repos": [],
+            "reason": str(exc),
+        }
+    return {
+        "connected": True,
+        "source": cred.source,
+        "login": login,
+        "repos": github_link.repo_dicts(repos),
+        "reason": "",
+    }
+
+
+@router.put("/github/binding", summary="Remember a workspace folder's GitHub repository")
+def bind_github_repository(req: BindingRequest) -> dict:
+    """Asked once per folder; every worktree of the same repository shares it."""
+    session = get_registry().get(req.workspace_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Workspace not found.")
+    try:
+        github_link.bind_repository(session.folder, req.repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="The choice could not be saved.") from exc
+    git_overview.clear_cache()
+    return {"ok": True, "repo": req.repo.strip()}
+
+
+@router.post("/prepare", summary="Prepare a checkout for a new workspace or agent")
+def prepare_checkout(req: PrepareRequest) -> dict:
+    try:
+        return git_ops.prepare(req.folder, req.mode, branch=req.branch, base=req.base).to_dict()
+    except GitError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/commit", summary="Stage every change and commit it")
+def commit_changes(req: CommitRequest) -> dict:
+    try:
+        sha = git_ops.commit_all(req.folder, req.message)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True, "commit": sha}
+
+
+@router.post("/push", summary="Push the current branch")
+def push_branch(req: FolderRequest) -> dict:
+    try:
+        upstream = git_ops.push(req.folder)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True, "upstream": upstream}
+
+
+@router.post("/fetch", summary="Fetch every remote")
+def fetch_remotes(req: FolderRequest) -> dict:
+    try:
+        git_ops.fetch(req.folder)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True}
+
+
+@router.post("/pull-request", summary="Open a pull request for the current branch")
+def open_pull_request(req: PullRequestRequest) -> dict:
+    try:
+        url = git_ops.create_pull_request(req.folder, title=req.title, draft=req.draft)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True, "url": url}
+
+
+@router.post("/merge", summary="Merge the current branch back into its target")
+def merge_branch(req: MergeRequest) -> dict:
+    try:
+        sha = git_ops.merge_back(req.folder, into=req.into)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True, "commit": sha}
+
+
+@router.post(
+    "/worktrees/remove",
+    summary="Remove a linked git worktree",
+    openapi_extra={"x-jarvis-dangerous": True},
+)
+def remove_worktree(req: RemoveWorktreeRequest) -> dict:
+    open_folders = [session.folder for session in get_registry().sessions]
+    if git_ops.worktree_in_use(req.worktree, open_folders):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "A workspace is still open in this worktree. Close it first.",
+                "code": "in_use",
+            },
+        )
+    try:
+        summary = git_ops.remove_worktree(
+            req.folder, req.worktree, force=req.force, delete_branch=req.delete_branch
+        )
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True, "message": summary}
+
+
+@router.post("/worktrees/prune", summary="Forget worktrees whose folders are gone")
+def prune_worktrees(req: FolderRequest) -> dict:
+    try:
+        git_ops.prune_worktrees(req.folder)
+    except GitError as exc:
+        raise _fail(exc) from exc
+    return {"ok": True}

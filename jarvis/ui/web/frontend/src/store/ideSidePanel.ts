@@ -1,0 +1,175 @@
+import { create } from "zustand";
+
+/**
+ * The Agentic IDE's right-hand side panel: open or shut, which tabs it holds,
+ * and which one is in front.
+ *
+ * The panel, its closed-state rail and the explorer path routing all need the
+ * answer, so it lives in one store. The state survives a reload through localStorage, which may be
+ * blocked — every read and write degrades to the defaults instead of throwing.
+ */
+
+/** Every function the panel can show. A new one is a new id plus a registry entry. */
+export type SidePanelTabId = "browser" | "agents" | "changes" | "files" | "search" | "git" | "skills" | "subscriptions" | "office" | `terminal:${string}`;
+
+export interface SidePanelTerminal {
+  id: `terminal:${string}`;
+  workspaceId: string;
+  workspaceName: string;
+  number: number;
+}
+
+export const MAX_TERMINAL_TABS = 16;
+
+export const SIDE_PANEL_TAB_IDS: readonly SidePanelTabId[] = ["browser", "agents", "changes", "files", "search", "git", "skills", "subscriptions", "office"];
+
+/**
+ * DOM id of the panel host, for the toggle's `aria-controls`.
+ *
+ * It lives here rather than in the panel's module because the toggle sits in
+ * the always-loaded window caption: importing it from `IdeSidePanel` linked the
+ * whole panel (explorer, git overview, agents overview) into the entry chunk.
+ */
+export const SIDE_PANEL_ID = "ide-side-panel";
+
+const OPEN_KEY = "jarvis.agenticIde.sidePanelOpen";
+// v5: the panel starts empty and offers the "Open a surface" launcher; the
+// reader picks what to open (maintainer, 2026-10-07). Older lists reopened
+// every tab they had ever added.
+const TABS_KEY = "jarvis.agenticIde.sidePanelTabs.v5";
+
+const DEFAULT_TABS: SidePanelTabId[] = [];
+/** Stand-in for `active` while no tab is open; the panel then shows the launcher. */
+const NO_TAB: SidePanelTabId = "agents";
+
+const isTabId = (value: unknown): value is SidePanelTabId =>
+  typeof value === "string" && (SIDE_PANEL_TAB_IDS as readonly string[]).includes(value);
+
+function storedOpen(): boolean {
+  try {
+    return localStorage.getItem(OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function storedTabs(): { tabs: SidePanelTabId[]; active: SidePanelTabId } {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TABS_KEY) ?? "null") as {
+      tabs?: unknown;
+      active?: unknown;
+    } | null;
+    const tabs = Array.isArray(raw?.tabs) ? [...new Set(raw.tabs.filter(isTabId))] : [];
+    if (tabs.length === 0) return { tabs: DEFAULT_TABS, active: NO_TAB };
+    return { tabs, active: isTabId(raw?.active) && tabs.includes(raw.active) ? raw.active : tabs[0] };
+  } catch {
+    return { tabs: DEFAULT_TABS, active: NO_TAB };
+  }
+}
+
+function persist(open: boolean, tabs: SidePanelTabId[], active: SidePanelTabId): void {
+  try {
+    localStorage.setItem(OPEN_KEY, open ? "1" : "0");
+    // Shell processes belong to this window. A reload must not silently start
+    // replacements for commands that were running before the window closed.
+    const saved = tabs.filter(isTabId);
+    localStorage.setItem(TABS_KEY, JSON.stringify({ tabs: saved, active: isTabId(active) ? active : saved[0] ?? NO_TAB }));
+  } catch {
+    /* a convenience only: the panel still works for this session */
+  }
+}
+
+/**
+ * The pane an agent card pointed at: the grid frames it in the signal blue
+ * until the user focuses another pane, picks another card, or closes the panel.
+ */
+export interface PaneSpotlight {
+  workspaceId: string;
+  pane: string;
+}
+
+interface IdeSidePanelState {
+  open: boolean;
+  tabs: SidePanelTabId[];
+  active: SidePanelTabId;
+  terminals: SidePanelTerminal[];
+  addTerminalTab: (workspaceId: string, workspaceName: string) => void;
+  setOpen: (open: boolean) => void;
+  /** Open a tab (or bring it forward when it is already open). */
+  openTab: (id: SidePanelTabId) => void;
+  select: (id: SidePanelTabId) => void;
+  /** Closing the last tab leaves the panel open on the "Open a surface" launcher. */
+  closeTab: (id: SidePanelTabId) => void;
+  spotlight: PaneSpotlight | null;
+  setSpotlight: (spotlight: PaneSpotlight | null) => void;
+  /**
+   * The panel covers the whole IDE view (the office walked full-size). Not
+   * persisted: a reload always comes back to the terminals.
+   */
+  maximized: boolean;
+  setMaximized: (maximized: boolean) => void;
+  /**
+   * The reader is working in the panel: their last press landed in it rather
+   * than in a terminal. The panel then wears the blue "you are here" frame a
+   * focused terminal wears, and the terminal lets go of its own. A press on
+   * a pane hands it back. Not persisted.
+   */
+  inUse: boolean;
+  setInUse: (inUse: boolean) => void;
+}
+
+const initialTabs = storedTabs();
+
+export const useIdeSidePanelStore = create<IdeSidePanelState>((set, get) => {
+  const commit = (next: Partial<Pick<IdeSidePanelState, "open" | "tabs" | "active">>) => {
+    const merged = { open: get().open, tabs: get().tabs, active: get().active, ...next };
+    set(merged);
+    persist(merged.open, merged.tabs, merged.active);
+  };
+  return {
+    open: storedOpen(),
+    tabs: initialTabs.tabs,
+    active: initialTabs.active,
+    terminals: [],
+    addTerminalTab: (workspaceId, workspaceName) => {
+      if (!workspaceId) return;
+      const { terminals, tabs } = get();
+      const siblings = terminals.filter((terminal) => terminal.workspaceId === workspaceId);
+      if (siblings.length >= MAX_TERMINAL_TABS) return;
+      const id = `terminal:${crypto.randomUUID()}` as const;
+      const number = Math.max(0, ...siblings.map((terminal) => terminal.number)) + 1;
+      set({ terminals: [...terminals, { id, workspaceId, workspaceName, number }] });
+      commit({ open: true, tabs: [...tabs, id], active: id });
+    },
+    spotlight: null,
+    setSpotlight: (spotlight) => set({ spotlight }),
+    maximized: false,
+    setMaximized: (maximized) => set({ maximized: maximized && get().open }),
+    inUse: false,
+    setInUse: (inUse) => { if (get().inUse !== inUse) set({ inUse: inUse && get().open }); },
+    setOpen: (open) => {
+      if (!open) set({ spotlight: null, maximized: false, inUse: false });
+      commit({ open });
+    },
+    openTab: (id) => {
+      const { tabs } = get();
+      commit({ open: true, tabs: tabs.includes(id) ? tabs : [...tabs, id], active: id });
+    },
+    select: (id) => {
+      if (get().tabs.includes(id)) commit({ active: id });
+    },
+    closeTab: (id) => {
+      const { tabs, active } = get();
+      const index = tabs.indexOf(id);
+      if (index < 0) return;
+      const rest = tabs.filter((tab) => tab !== id);
+      set({ terminals: get().terminals.filter((terminal) => terminal.id !== id) });
+      if (rest.length === 0) {
+        set({ spotlight: null, maximized: false });
+        commit({ tabs: DEFAULT_TABS, active: NO_TAB });
+        return;
+      }
+      commit({ tabs: rest, active: active === id ? rest[Math.max(0, index - 1)] : active });
+    },
+  };
+});

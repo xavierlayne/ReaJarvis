@@ -1,0 +1,368 @@
+"""Installer flow: no wizard, explanatory steps, launch is the LAST action."""
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[3]
+_spec = importlib.util.spec_from_file_location("installer", REPO / "install" / "installer.py")
+installer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(installer)
+
+
+def test_no_wizard_invocation_anywhere() -> None:
+    source = (REPO / "install" / "installer.py").read_text(encoding="utf-8")
+    assert "--wizard" not in source.replace("--no-wizard", "")
+
+
+def test_dry_run_order_launch_last(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(installer, "write_managed_marker", lambda: None)
+    rc = installer.main(["--dry-run", "--headless"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # The launch line must come after every prepare phase AND after the summary.
+    assert out.rindex("Launching") > out.rindex("Voice models")
+    assert out.rindex("Launching") > out.rindex("Personal Jarvis is ready")
+
+
+def test_dry_run_prints_the_numbered_journey(monkeypatch, capsys) -> None:
+    """Design 2026-07-09: one six-phase journey; this stage owns 4/6..6/6 in order."""
+    monkeypatch.setattr(installer, "write_managed_marker", lambda: None)
+    rc = installer.main(["--dry-run", "--headless"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.index("4/6") < out.index("5/6") < out.index("6/6")
+    assert "Dependencies" in out
+    assert "Voice models" in out
+    assert "Finish & launch" in out
+
+
+@pytest.mark.parametrize(
+    ("args", "auto_headless", "expected_browser"),
+    [
+        (["--headless"], False, False),
+        ([], True, False),
+        (["--with-desktop"], False, True),
+        (["--headless", "--with-desktop"], False, False),
+    ],
+)
+def test_browser_provisioning_respects_headless_profile(
+    monkeypatch, capsys, tmp_path, args, auto_headless, expected_browser
+) -> None:
+    """Headless installs must not launch Chromium or request system packages."""
+    commands: list[list[str]] = []
+    monkeypatch.setattr(installer, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(installer, "is_headless_linux", lambda: auto_headless)
+    monkeypatch.setattr(installer, "is_update_run", lambda: False)
+    monkeypatch.setattr(installer, "write_managed_marker", lambda **kwargs: None)
+    for step in (
+        "step_preflight", "step_pip_install", "step_models", "step_cli_links",
+        "step_worker_cli", "step_summary",
+    ):
+        monkeypatch.setattr(installer, step, lambda **kwargs: None)
+    monkeypatch.setattr(installer, "step_desktop_integration", lambda **kwargs: True)
+    monkeypatch.setattr(installer, "step_ui_bundle_check", lambda: True)
+    monkeypatch.setattr(
+        installer, "run_noted", lambda command, **kwargs: commands.append(command)
+    )
+
+    assert installer.main([*args, "--no-launch"]) == 0
+    browser_commands = [
+        command for command in commands if "jarvis.society.browser.install" in command
+    ]
+    assert bool(browser_commands) is expected_browser
+    assert ("Agent browser skipped" in capsys.readouterr().out) is not expected_browser
+
+
+def test_installer_prompts_only_inside_missing_prerequisite_flow() -> None:
+    """Design amendment 2026-07-11: Stage 1 may ask only when Python or Git
+    is missing. The normal path and all of Stage 2 remain prompt-free."""
+    sh = (REPO / "install" / "install.sh").read_text(encoding="utf-8")
+    ps1 = (REPO / "install" / "install.ps1").read_text(encoding="utf-8")
+    py = (REPO / "install" / "installer.py").read_text(encoding="utf-8")
+
+    sh_begin = sh.index("# --- prerequisite-bootstrap begin")
+    sh_end = sh.index("# --- prerequisite-bootstrap end")
+    # Design amendment 2026-07-14: ONE more allowed prompt — the welcome gate
+    # ("Would you like to install?") BEFORE phase 1. Nothing else may ask.
+    wg_begin = sh.index(
+        "# -------------------------------------------------------------- welcome gate"
+    )
+    wg_end = sh.index("# -------------------------------------------------------------- preflight")
+    sh_outside = sh[:wg_begin] + sh[wg_end:sh_begin] + sh[sh_end:]
+    assert "read -r" not in sh_outside
+    assert "read -p" not in sh
+    # 3 sanctioned prompts: install Python?, install Git?, and (Linux X11,
+    # commit 72fd9aa2) install the desktop-automation tools? All must read
+    # from /dev/tty (asserted below).
+    assert sh[sh_begin:sh_end].count("read -r") == 3
+    assert all(
+        "< /dev/tty" in line.replace("</dev/tty", "< /dev/tty")
+        for block in (sh[sh_begin:sh_end], sh[wg_begin:wg_end])
+        for line in block.splitlines()
+        if "read -r" in line
+    )
+
+    ps1_begin = ps1.index("# --- prerequisite-bootstrap begin")
+    ps1_end = ps1.index("# --- prerequisite-bootstrap end")
+    ps1_outside = ps1[:ps1_begin] + ps1[ps1_end:]
+    assert "Read-Host" not in ps1_outside
+    assert "$Host.UI.Prompt" not in ps1
+    ps1_prompt_lines = [
+        line
+        for line in ps1[ps1_begin:ps1_end].splitlines()
+        if "Read-Host" in line and not line.lstrip().startswith("#")
+    ]
+    assert len(ps1_prompt_lines) == 2
+
+    for forbidden in ("input(", "Confirm.ask", "Prompt.ask", "getpass"):
+        assert forbidden not in py
+
+
+def test_update_run_is_detected(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(installer, "repo_root", lambda: tmp_path)
+    assert installer.is_update_run() is False
+    (tmp_path / ".jarvis-managed-install").write_text("{}", encoding="utf-8")
+    assert installer.is_update_run() is True
+
+
+def test_default_pip_plan_installs_full_extra(capsys) -> None:
+    """Design 2026-07-07: the one advertised install path installs .[full]."""
+    installer.step_pip_install(with_desktop=True, with_voice_local=False, dry_run=True)
+    out = capsys.readouterr().out
+    assert ".[full]" in out
+    assert ".[desktop]" not in out
+    assert ".[local-voice]" not in out
+
+
+def test_headless_pip_plan_stays_base_floor(capsys) -> None:
+    """--headless keeps the torch-free base floor: no extras at all."""
+    installer.step_pip_install(with_desktop=False, with_voice_local=False, dry_run=True)
+    out = capsys.readouterr().out
+    assert ".[full]" not in out
+    assert ".[desktop]" not in out
+
+
+@pytest.mark.parametrize("desktop", [True, False])
+def test_native_crypto_index_reaches_the_installer_profile(monkeypatch, desktop) -> None:
+    from scripts import native_crypto_index
+
+    options = native_crypto_index.pip_options("darwin", "x86_64")
+    monkeypatch.setattr(native_crypto_index, "pip_options", lambda: options)
+    commands = []
+
+    def capture(command, **_kwargs):
+        commands.append(command)
+        return 0
+
+    monkeypatch.setattr(installer, "run_quiet", capture)
+    monkeypatch.setattr(installer, "repair_distribution_metadata", lambda **_kwargs: True)
+    installer.step_pip_install(with_desktop=desktop, with_voice_local=False, dry_run=False)
+    profile = ".[full]" if desktop else "."
+    command = next(
+        command for command in commands if profile in command and "--no-deps" not in command
+    )
+    assert command[command.index("--find-links") + 1] == native_crypto_index.wheel_links_url()
+
+
+@pytest.mark.parametrize("update", [False, True])
+@pytest.mark.parametrize(
+    ("args", "display", "with_desktop"),
+    [
+        (["--headless"], ":0", False),  # Explicit headless, including WSLg.
+        ([], "", False),  # Automatically detected headless Linux.
+        ([], ":0", True),
+        (["--with-desktop"], "", True),
+    ],
+)
+def test_browser_provisioning_follows_install_profile(
+    monkeypatch, tmp_path, capsys, update, args, display, with_desktop
+) -> None:
+    """A server install must never start optional Chromium or privileged setup."""
+    monkeypatch.setattr(installer.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", display)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv("JARVIS_INSTALL_PREREQS", "never")
+    monkeypatch.setattr(installer, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(installer, "is_update_run", lambda: update)
+    monkeypatch.setattr(installer, "step_preflight", lambda: None)
+    monkeypatch.setattr(installer, "write_managed_marker", lambda **kw: None)
+    for step in ("step_pip_install", "step_models", "step_worker_cli"):
+        monkeypatch.setattr(installer, step, lambda **kw: None)
+    monkeypatch.setattr(installer, "step_desktop_integration", lambda **kw: True)
+    monkeypatch.setattr(installer, "step_ui_bundle_check", lambda: True)
+    monkeypatch.setattr(installer, "step_summary", lambda **kw: print("Core install ready"))
+    cli_links = []
+    monkeypatch.setattr(
+        installer, "step_cli_links", lambda **kw: cli_links.append(kw["dry_run"])
+    )
+    calls = []
+
+    def run_browser(cmd, **kw):
+        calls.append(cmd)
+        return 0
+
+    monkeypatch.setattr(installer, "run_noted", run_browser)
+    assert installer.main([*args, "--no-launch"]) == 0
+    out = capsys.readouterr().out
+    assert "Core install ready" in out
+    assert cli_links == [False]
+    if with_desktop:
+        assert calls == [[
+            str(installer.venv_python()), "-m", "jarvis.society.browser.install",
+            "--system-deps",
+        ]]
+    else:
+        assert calls == []
+        assert "browser skipped" in out
+        assert "jarvis.society.browser.install" in out
+        assert "--system-deps" in out
+        assert "administrator" in out
+        assert "Traceback" not in out
+
+
+def test_full_profile_prefetches_every_wake_language(capsys) -> None:
+    installer.step_models(full_profile=True, dry_run=True)
+    out = capsys.readouterr().out
+    assert "--prefetch-all-wake-languages" in out
+
+
+def test_headless_prefetch_keeps_only_configured_wake_language(capsys) -> None:
+    installer.step_models(full_profile=False, dry_run=True)
+    out = capsys.readouterr().out
+    assert "--prefetch" in out
+    assert "--prefetch-all-wake-languages" not in out
+
+
+def test_macos_fresh_install_ci_exercises_advertised_full_profile() -> None:
+    workflow = (REPO / ".github" / "workflows" / "installer-smoke.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "MATRIX_OS: ${{ matrix.os }}" in workflow
+    assert 'if [ "$MATRIX_OS" = "macos-latest" ]; then' in workflow
+    assert "installer.py --with-desktop --no-launch" in workflow
+
+
+def test_full_profile_failure_stops_desktop_install(monkeypatch) -> None:
+    results = iter([0, 0, 1])
+    monkeypatch.setattr(installer, "run_quiet", lambda *args, **kwargs: next(results))
+
+    with pytest.raises(SystemExit, match="2"):
+        installer.step_pip_install(
+            with_desktop=True,
+            with_voice_local=False,
+            dry_run=False,
+        )
+
+
+def test_macos_launch_enters_through_application_bundle(monkeypatch, tmp_path, capsys) -> None:
+    launched: dict[str, object] = {}
+    bundle = tmp_path / "Personal Jarvis.app"
+    monkeypatch.setattr(installer.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        "jarvis.setup.macos_app_bundle.macos_app_bundle_path", lambda: bundle
+    )
+    monkeypatch.setattr(
+        "jarvis.setup.macos_app_bundle.macos_app_bundle_is_launchable", lambda _p: True
+    )
+    monkeypatch.setattr(
+        "jarvis.setup.macos_app_bundle.macos_launch_services_command",
+        lambda _p: ["/usr/bin/open", "-a", str(bundle)],
+    )
+    monkeypatch.setattr(
+        installer.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: launched.update(cmd=cmd, kwargs=kwargs),
+    )
+
+    installer.step_launch(headless=False, dry_run=False)
+
+    assert launched["cmd"] == ["/usr/bin/open", "-a", str(bundle)]
+    # A spawned Popen reports success even when no window ever surfaces, so the
+    # outro must always leave a manual re-launch command behind (the bug the user
+    # hit: outro said "Launching…" but nothing opened, with no recovery path).
+    out = capsys.readouterr().out
+    assert "If it doesn't open, run:" in out
+    assert 'open -a "Personal Jarvis"' in out
+
+
+def test_launch_fallback_hint_is_shown_on_every_desktop_os(monkeypatch, capsys) -> None:
+    """The manual re-launch line appears on Windows and Linux too, not just mac."""
+    monkeypatch.setattr(installer.subprocess, "Popen", lambda cmd, **kwargs: None)
+
+    monkeypatch.setattr(installer.sys, "platform", "win32")
+    installer.step_launch(headless=False, dry_run=False)
+    win_out = capsys.readouterr().out
+    assert "If it doesn't open, run:" in win_out
+    assert "run.bat" in win_out
+
+    monkeypatch.setattr(installer.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":99")
+    installer.step_launch(headless=False, dry_run=False)
+    linux_out = capsys.readouterr().out
+    assert "If it doesn't open, run:" in linux_out
+    assert "jarvis.ui.web.launcher" in linux_out
+
+
+def test_linux_gui_gets_full_profile_and_app_menu_registration(
+    monkeypatch, capsys
+) -> None:
+    """A Linux desktop is a first-class app install, not the headless floor."""
+    monkeypatch.setattr(installer.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":99")
+
+    rc = installer.main(["--dry-run", "--no-launch"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert ".[full]" in out
+    assert "repair desktop-shell registration" in out
+    assert 'app menu -> "Personal Jarvis"' in out
+
+
+def test_update_summary_promises_no_reonboarding(monkeypatch, capsys, tmp_path) -> None:
+    (tmp_path / ".jarvis-managed-install").write_text("{}", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(installer, "write_managed_marker", lambda: None)
+    rc = installer.main(["--dry-run", "--headless", "--no-launch"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no re-onboarding" in out
+
+
+class _ProbeResult:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+
+
+@pytest.mark.parametrize(
+    ("probe_output", "expect_note"),
+    [("False\n", True), ("True\n", False), ("None\n", False), ("", False)],
+)
+def test_a_stalled_spotlight_index_is_named_with_its_repair_command(
+    monkeypatch: pytest.MonkeyPatch, probe_output: str, expect_note: bool
+) -> None:
+    """Reported 2026-09-17: installed, in Launchpad, and Spotlight found nothing
+    — the Mac's index had stopped absorbing new apps. Only a proven stall
+    (import accepted, app never listed) may speak; "unknown" stays silent."""
+    notes: list[str] = []
+    monkeypatch.setattr(installer, "note", notes.append)
+    monkeypatch.setattr(
+        installer.subprocess, "run", lambda *_a, **_kw: _ProbeResult(probe_output)
+    )
+
+    installer._note_stalled_spotlight()
+
+    assert any("sudo mdutil -E /" in line for line in notes) is expect_note
+
+
+def test_a_spotlight_probe_that_cannot_run_never_fails_the_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a, **_kw):
+        raise OSError("no interpreter")
+
+    monkeypatch.setattr(installer.subprocess, "run", _boom)
+
+    installer._note_stalled_spotlight()

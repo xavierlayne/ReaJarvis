@@ -1,0 +1,316 @@
+"""Visibility rules for empty voice-session attempts."""
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from jarvis.core.bus import EventBus
+from jarvis.sessions.store import SessionStore
+from jarvis.state.chat_store import ChatStore
+from jarvis.ui.web import chats_routes, sessions_routes
+
+
+def _finalize_session(
+    store: SessionStore,
+    *,
+    session_id: str,
+    started_ms: int,
+    user_text: str = "",
+    assistant_text: str = "",
+) -> None:
+    store.upsert_session(
+        session_id=session_id,
+        started_ms=started_ms,
+        language="en",
+        voice_mode="realtime",
+    )
+    turn_count = 0
+    if user_text or assistant_text:
+        turn_id = f"{session_id}-turn"
+        store.upsert_turn(
+            turn_id=turn_id,
+            session_id=session_id,
+            idx=0,
+            started_ms=started_ms,
+        )
+        store.finalize_turn(
+            turn_id=turn_id,
+            ended_ms=started_ms + 500,
+            user_text=user_text,
+            user_lang="en" if user_text else "",
+            jarvis_text=assistant_text,
+            jarvis_lang="en" if assistant_text else "",
+            tier="realtime",
+            provider="test-live",
+            model="test-model",
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            latency_total_ms=500,
+            tool_calls=[],
+        )
+        turn_count = 1
+    store.finalize_session(
+        session_id=session_id,
+        ended_ms=started_ms + 1_000,
+        hangup_reason="hotkey",
+        turn_count=turn_count,
+        total_cost_usd=0.0,
+        total_tokens_in=0,
+        total_tokens_out=0,
+        providers_used=[],
+    )
+
+
+def test_transcript_filter_keeps_content_and_open_sessions(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(
+            store,
+            session_id="meaningful",
+            started_ms=1_000,
+            user_text="Hello",
+        )
+        _finalize_session(
+            store,
+            session_id="assistant-only",
+            started_ms=2_000,
+            assistant_text="Microphone access is unavailable.",
+        )
+        _finalize_session(store, session_id="empty", started_ms=4_000)
+        store.upsert_session(
+            session_id="running",
+            started_ms=3_000,
+            language="en",
+            voice_mode="unknown",
+        )
+
+        visible = store.list_sessions(limit=10, include_empty=False)
+        all_attempts = store.list_sessions(limit=10, include_empty=True)
+
+        assert [session.id for session in visible] == [
+            "running",
+            "assistant-only",
+            "meaningful",
+        ]
+        assert [session.id for session in all_attempts] == [
+            "empty",
+            "running",
+            "assistant-only",
+            "meaningful",
+        ]
+    finally:
+        store.close()
+
+
+def test_a_session_whose_only_content_was_spoken_stays_listed(tmp_path) -> None:
+    """A voiced mission readback is a transcript, not an empty attempt.
+
+    The session carries no turn text (the readback arrives after hangup and is
+    persisted on the spoken track), yet the detail view and all three exports
+    render it in full. Hiding the row made a conversation the user had heard
+    unreachable.
+    """
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="spoken-only", started_ms=1_000)
+        store.append_event(
+            session_id="spoken-only",
+            turn_id=None,
+            ts_ms=1_500,
+            kind="SpeechSpoken",
+            payload={
+                "text": "Done. The file is in your Outputs folder.",
+                "language": "en",
+                "spoken_kind": "completion",
+            },
+        )
+        _finalize_session(store, session_id="really-empty", started_ms=2_000)
+
+        visible = store.list_sessions(limit=10, include_empty=False)
+
+        assert [session.id for session in visible] == ["spoken-only"]
+        assert visible[0].preview == "Done. The file is in your Outputs folder."
+    finally:
+        store.close()
+
+
+def test_a_silent_spoken_event_does_not_resurrect_an_empty_attempt(tmp_path) -> None:
+    """An event whose text is blank carries nothing to show."""
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="blank-spoken", started_ms=1_000)
+        store.append_event(
+            session_id="blank-spoken",
+            turn_id=None,
+            ts_ms=1_500,
+            kind="SpeechSpoken",
+            payload={"text": "   ", "language": "en", "spoken_kind": "reply"},
+        )
+
+        assert store.list_sessions(limit=10, include_empty=False) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_realtime_transcript_only_call_is_listed_and_can_be_reopened(tmp_path, role) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="live-only", started_ms=1_000)
+        for revision, text in [(1, "Plan"), (2, "Plan the next release")]:
+            store.append_event(
+                session_id="live-only", turn_id=None, ts_ms=1_100 + revision,
+                kind="VoiceTranscriptUpdated",
+                payload={"segment_id": "segment-1", "role": role,
+                         "text": text, "revision": revision, "start_ms": 100},
+            )
+        # Newer empty attempts must not consume the list's limit.
+        _finalize_session(store, session_id="empty", started_ms=3_000)
+        app = FastAPI()
+        app.include_router(chats_routes.router)
+        app.state.session_store = store
+        app.state.chat_store = ChatStore(bus=EventBus())
+        with TestClient(app) as client:
+            response = client.get("/api/chats", params={"limit": 1})
+            detail = client.get("/api/chats/voice/live-only")
+        assert response.status_code == 200
+        assert [(row["kind"], row["id"], row["title"]) for row in response.json()] == [
+            ("voice", "live-only", "Plan the next release"),
+        ]
+        assert detail.status_code == 200
+        assert [(message["role"], message["text"]) for message in detail.json()["messages"]] == [
+            (role, "Plan the next release"),
+        ]
+    finally:
+        store.close()
+
+
+def test_realtime_preview_prefers_the_users_words(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="live-only", started_ms=1_000)
+        for index, (role, text) in enumerate([
+            ("assistant", "How can I help?"), ("user", "Plan the next release"),
+        ]):
+            store.append_event(
+                session_id="live-only", turn_id=None, ts_ms=1_100 + index,
+                kind="VoiceTranscriptUpdated",
+                payload={"segment_id": str(index), "role": role, "text": text, "revision": 1},
+            )
+        assert store.list_sessions(include_empty=False)[0].preview == "Plan the next release"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("payload", [
+    {"segment_id": "s", "role": "user", "text": "   ", "revision": 1},
+    {"segment_id": "s", "role": "system", "text": "Internal event", "revision": 1},
+    {"segment_id": "", "role": "user", "text": "No segment", "revision": 1},
+])
+def test_empty_or_unreadable_realtime_events_stay_out_of_history(tmp_path, payload) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="empty", started_ms=1_000)
+        store.append_event(session_id="empty", turn_id=None, ts_ms=1_100,
+                           kind="VoiceTranscriptUpdated", payload=payload)
+        assert store.list_sessions(include_empty=False) == []
+    finally:
+        store.close()
+
+
+def test_cleared_realtime_segment_does_not_resurrect_empty_call(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="cleared", started_ms=1_000)
+        for revision, text in [(1, "Discarded recognition"), (2, "")]:
+            store.append_event(
+                session_id="cleared", turn_id=None, ts_ms=1_100 + revision,
+                kind="VoiceTranscriptUpdated",
+                payload={"segment_id": "s", "role": "user", "text": text, "revision": revision},
+            )
+        assert store.list_sessions(include_empty=False) == []
+    finally:
+        store.close()
+
+
+def test_turn_history_remains_available_without_sqlite_json1(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(store, session_id="legacy", started_ms=1_000, user_text="Hello")
+        _finalize_session(store, session_id="empty", started_ms=2_000)
+        store._has_json1 = False
+        assert [row.id for row in store.list_sessions(include_empty=False)] == ["legacy"]
+    finally:
+        store.close()
+
+
+def test_empty_attempts_do_not_consume_the_visible_limit(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(
+            store,
+            session_id="meaningful",
+            started_ms=1_000,
+            user_text="Hello",
+        )
+        for index in range(2, 8):
+            _finalize_session(
+                store,
+                session_id=f"empty-{index}",
+                started_ms=index * 1_000,
+            )
+
+        visible = store.list_sessions(limit=1, include_empty=False)
+
+        assert [session.id for session in visible] == ["meaningful"]
+    finally:
+        store.close()
+
+
+def test_sessions_api_hides_empty_attempts_but_keeps_diagnostics_access(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.open()
+    try:
+        _finalize_session(
+            store,
+            session_id="meaningful",
+            started_ms=1_000,
+            user_text="Hello",
+        )
+        _finalize_session(store, session_id="empty", started_ms=2_000)
+        app = FastAPI()
+        app.include_router(sessions_routes.router)
+        app.state.session_store = store
+
+        with TestClient(app) as client:
+            visible = client.get("/api/sessions")
+            all_attempts = client.get(
+                "/api/sessions",
+                params={"include_empty": True},
+            )
+            empty_detail = client.get("/api/sessions/empty")
+
+        assert visible.status_code == 200
+        assert [session["id"] for session in visible.json()] == ["meaningful"]
+        assert all_attempts.status_code == 200
+        assert [session["id"] for session in all_attempts.json()] == [
+            "empty",
+            "meaningful",
+        ]
+        assert empty_detail.status_code == 200
+        assert empty_detail.json()["turns"] == []
+    finally:
+        store.close()

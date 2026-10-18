@@ -1,0 +1,763 @@
+"""Agent chat — effort ladders, the store, the tools, the event reducers."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+from jarvis.agent_chat import effort
+from jarvis.agent_chat.catalog import PROVIDER_ROWS, provider_row
+from jarvis.agent_chat.events import make_event
+from jarvis.agent_chat.runner_api import messages_from_events
+from jarvis.agent_chat.runner_cli import (
+    _ClaudeState,
+    _CodexState,
+    _content_text,
+    _tool_abort_is_recoverable,
+    translate_claude_line,
+    translate_codex_line,
+)
+from jarvis.agent_chat.store import AgentChatStore
+from jarvis.agent_chat.tools import execute_tool, summarize_call
+
+# ---------------------------------------------------------------- effort
+
+
+def test_effort_ladders_are_subsequences_of_the_universal_order():
+    for row in PROVIDER_ROWS:
+        levels = [lvl for lvl in effort.effort_levels(row.id) if lvl]
+        positions = [effort.ORDER.index(lvl) for lvl in levels]
+        assert positions == sorted(positions), row.id
+        default = effort.default_effort(row.id)
+        assert default in effort.effort_levels(row.id), row.id
+
+
+@pytest.mark.parametrize(
+    ("provider", "picked", "expected"),
+    [
+        ("claude-api", "xhigh", "xhigh"),
+        ("claude-api", "none", "low"),
+        ("gemini", "xhigh", "high"),
+        ("gemini", "max", "high"),
+        ("openai-codex", "max", "max"),
+        ("openai-codex", "none", "low"),
+        ("gemini", "ultra", "high"),
+        ("openai", "", ""),
+        ("openai", None, ""),
+        ("grok", "medium", "medium"),
+        ("grok", "max", "xhigh"),
+        ("unknown-provider", "high", "high"),
+        ("openai", "bogus", "medium"),
+    ],
+)
+def test_normalize_effort_folds_onto_the_nearest_offered_level(provider, picked, expected):
+    assert effort.normalize_effort(provider, picked) == expected
+
+
+def test_effort_note_names_the_level_the_turn_runs_on():
+    assert "Reasoning effort for this turn: medium" in effort.effort_note("claude-api", "medium")
+    assert "provider's own default" in effort.effort_note("grok", "")
+    # A provider without an effort knob is told nothing.
+    assert effort.effort_note("kimi", "") == ""
+    # Nor is a model without one (Haiku 4.5, agy's Claude models).
+    assert effort.effort_note("claude-api", "", ()) == ""
+
+
+@pytest.mark.parametrize(
+    ("provider", "picked", "ladder", "expected"),
+    [
+        # Claude Code runs --effort xhigh as high on Opus 4.6: say high.
+        ("claude-api", "xhigh", ("low", "medium", "high", "max"), "high"),
+        ("claude-api", "medium", None, "medium"),
+        # No knob on the model: no level at all.
+        ("claude-api", "medium", (), ""),
+        # "Default" cannot be picked on Claude's ladder: its default level runs.
+        ("claude-api", "", None, "high"),
+        ("openai-codex", "ultra", ("low", "medium", "high", "xhigh", "max"), "max"),
+        ("antigravity", "medium", ("low", "high"), "low"),
+        # A level only the model's live list knows is kept.
+        ("openai-codex", "future", ("future",), "future"),
+        # A ladder with a "Default" entry keeps it.
+        ("grok", "", None, ""),
+    ],
+)
+def test_effort_for_model_is_the_level_the_turn_runs_on(provider, picked, ladder, expected):
+    assert effort.effort_for_model(provider, picked, ladder) == expected
+
+
+def test_catalog_rows_carry_ladders_and_curated_models_for_cli_runners():
+    claude = provider_row("claude-api")
+    assert claude is not None and claude.runner == "claude-cli"
+    d = claude.to_dict()
+    assert d["effort_levels"] == ["low", "medium", "high", "xhigh", "max"]
+    assert d["curated_models"], "CLI-backed rows need a curated list"
+    assert provider_row("openai").models_source == "live"  # type: ignore[union-attr]
+
+
+# ----------------------------------------------------------------- store
+
+
+def test_store_round_trips_sessions_and_events(tmp_path: Path):
+    store = AgentChatStore(tmp_path / "agent_chat.db")
+    s = store.create_session(provider="openai", model="gpt-5.5", effort="high", cwd=str(tmp_path))
+    assert s.title == "" and s.message_count == 0
+
+    ev = store.append_event(s.session_id, make_event("user_message", {"text": "Hallo Welt, bitte"}))
+    assert ev["seq"] == 1
+    delta = store.append_event(s.session_id, make_event("text_delta", {"text": "x"}))
+    assert delta["seq"] == 0, "transient events are never persisted"
+    store.append_event(s.session_id, make_event("assistant_text", {"text": "Hi  there"}))
+
+    again = store.get_session(s.session_id)
+    assert again is not None
+    assert again.title == "Hallo Welt, bitte"
+    assert again.message_count == 1
+    assert again.preview == "Hi there"
+
+    events = store.list_events(s.session_id)
+    assert [e["kind"] for e in events] == ["user_message", "assistant_text"]
+    assert store.list_events(s.session_id, after_seq=1)[0]["kind"] == "assistant_text"
+    # A live preview asks for the newest events only, still oldest first.
+    assert [e["kind"] for e in store.list_events(s.session_id, tail=1)] == ["assistant_text"]
+    assert [e["seq"] for e in store.list_events(s.session_id, tail=5)] == [1, 2]
+
+    # The store keeps whatever id the route validated against the runner's
+    # ladder (jarvis/agent_chat/permissions.py); it does not judge it.
+    updated = store.update_session(s.session_id, effort="low", permission_mode="accept-edits")
+    assert updated is not None and updated.effort == "low"
+    assert updated.permission_mode == "accept-edits"
+    assert store.list_sessions()[0].session_id == s.session_id
+    assert store.delete_session(s.session_id)
+    assert store.get_session(s.session_id) is None
+    assert store.list_events(s.session_id) == []
+    store.close()
+
+
+# ----------------------------------------------------------------- tools
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_file_tools_read_write_edit_glob_grep(tmp_path: Path):
+    out, err = _run(
+        execute_tool("Write", {"file_path": "a/b.txt", "content": "one\ntwo\n"}, cwd=tmp_path)
+    )
+    assert not err and "Created" in out
+    assert (tmp_path / "a" / "b.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+
+    out, err = _run(execute_tool("Read", {"file_path": "a/b.txt"}, cwd=tmp_path))
+    assert not err and "1\tone" in out and "2 lines" in out
+
+    out, err = _run(
+        execute_tool(
+            "Edit",
+            {"file_path": "a/b.txt", "old_string": "two", "new_string": "three"},
+            cwd=tmp_path,
+        )
+    )
+    assert not err and "1 replacement" in out
+
+    out, err = _run(
+        execute_tool(
+            "Edit", {"file_path": "a/b.txt", "old_string": "zzz", "new_string": "q"}, cwd=tmp_path
+        )
+    )
+    assert err and "not found" in out
+
+    out, err = _run(execute_tool("Glob", {"pattern": "**/*.txt"}, cwd=tmp_path))
+    assert not err and "a/b.txt" in out
+
+    out, err = _run(execute_tool("Grep", {"pattern": "thr.e", "glob": "*.txt"}, cwd=tmp_path))
+    assert not err and "a/b.txt:2:three" in out
+
+    out, err = _run(execute_tool("Ls", {}, cwd=tmp_path))
+    assert not err and "a/" in out
+
+    out, err = _run(execute_tool("Read", {"file_path": "missing.txt"}, cwd=tmp_path))
+    assert err
+
+
+def test_run_command_returns_output_and_exit_code(tmp_path: Path):
+    out, err = _run(execute_tool("RunCommand", {"command": "echo agent-chat-ok"}, cwd=tmp_path))
+    assert not err
+    assert "agent-chat-ok" in out and "[exit 0" in out
+
+
+def test_unknown_tool_is_an_error_not_a_crash(tmp_path: Path):
+    out, err = _run(execute_tool("Nope", {}, cwd=tmp_path))
+    assert err and "Unknown tool" in out
+
+
+def test_summarize_call_picks_the_human_field():
+    assert summarize_call("RunCommand", {"command": "git status\n--porcelain"}) == "git status"
+    assert summarize_call("Edit", {"file_path": "x.py"}) == "x.py"
+    assert summarize_call("Ls", {}) == "."
+
+
+# -------------------------------------------------------- history replay
+
+
+def test_messages_from_events_rebuilds_rounds_and_closes_dangling_calls():
+    events = [
+        make_event("user_message", {"text": "hi"}),
+        make_event("turn_started", {"turn_id": "t1"}),
+        make_event("assistant_text", {"turn_id": "t1", "text": "let me look"}),
+        make_event("tool_call", {"turn_id": "t1", "call_id": "c1", "name": "Ls", "input": {}}),
+        make_event(
+            "tool_result", {"turn_id": "t1", "call_id": "c1", "output": "a/\nb", "is_error": False}
+        ),
+        make_event("assistant_text", {"turn_id": "t1", "text": "done"}),
+        make_event("turn_finished", {"turn_id": "t1", "status": "done"}),
+        make_event("user_message", {"text": "again"}),
+        make_event("turn_started", {"turn_id": "t2"}),
+        make_event("tool_call", {"turn_id": "t2", "call_id": "c2", "name": "Ls", "input": {}}),
+        make_event("turn_finished", {"turn_id": "t2", "status": "cancelled"}),
+    ]
+    msgs = messages_from_events(events)
+    roles = [m.role for m in msgs]
+    assert roles == ["user", "assistant", "tool", "assistant", "user", "assistant", "tool"]
+    first_assistant = msgs[1]
+    assert isinstance(first_assistant.content, list)
+    assert [b["type"] for b in first_assistant.content] == ["text", "tool_use"]
+    assert msgs[2].tool_call_id == "c1"
+    # The cancelled round's tool call got a synthetic result so the next
+    # request is well-formed.
+    assert msgs[-1].tool_call_id == "c2"
+    assert "cancelled" in json.dumps(msgs[-1].content)
+
+
+# ---------------------------------------------------------- CLI shapes
+
+
+def test_claude_stream_translation_streams_then_finalizes():
+    st = _ClaudeState(turn_id="t")
+    lines = [
+        {"type": "system", "subtype": "init", "session_id": "sess-1"},
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "hmm"},
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"id": "m1", "content": [{"type": "thinking", "thinking": "hmm"}]},
+        },
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "he"},
+            },
+        },
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "llo"},
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"id": "m1", "content": [{"type": "text", "text": "hello"}]},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "ls"}}
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu1",
+                        "content": "a b",
+                        "is_error": False,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "total_cost_usd": 0.01,
+            "usage": {"output_tokens": 5},
+        },
+    ]
+    kinds: list[str] = []
+    for obj in lines:
+        for ev in translate_claude_line(obj, st):
+            kinds.append(ev["kind"])
+            if ev["kind"] == "assistant_text":
+                assert ev["payload"]["text"] == "hello"
+                assert ev["payload"]["message_id"] == "m1"
+            if ev["kind"] == "tool_call":
+                assert ev["payload"]["summary"] == "ls"
+    assert kinds == [
+        "reasoning_delta",
+        "reasoning",
+        "text_delta",
+        "text_delta",
+        "assistant_text",
+        "tool_call",
+        "tool_result",
+    ]
+    assert st.vendor_session == "sess-1"
+    assert st.cost_usd == 0.01 and st.usage == {"output_tokens": 5} and st.status == "done"
+
+
+def test_grok_cancelled_tool_payload_is_readable_and_recoverable() -> None:
+    """Print-mode Grok wraps a cancelled tool as nested ``content`` blocks.
+
+    The chat used to show raw JSON and then mark the whole turn Failed, so
+    the model never got a second round (live Bot ersteller, 2026-09-17).
+    """
+    nested = [
+        {
+            "type": "content",
+            "content": {
+                "type": "text",
+                "text": "User cancelled the execution of tool 'run_terminal_command'",
+            },
+        }
+    ]
+    text = _content_text(nested)
+    assert "User cancelled the execution of tool" in text
+    assert _tool_abort_is_recoverable(text)
+    assert not _tool_abort_is_recoverable("exited with code 3")
+    assert not _tool_abort_is_recoverable(None)
+
+    st = _ClaudeState(turn_id="t")
+    events = translate_claude_line(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu1",
+                        "is_error": True,
+                        "content": nested,
+                    }
+                ]
+            },
+        },
+        st,
+    )
+    assert events[0]["payload"]["is_error"]
+    assert "User cancelled" in events[0]["payload"]["output"]
+    assert st.last_tool_error is not None and "User cancelled" in st.last_tool_error
+
+    translate_claude_line({"type": "result", "subtype": "error", "is_error": True}, st)
+    assert st.status == "error"
+    assert st.error is not None and _tool_abort_is_recoverable(st.error)
+
+
+def test_streamed_text_counts_as_an_answer_so_the_result_line_never_repeats_it():
+    """A turn cut short must not print its answer a second time.
+
+    The closing ``result`` line carries the whole answer again, and the runner
+    falls back to it for a turn that produced no text at all. Streamed deltas
+    therefore have to mark the turn as answered: without that, a stream that
+    ends before its closing ``assistant`` message — Stop, a crash, a killed
+    CLI — replayed the same text under a fresh message id, and the chat showed
+    it twice (maintainer, 2026-08-25).
+    """
+    st = _ClaudeState(turn_id="t")
+    lines = [
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "half an answer"},
+            },
+        },
+    ]
+    for obj in lines:
+        translate_claude_line(obj, st)
+    assert st.emitted_text is True
+
+
+def test_codex_stream_translation_maps_items_to_tools():
+    st = _CodexState(turn_id="t")
+    lines = [
+        {"type": "thread.started", "thread_id": "th-9"},
+        {"type": "turn.started"},
+        {
+            "type": "item.started",
+            "item": {"id": "i1", "type": "command_execution", "command": "pytest -q"},
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "i1",
+                "type": "command_execution",
+                "command": "pytest -q",
+                "aggregated_output": "3 passed",
+                "exit_code": 0,
+            },
+        },
+        {"type": "item.completed", "item": {"id": "i2", "type": "reasoning", "text": "thinking"}},
+        {
+            "type": "item.completed",
+            "item": {"id": "i3", "type": "agent_message", "text": "All green."},
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 4}},
+    ]
+    kinds = [ev["kind"] for obj in lines for ev in translate_codex_line(obj, st)]
+    assert kinds == ["tool_call", "tool_result", "reasoning", "assistant_text"]
+    assert st.vendor_session == "th-9"
+    assert st.usage == {"input_tokens": 10, "output_tokens": 4}
+    assert st.emitted_text
+
+
+def test_claude_redacted_thinking_is_announced_and_tokens_count_live():
+    """Claude Code redacts thinking: the UI still learns WHEN it thinks and how many tokens flow."""
+    st = _ClaudeState(turn_id="t")
+    lines = [
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""},
+            },
+        },
+        # Redacted: the finished block carries no text, only that it happened.
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [{"type": "thinking", "thinking": ""}],
+                "usage": {"input_tokens": 3, "output_tokens": 40},
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 3, "output_tokens": 55},
+            },
+        },
+        {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "m2"}},
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m2",
+                "content": [{"type": "text", "text": "more"}],
+                "usage": {"input_tokens": 1, "output_tokens": 10},
+            },
+        },
+    ]
+    events = [ev for obj in lines for ev in translate_claude_line(obj, st)]
+    kinds = [ev["kind"] for ev in events]
+    assert kinds[:3] == ["reasoning_started", "usage_delta", "reasoning"]
+    # The same message re-reporting its usage replaces, a new message adds.
+    usage = [ev["payload"]["usage"] for ev in events if ev["kind"] == "usage_delta"]
+    assert usage[0] == {"input_tokens": 3, "output_tokens": 40}
+    assert usage[1] == {"input_tokens": 3, "output_tokens": 55}
+    assert usage[-1] == {"input_tokens": 4, "output_tokens": 65}
+    reasoning = next(ev for ev in events if ev["kind"] == "reasoning")
+    assert reasoning["payload"]["text"] == ""
+    assert reasoning["payload"]["duration_ms"] is not None
+
+
+def test_claude_live_usage_counts_cache_and_never_walks_back():
+    """The real CLI shape: the cache carries the turn, output starts as a placeholder.
+
+    A warm session reports two new input tokens beside fifty thousand cached
+    ones, and ``output_tokens: 1`` until the ``result`` line lands. Counting
+    only the two uncached fields made a 50k-token turn read as "10 tokens"
+    (BUG-173).
+    """
+    st = _ClaudeState(turn_id="t")
+    lines = [
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 2,
+                    "cache_creation_input_tokens": 30420,
+                    "cache_read_input_tokens": 21355,
+                    "output_tokens": 1,
+                },
+            },
+        },
+        # The same message reported again with the true output count.
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 2,
+                    "cache_creation_input_tokens": 30420,
+                    "cache_read_input_tokens": 21355,
+                    "output_tokens": 412,
+                },
+            },
+        },
+        # …and once more as the placeholder: it must not undo the real count.
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        },
+    ]
+    events = [ev for obj in lines for ev in translate_claude_line(obj, st)]
+    usage = [ev["payload"]["usage"] for ev in events if ev["kind"] == "usage_delta"]
+    assert usage[0] == {
+        "input_tokens": 2,
+        "cache_creation_input_tokens": 30420,
+        "cache_read_input_tokens": 21355,
+        "output_tokens": 1,
+    }
+    assert usage[-1]["output_tokens"] == 412
+    assert usage[-1]["cache_read_input_tokens"] == 21355
+    assert usage[-1]["cache_creation_input_tokens"] == 30420
+
+
+def test_codex_reasoning_start_is_announced():
+    st = _CodexState(turn_id="t")
+    lines = [
+        {"type": "item.started", "item": {"id": "r1", "type": "reasoning"}},
+        {"type": "item.completed", "item": {"id": "r1", "type": "reasoning", "text": "plan"}},
+    ]
+    kinds = [ev["kind"] for obj in lines for ev in translate_codex_line(obj, st)]
+    assert kinds == ["reasoning_started", "reasoning"]
+
+
+# ---------------------------------------------------------------- runners
+
+
+def test_resolve_runner_per_surface(monkeypatch):
+    """Jarvis runs API seats through its brain and preserves coding CLI seats."""
+    from jarvis.agent_chat import service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "_claude_cli_installed", lambda: False)
+    assert svc_mod.resolve_runner("openai") == "api"
+    assert svc_mod.resolve_runner("openai", surface="jarvis") == "brain"
+    assert svc_mod.resolve_runner("ollama", surface="jarvis") == "brain"
+    assert svc_mod.resolve_runner("claude-api") == "api"
+    assert svc_mod.resolve_runner("claude-api", surface="jarvis") == "brain"
+    assert svc_mod.resolve_runner("openai-codex", surface="jarvis") == "codex-cli"
+    assert svc_mod.resolve_runner("antigravity", surface="jarvis") == "agy-cli"
+    assert svc_mod.resolve_runner("openai-codex", surface="agent") == "codex-cli"
+    assert svc_mod.resolve_runner("antigravity", surface="agent") == "agy-cli"
+    monkeypatch.setattr(svc_mod, "_claude_cli_installed", lambda: True)
+    assert svc_mod.resolve_runner("claude-api") == "claude-cli"
+    assert svc_mod.resolve_runner("claude-api", surface="jarvis") == "claude-cli"
+    # API-only surfaces still resolve Claude to the brain with its CLI installed.
+    assert svc_mod.resolve_runner("claude-api", surface="local-models") == "brain"
+    assert svc_mod.resolve_runner("openai-codex", surface="local-models") == "unknown"
+    assert svc_mod.resolve_runner("no-such-provider", surface="jarvis") == "unknown"
+
+
+def test_an_agent_can_pin_claude_to_its_api_key_or_its_subscription(monkeypatch):
+    """The "New agent" dialog's access choice beats the API Keys page's setting."""
+    from jarvis.agent_chat import agent_provider_prefs
+    from jarvis.agent_chat import service as svc_mod
+    from jarvis.agent_chat.catalog import API_KEY_ACCOUNT, SUBSCRIPTION_ACCOUNT
+
+    monkeypatch.setattr(svc_mod, "_claude_cli_installed", lambda: True)
+    monkeypatch.setattr(agent_provider_prefs, "forces_api", lambda *_: False)
+    api_runner = svc_mod.resolve_runner("openai", surface="society")
+    assert svc_mod.resolve_runner("claude-api", surface="society") == "claude-cli"
+    assert (
+        svc_mod.resolve_runner("claude-api", surface="society", account_id=API_KEY_ACCOUNT)
+        == api_runner
+    )
+    monkeypatch.setattr(agent_provider_prefs, "forces_api", lambda *_: True)
+    assert svc_mod.resolve_runner("claude-api", surface="society") == api_runner
+    assert (
+        svc_mod.resolve_runner("claude-api", surface="society", account_id=SUBSCRIPTION_ACCOUNT)
+        == "claude-cli"
+    )
+    # A real login id keeps the page's setting, exactly as before.
+    assert svc_mod.resolve_runner("claude-api", surface="society", account_id="acct") == api_runner
+    # Only the dual row reads the pin.
+    assert svc_mod.resolve_runner("openai-codex", account_id=API_KEY_ACCOUNT) == "codex-cli"
+
+
+def test_a_reserved_access_value_never_names_a_login():
+    from jarvis.agent_chat.catalog import API_KEY_ACCOUNT, SUBSCRIPTION_ACCOUNT
+    from jarvis.agent_chat.runner_cli import _login_id
+
+    assert _login_id(API_KEY_ACCOUNT) == "" and _login_id(SUBSCRIPTION_ACCOUNT) == ""
+    assert _login_id("acct-1") == "acct-1" and _login_id("") == ""
+
+
+def test_the_jarvis_surface_offers_api_and_cli_seats():
+    """Jarvis shares the IDE's provider seats; API-only surfaces remain filtered."""
+    from jarvis.agent_chat.catalog import PROVIDER_ROWS, offers, rows_for
+    from jarvis.agent_chat.runner_api import supports_api_runner
+
+    jarvis_ids = [row.id for row in rows_for("jarvis")]
+    assert jarvis_ids == [row.id for row in rows_for("agent")]
+    for cli_row in ("openai-codex", "antigravity", "grok-build"):
+        assert offers("jarvis", cli_row)
+        assert offers("agent", cli_row)
+        assert not offers("local-models", cli_row)
+    api_ids = [row.id for row in rows_for("local-models")]
+    assert api_ids and all(supports_api_runner(pid) for pid in api_ids)
+    assert [row.id for row in rows_for("agent")] == [row.id for row in PROVIDER_ROWS]
+
+
+def test_cli_seat_creation_follows_the_surface_capability(tmp_path):
+    """CLI seats can be created on Jarvis and the IDE, but not API-only surfaces."""
+    from jarvis.agent_chat.service import AgentChatService
+    from jarvis.agent_chat.store import AgentChatStore
+
+    svc = AgentChatService(AgentChatStore(":memory:"), default_cwd=lambda: str(tmp_path))
+    for surface in ("jarvis", "agent"):
+        session = svc.create_session(provider="openai-codex", surface=surface, cwd=str(tmp_path))
+        assert (session.provider, session.surface) == ("openai-codex", surface)
+    with pytest.raises(ValueError, match="not offered"):
+        svc.create_session(provider="openai-codex", surface="local-models")
+
+
+@pytest.mark.parametrize("cli_seats", [True, False])
+def test_cli_seat_retirement_follows_the_surface_capability(tmp_path, monkeypatch, cli_seats):
+    """Keep supported CLI seats; retain migration coverage for an API-only kit."""
+    from dataclasses import replace
+
+    from jarvis.agent_chat import surface_kits
+    from jarvis.agent_chat.service import AgentChatService
+    from jarvis.agent_chat.store import AgentChatStore
+
+    if not cli_seats:
+        monkeypatch.setitem(
+            surface_kits._KITS,
+            "jarvis",
+            replace(surface_kits.kit_for("jarvis"), cli_seats=False),
+        )
+    store = AgentChatStore(":memory:")
+    # ``gpt-5.2`` is in Codex's own catalog and not in OpenAI's, so it goes.
+    codex = store.create_session(
+        provider="openai-codex", model="gpt-5.2", effort="high", cwd=".", surface="jarvis"
+    )
+    # One the API does know rides along rather than resetting for nothing.
+    shared = store.create_session(
+        provider="openai-codex", model="gpt-5.5", effort="high", cwd=".", surface="jarvis"
+    )
+    claude = store.create_session(
+        provider="claude-api", model="opusplan", effort="high", cwd=".", surface="jarvis"
+    )
+    kept = store.create_session(
+        provider="claude-api", model="claude-opus-5", effort="high", cwd=".", surface="agent"
+    )
+    history = store.append_event(codex.session_id, make_event("user_message", {"text": "hi"}))
+    before = store.get_session(codex.session_id).updated_ms
+
+    AgentChatService(store, default_cwd=lambda: str(tmp_path))
+
+    moved = store.get_session(codex.session_id)
+    assert (moved.provider, moved.model) == (
+        ("openai-codex", "gpt-5.2") if cli_seats else ("openai", "")
+    )
+    assert (
+        store.get_session(shared.session_id).provider,
+        store.get_session(shared.session_id).model,
+    ) == (
+        "openai-codex" if cli_seats else "openai",
+        "gpt-5.5",
+    )
+    # The list order is by updated_ms; a migration must not reshuffle it.
+    assert moved.updated_ms == before
+    assert store.list_events(codex.session_id) == [history]
+    # Only an API-only kit retires Claude's CLI-specific model id.
+    assert store.get_session(claude.session_id).provider == "claude-api"
+    assert store.get_session(claude.session_id).model == ("opusplan" if cli_seats else "")
+    # The IDE's chat is untouched.
+    assert store.get_session(kept.session_id).provider == "claude-api"
+    assert store.get_session(kept.session_id).model == "claude-opus-5"
+
+
+def test_claude_live_usage_follows_the_stream_and_the_message_end():
+    """The live counter tracks real output, not the start-of-message placeholder.
+
+    Claude Code reports a message's true ``output_tokens`` only in the
+    ``message_delta`` that ends it; every ``assistant`` snapshot before that
+    carries a placeholder. The counter read "Working 28s · 39 tokens" on a
+    turn that ended at 11k. Streamed text and tool input now count as they
+    arrive, and the message end sets the real number.
+    """
+    st = _ClaudeState(turn_id="t")
+    lines = [
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}},
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        },
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "x" * 400},
+            },
+        },
+        {
+            "type": "stream_event",
+            "event": {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 180}},
+        },
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m2"}}},
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "y" * 200},
+            },
+        },
+    ]
+    events = [ev for obj in lines for ev in translate_claude_line(obj, st)]
+    usage = [ev["payload"]["usage"] for ev in events if ev["kind"] == "usage_delta"]
+    output = [u["output_tokens"] for u in usage]
+    # Placeholder, then the streamed tool input (400 chars ≈ 100 tokens), then
+    # the message's real count, then the next message streaming on top.
+    assert output == [2, 100, 180, 230]
+    # A few streamed characters do not send an update of their own.
+    quiet = _ClaudeState(turn_id="q")
+    tiny = {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"},
+        },
+    }
+    assert [ev for ev in translate_claude_line(tiny, quiet) if ev["kind"] == "usage_delta"] == []

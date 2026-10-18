@@ -1,0 +1,355 @@
+# Desktop installers
+
+How Personal Jarvis becomes a one-click download, how each installer is built
+and signed, and how an installed copy keeps itself up to date.
+
+This is the maintainer's page. A user never reads it: they press one button on
+the website, run a normal install wizard, and the app updates itself afterwards.
+
+---
+
+## 1. What a release publishes
+
+Every `v*.*.*` tag produces these assets on the GitHub Release. The names are a
+contract - the website's download button and the in-app updater both resolve
+`https://github.com/PersonalJarvis/PersonalJarvis/releases/latest/download/<name>`:
+
+| Asset                                  | Platform                                  |
+| -------------------------------------- | ----------------------------------------- |
+| `PersonalJarvis-Setup-x64.exe`         | Windows 10/11 x64, per-user Inno Setup    |
+| `PersonalJarvis-macOS-arm64.dmg`       | Apple Silicon                             |
+| `PersonalJarvis-macOS-x64.dmg`         | Intel Mac                                 |
+| `PersonalJarvis-Linux-x86_64.AppImage` | Linux x86_64                              |
+| `installers-SHA256SUMS.txt`            | what the updater verifies every download against |
+
+The terminal one-liner and `pipx install personal-jarvis` stay supported. They
+produce a *managed* or *dev* install, which updates through git - see
+[section 6](#6-how-an-installed-copy-updates-itself).
+
+---
+
+## 2. The frozen bundle
+
+Everything starts from one PyInstaller build:
+
+```bash
+pyinstaller jarvis.spec --noconfirm --clean
+```
+
+`onedir`, not `onefile`: no 3-5 second extraction on every launch, and each DLL
+can be signed on its own.
+
+It produces **two executables that share one payload**:
+
+| Binary                    | Console? | What it is                                                       |
+| ------------------------- | -------- | ---------------------------------------------------------------- |
+| `PersonalJarvis` (`.exe`) | no       | the windowed app - Start Menu, Dock, `.desktop`                   |
+| `jarvis` (`.exe`)         | yes      | the CLI: `jarvis serve`, `jarvis --version`, `jarvis missions list` |
+
+Both run `jarvis/__main__.py`, so the CLI from a native install behaves exactly
+like the pip console script.
+
+> **Why the GUI binary is not called `Jarvis`.** `Jarvis` and `jarvis` are the
+> same path on Windows (NTFS) and on a default macOS APFS volume, so one would
+> silently overwrite the other. `PersonalJarvis` is the name
+> `jarvis.core.branding` already uses for the Windows branded launcher and the
+> macOS bundle executable.
+
+Layout:
+
+- Windows / Linux: `dist/Jarvis/` with both binaries plus `_internal/`
+- macOS: `dist/Personal Jarvis.app`, CLI at `Contents/MacOS/jarvis`
+
+### Where a frozen install keeps user data
+
+`packaging/pyinstaller_rthook_frozen.py` runs before anything imports `jarvis`
+and points the two documented overrides at the per-user application directory:
+
+- `JARVIS_CONFIG` -> `%LOCALAPPDATA%\Jarvis\jarvis.toml` (`~/.jarvis/jarvis.toml`
+  off Windows), seeded once from the copy inside the bundle
+- `JARVIS_DATA_DIR` -> `<that directory>/data`
+
+Without it, `jarvis.core.config` would anchor both to the bundle's own
+directory, where an in-place upgrade overwrites the user's settings and an
+uninstall deletes their memory. An explicitly exported `JARVIS_CONFIG` /
+`JARVIS_DATA_DIR` still wins, so a maintainer can point a frozen build at a
+scratch directory.
+
+---
+
+## 3. Building each installer
+
+All three scripts do the same three things: build the frontend if
+`jarvis/ui/web/dist` is missing, run PyInstaller, package the result into
+`dist/installers/`. Each prints the artifact path and exits non-zero on failure.
+
+### Windows
+
+```powershell
+pwsh packaging/windows/build.ps1
+# -> dist/installers/PersonalJarvis-Setup-x64.exe
+```
+
+Needs Node 22+, Python 3.12 with `pip install -e ".[desktop,dev]"`, and Inno
+Setup 6 (`winget install --id JRSoftware.InnoSetup -e`). The script finds
+`ISCC.exe` on `PATH`, under `Program Files (x86)`, or in
+`%LOCALAPPDATA%\Programs\Inno Setup 6`.
+
+Two flags shorten the loop: `-SkipPyInstaller` repackages the existing
+`dist/Jarvis` (seconds instead of ~12 minutes) and `-SkipFrontend` refuses to
+run npm.
+
+The wizard itself is `packaging/windows/PersonalJarvis.iss`:
+
+- **per-user** (`PrivilegesRequired=lowest`, `{localappdata}\Programs\Personal
+  Jarvis`) - no administrator prompt, exactly like Chrome. This is also what
+  lets the in-app updater run the upgrade unattended.
+- a **fixed `AppId` GUID** so every future setup upgrades in place instead of
+  adding a second entry to "Installed apps"
+- Start Menu shortcut; optional desktop shortcut (off by default)
+- optional **"Add the `jarvis` command to PATH"** (on by default). Implemented
+  in `[Code]` against `HKCU\Environment` and broadcast with `WM_SETTINGCHANGE`,
+  so a newly opened terminal sees it without a sign-out. Adding is idempotent,
+  and clearing the task on an upgrade removes the entry again.
+- `CloseApplications=yes` so Restart Manager closes a running Personal Jarvis
+  instead of failing on locked files
+- LZMA2/max, `x64compatible` only, `MinVersion=10.0`
+
+### macOS
+
+```bash
+./packaging/macos/build.sh
+# -> dist/installers/PersonalJarvis-macOS-<arm64|x64>.dmg
+```
+
+Owned by `packaging/macos/`. It reads `APPLE_CERTIFICATE_P12_BASE64` and
+`APPLE_CERTIFICATE_PASSWORD` (imported into a throw-away keychain before the long
+freeze, so an unusable certificate fails early), `APPLE_SIGNING_IDENTITY`
+(optional: read from the imported certificate when absent), `APPLE_ID`,
+`APPLE_TEAM_ID` and `APPLE_APP_SPECIFIC_PASSWORD`; with none of them set it
+ad-hoc signs, skips notarization and prints a one-line notice. The `.app`'s
+identity (bundle id, minimum system version) comes from the `BUNDLE` block in
+`jarvis.spec`. The usage strings macOS shows in its permission dialogs
+(microphone, screen capture, Apple events, the Desktop / Documents / Downloads /
+removable-volume / network-volume folders, local network) come from ONE table,
+`jarvis/core/macos_privacy_strings.py`, which `jarvis.spec` and the managed
+source-install app both load by path, so the two apps cannot drift apart. The same
+table carries the German and Spanish versions: `jarvis.spec` declares the languages
+(`CFBundleLocalizations`) and `build.sh` writes
+`Contents/Resources/{de,es}.lproj/InfoPlist.strings` into the finished `.app`
+(`packaging/macos/add_localizations.py`) BEFORE it signs it, because the files are
+part of the code seal. There
+is deliberately no camera string, no speech-recognition string and no camera
+entitlement: Jarvis has no caller for either. The entitlements embedded by the
+Developer ID path live in `packaging/macos/entitlements.plist` (no comments; the
+reasoning is in `packaging/macos/README.md`).
+
+Several things in that block are easy to get wrong and invisible to a headless
+smoke run, so the macOS job checks the finished bundle
+(`python scripts/ci/check_frozen_macos_app.py --app "dist/Personal Jarvis.app"`):
+
+- `LSBackgroundOnly` must be `False`. PyInstaller sets it to true whenever the
+  last executable of the bundle is a console one (the `jarvis` CLI is), and
+  LaunchServices then treats the app as having no Dock icon and no windows.
+- The pyobjc frameworks the permission code loads by name (`AVFoundation`
+  above all) must be in the frozen archive. That needs the `desktop-macos` extra
+  on the build machine; the macOS job installs it.
+- Every usage string of the table must be in `Info.plist` with exactly that
+  text, and the removed keys must not be.
+- The bundle must declare its German and Spanish localisation, and each
+  `{de,es}.lproj/InfoPlist.strings` must exist with exactly the text of the table.
+- On a signed build, `codesign -d --entitlements :-` must report every
+  entitlement of `entitlements.plist` and not the camera one. An ad-hoc or
+  unsigned build embeds no entitlements, so the check skips itself with a NOTE
+  line; that is a skip, not a pass, and the hardened-runtime behaviour of a
+  signed build has never been run on a Mac (unverified).
+
+The frozen smoke boots the app twice and, on macOS, also reads its permission
+status each time: a microphone row that reads "unavailable" means the framework
+did not load inside the app (the check above only sees that the module is in the
+archive). The v2.5.0 image shipped with the first two defects (BUG-222).
+
+**Permission prompts.** Personal Jarvis asks for a macOS permission at the moment
+a feature you start needs it (the first dictation asks for the microphone, the
+first screen capture for Screen Recording, and so on) and never at launch;
+nothing is requested up front and no banner or wizard nags. Apple's own dialog or
+System Settings pane does the asking and the app draws nothing around it. Declining
+a permission degrades that one feature and leaves the rest of the app working; the
+app then shows one short toast with one click to the right System Settings pane.
+The dialog text is German and Spanish on a German or Spanish Mac (the build writes
+the `.lproj` strings before signing). `jarvis permissions reset <permission>` makes
+macOS ask again. This is the designed behaviour; it has not been exercised on a real
+Mac yet (unverified). The
+downloaded app and the managed source-install app are separate apps to macOS
+(`ai.personaljarvis.desktop` and `com.personal-jarvis.desktop`) and each keeps its
+own grants.
+
+### Linux
+
+```bash
+./packaging/linux/build.sh
+# -> dist/installers/PersonalJarvis-Linux-x86_64.AppImage
+```
+
+Owned by `packaging/linux/`. Built on the oldest supported runner
+(`ubuntu-22.04`) because an AppImage inherits the glibc of the machine that
+built it.
+
+---
+
+## 4. Signing
+
+Signing is optional everywhere. Without secrets the build still produces a
+working installer and says, in one line, that it is unsigned.
+
+| Platform | Mechanism                    | Secrets                                                                                                     |
+| -------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Windows  | SignPath Foundation (preferred) | secret `SIGNPATH_API_TOKEN`; variables `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` (optional `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`) |
+| Windows  | Azure Trusted Signing (alternative) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SIGNING_ENDPOINT`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERTIFICATE_PROFILE` |
+| macOS    | Developer ID + notarization  | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD` (and optionally `APPLE_SIGNING_IDENTITY`; `build.sh` reads it from the imported certificate) |
+| Linux    | none (AppImage is unsigned)  | -                                                                                                             |
+
+Private key material only ever exists as a GitHub Actions secret (AP-29); no
+signing step ever reads a file from the repository.
+
+Without the macOS secrets the published `.dmg` is ad-hoc signed and not
+notarized: macOS blocks the first launch (System Settings > Privacy & Security >
+Open Anyway) and treats every update as a new app, so every permission is asked
+for again. `packaging/macos/build.sh` is written to import the certificate into
+a temporary keychain on the runner and read the signing identity from it; that
+step has been rehearsed (`DRY_RUN`) and run against a stand-in `security`
+command, but not yet against a real keychain or with an Apple account.
+`packaging/macos/README.md` lists how to obtain the certificate.
+
+A run started by hand from a branch (`workflow_dispatch`) builds the installers
+without publishing a release, which is the way to try the macOS job, its
+certificate import and the app probe before tagging.
+
+The Windows SignPath path and its team roles are described in
+[`code-signing-policy.md`](code-signing-policy.md). The workflow uploads the
+unsigned setup as a workflow artifact, waits up to an hour for the manual
+approval in SignPath, then refuses the signed file unless
+`Get-AuthenticodeSignature` reports a valid, timestamped signature issued to
+SignPath Foundation. When both SignPath and Azure are configured, SignPath
+is used.
+
+On Windows the workflow signs the **setup executable**. That is the file the
+browser marks with Mark-of-the-Web, so it is the signature SmartScreen weighs;
+files the installer then writes carry no MOTW of their own. Signing the inner
+binaries as well (run PyInstaller, sign `dist/Jarvis`, then
+`build.ps1 -SkipPyInstaller`) mainly helps against antivirus false positives on
+PyInstaller bootloaders, and can be added the same way.
+
+---
+
+## 5. Releasing
+
+`.github/workflows/desktop-installers.yml` runs on a `v*.*.*` tag push (or
+manually via `workflow_dispatch`):
+
+1. `windows`, `macos` (arm64 + x64) and `linux` each install Python 3.12 and
+   Node 22, `pip install -e ".[desktop,dev]"` (macOS adds `desktop-macos`), run
+   their OS build script and upload the artifact. The macOS jobs also read the
+   finished `.app` with `scripts/ci/check_frozen_macos_app.py` before the
+   headless smoke test.
+2. `release` downloads all of them, refuses to continue if any promised asset is
+   missing, verifies the tag equals `jarvis.__version__`, writes
+   `installers-SHA256SUMS.txt` (plain `sha256sum` format, flat file names),
+   re-verifies it with `sha256sum -c`, and attaches everything to the Release.
+
+`contents: write` is granted to that last job only.
+
+The version check matters twice over: a tag that disagrees with
+`jarvis.__version__` publishes installers nobody can trace back to a commit, and
+the updater compares the release version against `jarvis.__version__` - so a
+mismatch would offer an update that installs the same build forever.
+
+---
+
+## 6. How an installed copy updates itself
+
+`GET /api/update/status` and `POST /api/update/apply` serve all install kinds
+behind one "Update Now" button. `jarvis.core.frozen.is_frozen()` is the only
+switch between them.
+
+| Kind        | Detected by                          | Update path                                    |
+| ----------- | ------------------------------------ | ---------------------------------------------- |
+| **frozen**  | `sys.frozen` + `sys._MEIPASS`        | download the next installer asset, verify, install |
+| **managed** | install marker + official `origin`   | `git fetch` the published tag, reinstall       |
+| **dev**     | anything else                        | never updates                                  |
+
+For a frozen install (`jarvis/core/installer_update.py`):
+
+1. **Pick the asset.** OS plus CPU architecture map to exactly one name from the
+   table in section 1. No mapping (Windows on ARM, Linux on aarch64) means the
+   button never appears.
+2. **Refuse to offer what cannot be installed.** `status` reports
+   `update_available: true` only when the release actually carries both this
+   platform's installer and `installers-SHA256SUMS.txt`. Status is fail-open:
+   any network error reports "no update", never an error.
+3. **Verify before executing.** `apply` downloads to a temp directory under a
+   size cap, computes SHA-256 and compares it against the manifest **of the same
+   release**. A mismatch, a missing entry, an oversized body or an unreachable
+   manifest all delete the download and refuse. Apply is fail-closed.
+4. **Hand over to the platform.**
+   - Windows: runs the new `Setup.exe` detached with
+     `/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART`. Restart
+     Manager closes the app, the files are replaced, the app comes back.
+   - macOS: `hdiutil attach` the DMG, swap the running `.app` with two renames
+     on one filesystem (the old bundle is put back if the second rename fails),
+     `hdiutil detach`, relaunch with `open`.
+   - Linux: copy the new AppImage next to the running one, `chmod +x`,
+     `os.replace` onto `$APPIMAGE` (atomic), relaunch.
+
+The response says `restart_required: false`, because the handover restarts the
+app itself. A caller that restarts anyway is harmless - the single-instance lock
+still holds - but the honest answer is "no restart needed from you".
+
+Managed installs keep today's behaviour untouched: the frozen branch is entered
+only when `is_frozen()` is true, and the frozen branch never runs git.
+
+---
+
+## 7. What an uninstall keeps
+
+The Windows uninstaller removes the **program directory only**
+(`%LOCALAPPDATA%\Programs\Personal Jarvis`) and its PATH entry, Start Menu
+shortcut and uninstall registry key.
+
+It deliberately keeps **`%LOCALAPPDATA%\Jarvis`** - `jarvis.toml`, memory,
+skills, logs, the chat database. Uninstalling and reinstalling therefore returns
+the user to their own configured app, not to a blank one. The uninstall
+confirmation says so. To remove that too, delete the directory by hand or run
+`jarvis --uninstall` before uninstalling.
+
+API keys are not in that directory: they live in the OS credential store
+(Windows Credential Manager / Keychain / Secret Service) and survive both.
+
+---
+
+## 8. Verifying a build by hand
+
+```bash
+# the CLI works from the bundle
+dist/Jarvis/jarvis.exe --version
+
+# the backend really boots (Ctrl-C to stop)
+dist/Jarvis/jarvis.exe serve
+curl http://127.0.0.1:<admin_api_port>/api/health
+
+# a full install / upgrade / uninstall cycle, unattended
+PersonalJarvis-Setup-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\pj-test" /LOG=install.log
+C:\pj-test\jarvis.exe --version
+PersonalJarvis-Setup-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\pj-test"   # upgrade in place
+C:\pj-test\unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+Use a **short** test directory. The deepest path in the bundle is about 111
+characters; a real install prefix adds roughly 60, which fits inside Windows'
+260-character limit with room to spare, but a deeply nested scratch directory
+does not, and Inno then aborts with `MoveFile failed; code 3`.
+
+Never run the app out of `dist/Jarvis` and then package that directory: the app
+writes runtime state into it, which would ship the builder's own database inside
+the installer. `build.ps1` removes such leftovers before packaging, and a clean
+`--clean` build never has them.

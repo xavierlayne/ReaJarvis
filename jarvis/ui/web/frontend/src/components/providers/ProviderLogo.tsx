@@ -1,0 +1,210 @@
+import { HardDrive, Server } from "lucide-react";
+
+import { cn } from "@/lib/utils";
+
+/**
+ * The brand mark on a provider row.
+ *
+ * Every card that talks to the same company draws the same mark: the Gemini
+ * spark on the Gemini brain, STT, TTS and Live cards alike, the OpenAI knot on
+ * the OpenAI, Whisper, Realtime and Codex cards. The mapping therefore goes
+ * provider id -> FAMILY -> file, and the family table is the only place a new
+ * provider needs an entry. Presentation only: nothing here decides behaviour
+ * (AP-21) — a provider with no row in the table still works, it just draws a
+ * neutral glyph.
+ *
+ * Three render paths, recorded per file in `src/assets/providers/LOGOS.md`:
+ * `colour` is the vendor's full-colour mark as an <img>; `mono` is a
+ * single-colour glyph drawn as a CSS mask over the current text ink so it
+ * follows the theme by itself; `own` is a lockup that carries its own ground
+ * (Cartesia's green square) and is drawn untouched.
+ */
+type Render = "colour" | "mono" | "own";
+
+interface FamilyLogo {
+  file: string;
+  render: Render;
+}
+
+const PROVIDER_FAMILY_LOGOS: Record<string, FamilyLogo> = {
+  antigravity: { file: "antigravity.svg", render: "colour" },
+  aws: { file: "aws.svg", render: "mono" },
+  cartesia: { file: "cartesia.svg", render: "own" },
+  digitalocean: { file: "digitalocean.svg", render: "mono" },
+  claude: { file: "claude.svg", render: "colour" },
+  contabo: { file: "contabo.svg", render: "mono" },
+  elevenlabs: { file: "elevenlabs.svg", render: "mono" },
+  hermes: { file: "hermes.svg", render: "mono" },
+  openclaw: { file: "openclaw.svg", render: "colour" },
+  gemini: { file: "gemini.svg", render: "colour" },
+  "google-cloud": { file: "google-cloud.svg", render: "colour" },
+  groq: { file: "groq.svg", render: "mono" },
+  hetzner: { file: "hetzner.svg", render: "mono" },
+  hostinger: { file: "hostinger.svg", render: "mono" },
+  inworld: { file: "inworld.png", render: "own" },
+  ionos: { file: "ionos.svg", render: "mono" },
+  linode: { file: "linode.svg", render: "mono" },
+  nvidia: { file: "nvidia.svg", render: "colour" },
+  ollama: { file: "ollama.svg", render: "mono" },
+  openai: { file: "openai.svg", render: "mono" },
+  openrouter: { file: "openrouter.svg", render: "mono" },
+  oracle: { file: "oracle.svg", render: "mono" },
+  ovhcloud: { file: "ovhcloud.svg", render: "mono" },
+  raspberrypi: { file: "raspberrypi.svg", render: "mono" },
+  vultr: { file: "vultr.svg", render: "mono" },
+  xai: { file: "xai.svg", render: "mono" },
+};
+
+// Bundled at build time (hashed URLs), so a mark renders offline and never
+// calls a third party. The glob keeps the folder the single source of truth:
+// dropping a file in and adding a family row is the whole wiring.
+const BUNDLED = import.meta.glob("../../assets/providers/*.{svg,png}", {
+  eager: true,
+  query: "?url",
+  import: "default",
+}) as Record<string, string>;
+
+function assetUrl(file: string): string | undefined {
+  return BUNDLED[`../../assets/providers/${file}`];
+}
+
+/**
+ * Which family a provider id belongs to.
+ *
+ * Ids are catalog strings like "gemini-live", "vertex-stt", "openai-realtime"
+ * or "claude-cli"; the family is the brand the card connects to, so the test
+ * is "does the id name that company", in a fixed order where two could match
+ * (a "vertex" card is Google Cloud, never Gemini, even though Vertex serves
+ * Gemini models).
+ */
+export function providerFamily(providerId: string): string | null {
+  const id = providerId.toLowerCase();
+  if (id.includes("vertex")) return "google-cloud";
+  if (id.includes("antigravity") || id === "agy-cli") return "antigravity";
+  if (id.includes("gemini")) return "gemini";
+  if (id.includes("codex") || id.startsWith("openai")) return "openai";
+  if (id.includes("claude")) return "claude";
+  if (id.includes("grok")) return "xai";
+  if (id.includes("openrouter")) return "openrouter";
+  if (id.includes("groq")) return "groq";
+  if (id.includes("ollama")) return "ollama";
+  if (id.includes("elevenlabs")) return "elevenlabs";
+  if (id.includes("cartesia")) return "cartesia";
+  if (id.includes("inworld")) return "inworld";
+  if (id.includes("nvidia") || id.includes("nemotron")) return "nvidia";
+  // Society agent runtimes (docs/agent-runtimes.md).
+  if (id === "hermes" || id === "hermes-cli") return "hermes";
+  if (id === "openclaw" || id === "openclaw-cli") return "openclaw";
+  // Hosting providers (Settings -> Computers cloud import).
+  if (id.includes("hostinger")) return "hostinger";
+  if (id.includes("hetzner")) return "hetzner";
+  if (id.includes("digitalocean")) return "digitalocean";
+  // Exact ids from the Computers provider catalog: plain words like "oracle"
+  // or "aws" must not claim an unrelated provider id by substring.
+  const hosting: Record<string, string> = {
+    vultr: "vultr",
+    linode: "linode",
+    aws_lightsail: "aws",
+    contabo: "contabo",
+    ionos: "ionos",
+    ovhcloud: "ovhcloud",
+    oracle_cloud: "oracle",
+    raspberry_pi: "raspberrypi",
+  };
+  if (id in hosting) return hosting[id];
+  return null;
+}
+
+/** An on-device engine or a self-hosted server: a capability, not a brand. */
+function localGlyph(providerId: string): "device" | "server" | null {
+  const id = providerId.toLowerCase();
+  // The Jarvis-owned voice engine runs on this machine, not on a server.
+  if (id === "local-voice") return "device";
+  if (id.startsWith("local-") || id === "generic" || id === "home_server" || id === "strato") return "server";
+  if (id === "multipass") return "device";
+  if (id.includes("faster-whisper") || id.includes("piper")) return "device";
+  return null;
+}
+
+export function ProviderLogo({
+  providerId,
+  label,
+  className,
+  size = "md",
+}: {
+  providerId: string;
+  /** The card's display name — its initial is the monogram fallback. */
+  label: string;
+  className?: string;
+  /**
+   * `md` is the provider-row tile; `sm` is the same mark drawn inline — no
+   * tile, no border — for a menu row or a composer pill where the mark is a
+   * hint beside a word rather than the subject of a card.
+   */
+  size?: "md" | "sm";
+}) {
+  const family = providerFamily(providerId);
+  const entry = family ? PROVIDER_FAMILY_LOGOS[family] : undefined;
+  const url = entry ? assetUrl(entry.file) : undefined;
+  const local = localGlyph(providerId);
+  const monogram = label.trim().slice(0, 1).toUpperCase() || "?";
+  const small = size === "sm";
+  const markClass = small ? "h-3.5 w-3.5" : "h-5 w-5";
+  const glyphClass = small ? "h-3.5 w-3.5" : "h-4 w-4";
+
+  return (
+    <span
+      aria-hidden="true"
+      data-testid={`provider-logo-${providerId}`}
+      data-family={family ?? undefined}
+      className={cn(
+        // One neutral tile for every mark, so a row of providers reads as one
+        // list rather than a row of differently shaped app icons.
+        //
+        // The tile is a LIFT surface with no rim. It used to be a --background
+        // fill inside a --border outline: the room itself, which on a card is
+        // a child darker than its parent — that is why a logo tile could
+        // render as an empty outline. A nested tile steps UP, and once
+        // it has a real fill the outline is what was standing in for one.
+        small
+          ? "inline-flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden rounded-full"
+          : "inline-flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md bg-secondary",
+        className,
+      )}
+    >
+      {url && entry?.render === "mono" ? (
+        <span
+          className={cn("block bg-foreground", markClass)}
+          style={{
+            WebkitMaskImage: `url("${url}")`,
+            maskImage: `url("${url}")`,
+            WebkitMaskRepeat: "no-repeat",
+            maskRepeat: "no-repeat",
+            WebkitMaskPosition: "center",
+            maskPosition: "center",
+            WebkitMaskSize: "contain",
+            maskSize: "contain",
+          }}
+        />
+      ) : url && entry?.render === "own" ? (
+        // A lockup with its own ground fills the tile; its corners are ours.
+        <img src={url} alt="" className="block h-full w-full object-cover" />
+      ) : url ? (
+        <img src={url} alt="" className={cn("block object-contain", markClass)} />
+      ) : local === "server" ? (
+        <Server className={cn("text-muted-foreground", glyphClass)} />
+      ) : local === "device" ? (
+        <HardDrive className={cn("text-muted-foreground", glyphClass)} />
+      ) : (
+        <span
+          className={cn(
+            "font-display font-semibold text-muted-foreground",
+            small ? "text-micro" : "text-meta",
+          )}
+        >
+          {monogram}
+        </span>
+      )}
+    </span>
+  );
+}

@@ -1,0 +1,14 @@
+# Files that exist in the distribution repo but NOT in the working tree, and
+# must be PRESERVED during reconcile (one gitignore-ish glob per line).
+#
+# The reconcile step makes the distribution tree match the staged tree by
+# deleting its tracked files and copying the staged ones in. Any file listed
+# here is skipped by that deletion so a deliberately dist-only file is not wiped
+# every release.
+#
+# AGENTS.md used to be listed here while the working tree kept CLAUDE.md; it is
+# the tracked rulebook now (2026-09-30), so it ships like any other file.
+
+# Preserve the reviewed public bug register while the local register's newer
+# live-session evidence remains withheld by the distribution denylist.
+docs/BUGS.md

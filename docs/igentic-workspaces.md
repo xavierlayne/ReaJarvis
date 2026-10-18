@@ -1,0 +1,141 @@
+# iGentic projects and workspace orchestration
+
+The IDE is organized as **Project > Workspace > Coding Agent session**. A
+project is a connected folder in the existing project library. A workspace is
+an independently named group of any number of coding sessions in that project.
+Multiple workspaces may use the same folder; independent sessions do not imply
+isolated source checkouts. Users who need separate files connect a worktree as
+another project.
+
+## Interaction and identity
+
+Connecting or creating a folder registers a project without starting a process.
+The project's plus action opens a compact agent setup dialog. The project tree
+shows open and saved workspaces, their session counts, and active selection.
+Selecting an open workspace changes the visible group and active runtime ID;
+it does not stop background agents. Restoring a closed workspace is explicit.
+
+A workspace has no pane limit and no grid limit: panes can be docked on any
+side of any other pane, so the grid may grow past four columns or rows. The
+automatic even grid keeps one or two rows for up to eight sessions, adds a row
+per four sessions up to sixteen (nine is 3 x 3, sixteen is 4 x 4), and stays
+about square beyond that. A pane opened without a place joins the right edge
+while the workspace is under four columns wide; past that, a shape nobody
+arranged is dealt into the even grid again, while a hand-built arrangement is
+kept and the new pane splits its largest pane. The only guard is on one request:
+`MAX_PANES_PER_REQUEST` in `jarvis/agentic_ide/session.py` (mirrored in
+`workspaceDocking.ts`) bounds how many panes a single launch or batch opens.
+Screens too small for every pane's minimum size scroll rather than shrinking
+the user's terminal font. Dragging a card header or using
+Alt+Arrow reorders stable session IDs. Reordering does not recreate the CLI
+process. Each tile uses the existing
+PTY adapter, output replay, reconnect budget, and terminal appearance tokens.
+
+Project IDs come from the canonical folder identity. Workspace IDs survive
+restore. A coding session is addressed as `pane:<history_id>`; its display name
+and grid position are not execution identities. Additive snapshot migration
+retains older project-less workspaces and keeps sibling workspaces in the same
+folder distinct. Older snapshots above the session limit are retained
+but cannot be restored into the new grid unchanged.
+
+## Live integration
+
+The new `workspace-orchestrate` tool is available through the supervisor's voice
+catalog to ChatGPT Live and the native Gemini/local Live path. It replaces the
+legacy ambient IDE prompt tools on that surface. It is not installed in mission
+worker tools and does not grant Society agents any new capability.
+
+1. `inspect` reads the same project graph used by the sidebar, enriched with
+   actual coding-session identities, status and observed activity.
+2. `resolve` interprets model-extracted project/workspace/agent names or IDs.
+   Explicit references take precedence. With no reference, the active workspace
+   is the default. An unnamed agent is selected in stable order from idle or
+   unstarted sessions. Duplicate names and multiple matching workspaces return
+   structured clarification candidates rather than guessing.
+3. `send` requires the resolved project, workspace and terminal IDs, a task, and
+   the unique request ID issued by resolution. The application-owned ToolExecutor
+   applies permission policy before the coding-session gateway delivers to that
+   exact session.
+4. `context` reads recorded results from the addressed session. A delivery
+   receipt never asserts that the coding task has completed.
+
+For example, a request to fix an installer in a named project can address a
+background workspace while the user continues viewing another project. The
+orchestrator never temporarily changes global selection to make a delivery.
+Changing selection while an approval is pending cannot change its target.
+
+Each send is durably claimed in SQLite before delivery. Retrying the same ID
+returns its existing receipt. Reusing an ID with changed arguments fails.
+Cancellation or interruption after a possible write leaves an uncertain claim;
+neither voice reconnection nor a new tool-call ID replays that request. Receipts
+include the immutable target and execution trace. Requests to a closed, moved,
+archived or non-coding session fail without falling back to another terminal.
+
+### Agents that are in a turn
+
+A plain `send` never reaches into running work: a session in a turn returns
+`not_accepted` with `busy: true`, types nothing, and lists how the message could
+still get there. Only a correction the user directs at that running work uses
+`while_busy`:
+
+- `steer` types it into the running turn. Only for a CLI whose own mid-turn
+  input reaches that turn (`WorkspaceAgent.steers_mid_turn`: Claude Code, GLM,
+  Codex). Nothing is stopped. Other CLIs refuse it before typing.
+- `interrupt` presses Stop once (Escape), waits up to 15 s for the turn to end,
+  then types the correction at the prompt. The process, conversation and files
+  stay. A turn that has not ended by then is handed to the queue.
+- `queue` holds the message in the app and types it once the turn ends, for up
+  to 30 minutes. Its receipt reads `queued` until then and becomes the delivery
+  result. An app restart before delivery leaves nothing typed; the receipt then
+  reads `expired`.
+
+None of them types into an open question or permission prompt; that is
+`respond`. A busy refusal, an expired queue or any other receipt that proves
+nothing was typed may be retried with the same `request_id` and prompt (also
+with a different `while_busy`); an accepted, queued or uncertain receipt is
+returned instead of a second delivery. Claude Code records a mid-turn message as
+a human `queued_command`; `context` shows it as a user message.
+
+### Failed turns and stopped agents
+
+A turn that ended in an error (Codex records `task_complete` with an `error`)
+shows the pane as `failed`, but its CLI is back at its prompt: a `send` delivers
+the next task as usual.
+
+An agent whose process is gone (`exited`, or `error` when it could not start)
+takes nothing. A `send` returns `not_accepted` with `stopped: true` and
+`restartable: true` and types nothing. `restart` (by call-sign or the resolved
+IDs) starts that same pane again: same `terminal_id`, account and launch picks,
+continuing its own conversation through the CLI's resume where one exists
+(`conversation: continued`), fresh otherwise. Its receipt reads `restarted`;
+nothing is typed. A pane whose agent is running is left alone and the receipt
+reads `already_running`, so a repeated or concurrent restart starts at most one
+process and never cuts a turn short. The refused send is then retried with the
+same `request_id` and prompt: its refusal proved nothing was typed, so the retry
+delivers once, and the accepted receipt answers every later retry. A restart is
+a logged `monitor` action like `interrupt` and `close`. Nothing restarts an agent
+on its own: a send never does it implicitly.
+
+## Boundaries and verification
+
+This is a T3 shared contract change. No new OS adapter, credential or model
+default is introduced. PTY availability remains capability-probed; Windows uses
+the existing ConPTY backend and Linux/macOS the existing POSIX backend.
+Headless systems can inspect projects even without a usable terminal backend.
+
+Contract coverage is in `tests/contract/test_workspace_orchestration.py`; the
+workspace graph and migration tests are in
+`tests/unit/agentic_ide/test_workspace_graph.py`. Frontend interaction tests
+exercise project creation, switching, bounded grid layout and stable reordering.
+Passing these tests is not evidence of native macOS execution, a microphone
+test, or a completed real coding assignment. Live and desktop acceptance must
+be reported separately from mocked transport checks.
+
+A synthetic Gemini Realtime probe on Windows and a fresh headless Linux source
+installation exercised model-selected resolution and one addressed delivery
+through the real ToolExecutor, then received spoken delivery confirmation. The
+Linux dependency image was preinstalled; the application was freshly installed
+from source. The coding-session adapter in that probe was a fake; no repository
+was changed. An OpenAI Live probe was attempted but session setup was rejected,
+so live OpenAI acceptance remains open. Portable Linux contract tests pass;
+native macOS execution and microphone/device acceptance remain unverified.

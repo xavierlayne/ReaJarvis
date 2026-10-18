@@ -1,0 +1,523 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { AgentChatSession } from "@/lib/agentChatApi";
+import { providerKind } from "@/components/agentchat/AgentComposer";
+import { EMPTY_TIMELINE, type Timeline, type UserItem } from "@/components/agentchat/reduce";
+import { createAgentChatStore, draftKey } from "@/store/agentChat";
+import { captureComposerDraftTarget, readComposerDraft, writeComposerDraft } from "@/components/agentchat/composerDrafts";
+
+/**
+ * The store knows its surface: the front page's store speaks for the typed
+ * Jarvis chat (`jarvis`), an IDE's for its coding sessions (`agent`). Each
+ * asks the backend for its own list and catalog, stamps the surface on the
+ * sessions it creates, and keeps its draft under its own key.
+ */
+
+function session(id: string, surface?: AgentChatSession["surface"]): AgentChatSession {
+  return {
+    session_id: id,
+    title: id,
+    provider: "claude-api",
+    model: "",
+    effort: "high",
+    cwd: "C:\\work",
+    permission_mode: "ask",
+    ...(surface === undefined ? {} : { surface }),
+    vendor_session: null,
+    created_ms: 1,
+    updated_ms: 2,
+    message_count: 1,
+    preview: id,
+  };
+}
+
+interface Call {
+  url: string;
+  method: string;
+  body: Record<string, unknown> | null;
+}
+
+/** A fetch that answers every agent-chat route with something plausible and records what was asked. */
+function stubFetch(sessions: AgentChatSession[]): Call[] {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : null;
+      calls.push({ url, method, body });
+      const reply = (data: unknown) => new Response(JSON.stringify(data), { status: 200 });
+      if (url.startsWith("/api/agent-chat/catalog")) return reply({ providers: [], default_cwd: "C:\\work", shell: "pwsh" });
+      if (url.startsWith("/api/jarvis-agent/status")) return reply({ mapping: [] });
+      if (url.startsWith("/api/agent-chat/sessions?")) return reply({ sessions });
+      if (url === "/api/agent-chat/sessions" && method === "POST") {
+        return reply({ ...session("new"), ...(body ?? {}) });
+      }
+      if (url.endsWith("/messages")) return reply({ turn_id: "t1" });
+      return new Response(null, { status: 404 });
+    }),
+  );
+  return calls;
+}
+
+/** jsdom's WebSocket would try to reach a real host; a silent stand-in is enough here. */
+class FakeSocket {
+  onopen: (() => void) | null = null;
+  onmessage: ((msg: { data: string }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  close() {}
+}
+
+describe("agent-chat store surfaces", () => {
+
+  it("reconciles a Society permission draft from a clamped PATCH response", async () => {
+    const active = { ...session("society:reader", "society"), permission_mode: "plan" };
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(active), { status: 200 })));
+    const store = createAgentChatStore("society", "reader");
+    store.setState({ activeSessionId: active.session_id, activeSession: active });
+
+    await store.getState().setDraft({ permissionMode: "bypass" });
+
+    expect(store.getState().activeSession?.permission_mode).toBe("plan");
+    expect(store.getState().draft.permissionMode).toBe("plan");
+  });
+
+  it("keeps the latest Society draft while session PATCHes complete in order", async () => {
+    const active = { ...session("society:reader", "society"), permission_mode: "plan" };
+    const pending: Array<(response: Response) => void> = [];
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => pending.push(resolve))));
+    const store = createAgentChatStore("society", "reader-serial");
+    store.setState({ activeSessionId: active.session_id, activeSession: active });
+
+    const first = store.getState().setDraft({ permissionMode: "ask" });
+    const second = store.getState().setDraft({ permissionMode: "bypass" });
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    pending[0](new Response(JSON.stringify({ ...active, permission_mode: "ask" })));
+    await first;
+    expect(store.getState().draft.permissionMode).toBe("bypass");
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1](new Response(JSON.stringify({ ...active, permission_mode: "plan" })));
+    await second;
+    expect(store.getState().draft.permissionMode).toBe("plan");
+  });
+
+  it("snaps a stored mode the row's ladder does not know onto the row's default", async () => {
+    // The v1 draft was shared with the IDE and could carry a vendor word
+    // ("skip-permissions"); on the Jarvis ladder that must become "ask", not
+    // an unlabelled pill.
+    window.localStorage.setItem(
+      draftKey("jarvis"),
+      JSON.stringify({
+        provider: "antigravity",
+        model: "",
+        effort: "high",
+        permissionMode: "skip-permissions",
+        buildMode: "skip-permissions",
+        cwd: "C:\\ide",
+      }),
+    );
+    const modes = ["ask", "accept-edits", "plan", "bypass"].map((id) => ({ id, label: id, description: "" }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string) => {
+        const url = String(input);
+        const reply = (data: unknown) => new Response(JSON.stringify(data), { status: 200 });
+        if (url.startsWith("/api/agent-chat/catalog")) {
+          return reply({
+            providers: [
+              {
+                id: "antigravity",
+                label: "Antigravity",
+                family: "antigravity",
+                runner: "agy-cli",
+                models_source: "curated",
+                curated_models: [],
+                default_model: "",
+                keyless: false,
+                native_resume: true,
+                effort_levels: ["low", "medium", "high"],
+                default_effort: "medium",
+                cli_installed: true,
+                permission_modes: modes,
+                default_permission_mode: "ask",
+              },
+            ],
+            default_cwd: "C:\\home",
+            shell: "pwsh",
+          });
+        }
+        if (url.startsWith("/api/jarvis-agent/status")) return reply({ mapping: [] });
+        if (url.startsWith("/api/providers/")) return reply({ models: [] });
+        return new Response(null, { status: 404 });
+      }),
+    );
+    const store = createAgentChatStore("jarvis");
+    await store.getState().loadCatalog();
+    const draft = store.getState().draft;
+    expect(draft.provider).toBe("antigravity");
+    expect(draft.permissionMode).toBe("ask");
+    expect(draft.buildMode).toBe("ask");
+    expect(draft.effort).toBe("high");
+  });
+
+  it("paints the last catalog at once and keeps it across a new chat while it refreshes", async () => {
+    // The composer showed "Provider" for seconds on every start and every new
+    // chat: the catalog began empty and the route waits on CLI model lists.
+    const calls = stubFetch([]);
+    const first = createAgentChatStore("jarvis");
+    expect(first.getState().catalog).toBeNull();
+    await first.getState().loadCatalog();
+
+    const next = createAgentChatStore("jarvis");
+    expect(next.getState().catalog).toEqual(first.getState().catalog);
+    expect(next.getState().catalogStale).toBe(true);
+    await next.getState().loadCatalog();
+    expect(next.getState().catalogStale).toBe(false);
+
+    const before = calls.filter((c) => c.url.startsWith("/api/agent-chat/catalog")).length;
+    next.getState().newChat();
+    expect(next.getState().catalog).not.toBeNull();
+    expect(next.getState().catalogStale).toBe(true);
+    await vi.waitFor(() => expect(next.getState().catalogStale).toBe(false));
+    expect(calls.filter((c) => c.url.startsWith("/api/agent-chat/catalog")).length).toBeGreaterThan(before);
+    // Each surface keeps its own copy.
+    expect(createAgentChatStore("agent").getState().catalog).toBeNull();
+  });
+
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("counts a brain seat as connected only when an API KEY is saved", () => {
+    // The Agents tab calls a Claude Code login "connected" — right for a row
+    // a CLI runs. On the front page's chat the same row is the Anthropic
+    // endpoint, where that login buys nothing, so it must read as unconnected
+    // until a key is there.
+    const row = (runner: string, keyless = false) => ({
+      id: "claude-api",
+      label: "Anthropic Claude",
+      family: "claude",
+      runner,
+      models_source: "live" as const,
+      curated_models: [],
+      default_model: "",
+      keyless,
+      native_resume: true,
+      effort_levels: ["low", "high"],
+      default_effort: "high",
+      permission_modes: [{ id: "ask", label: "ask", description: "" }],
+      default_permission_mode: "ask",
+      cli_installed: null,
+    });
+    const seat = (runner: string, conn: Record<string, unknown>) => {
+      const store = createAgentChatStore("jarvis");
+      store.setState({
+        catalog: { providers: [row(runner)], default_cwd: "C:\work", shell: "pwsh" },
+        connections: [{ jarvis: "claude-api", is_active_brain: false, ...conn }],
+      } as never);
+      return store.getState().providerOptions()[0].connected;
+    };
+    const subscriptionOnly = { key_set: true, api_key_set: false, oauth_connected: true };
+    expect(seat("brain", subscriptionOnly)).toBe(false);
+    expect(seat("api", subscriptionOnly)).toBe(false);
+    // The CLI seat itself is exactly what that login is for.
+    expect(seat("claude-cli", subscriptionOnly)).toBe(true);
+    expect(seat("brain", { key_set: true, api_key_set: true })).toBe(true);
+    // A backend too old to report the finer field still answers as before.
+    expect(seat("brain", { key_set: true })).toBe(true);
+  });
+
+  it("counts a coding CLI the Agents tab has no card for as connected once installed", () => {
+    // OpenCode, Kimi, GLM Coding Plan and the DeepSeek harness keep their own
+    // login; the Agents tab has no card for them, and "no card" must not read
+    // as "not connected" — installed is what this app can know. The row also
+    // wears the IDE's mark for that CLI, so both pickers draw it alike.
+    const row = (cli_installed: boolean) => ({
+      id: "opencode",
+      label: "OpenCode",
+      family: "opencode",
+      runner: "opencode-cli",
+      models_source: "curated" as const,
+      curated_models: [],
+      default_model: "",
+      keyless: false,
+      native_resume: true,
+      effort_levels: [""],
+      default_effort: "",
+      permission_modes: [{ id: "auto", label: "auto", description: "" }],
+      default_permission_mode: "auto",
+      cli_installed,
+      agent: "opencode",
+    });
+    const seat = (cli_installed: boolean) => {
+      const store = createAgentChatStore("agent");
+      store.setState({
+        catalog: { providers: [row(cli_installed)], default_cwd: "C:\\work", shell: "pwsh" },
+        connections: [],
+      } as never);
+      return store.getState().providerOptions()[0];
+    };
+    expect(seat(true).connected).toBe(true);
+    expect(seat(true).agentMark).toBe("opencode");
+    expect(seat(false).connected).toBe(false);
+  });
+
+  it("groups a brain seat with the API keys, never with the CLIs", () => {
+    expect(providerKind({ runner: "brain", keyless: false })).toBe("api");
+    expect(providerKind({ runner: "api", keyless: false })).toBe("api");
+    expect(providerKind({ runner: "claude-cli", keyless: false })).toBe("cli");
+    expect(providerKind({ runner: "brain", keyless: true })).toBe("local");
+  });
+
+  it("names the front page's draft key as it always was, and gives the IDE its own", () => {
+    expect(draftKey("jarvis")).toBe("jarvis.agentChat.draft.v2");
+    expect(draftKey("agent")).toBe("jarvis.agentChat.draft.agent.v1");
+  });
+
+  it("creates a front-page session stamped with its surface", async () => {
+    const calls = stubFetch([]);
+    const store = createAgentChatStore("jarvis");
+    store.setState({
+      draft: { provider: "claude-api", model: "", effort: "high", permissionMode: "ask", buildMode: "ask", cwd: "C:\\work" },
+    });
+    await store.getState().send("hello");
+    const create = calls.find((c) => c.url === "/api/agent-chat/sessions" && c.method === "POST");
+    expect(create?.body).toMatchObject({ provider: "claude-api", permission_mode: "ask", surface: "jarvis" });
+    expect(store.getState().activeSessionId).toBe("new");
+    expect(store.getState().sessions[0]?.surface).toBe("jarvis");
+  });
+
+  it("asks the list for its own surface and drops rows of the other", async () => {
+    const calls = stubFetch([session("mine", "agent"), session("theirs", "jarvis")]);
+    const store = createAgentChatStore("agent");
+    await store.getState().loadSessions();
+    const list = calls.find((c) => c.url.startsWith("/api/agent-chat/sessions?"));
+    expect(list?.url).toContain("surface=agent");
+    expect(store.getState().sessions.map((s) => s.session_id)).toEqual(["mine"]);
+  });
+
+  it("keeps rows that name no surface — an older backend still lists its chats", async () => {
+    stubFetch([session("old"), session("front", "jarvis"), session("ide", "agent")]);
+    const store = createAgentChatStore("jarvis");
+    await store.getState().loadSessions();
+    expect(store.getState().sessions.map((s) => s.session_id)).toEqual(["old", "front"]);
+  });
+
+  it("asks the catalog for its surface", async () => {
+    const calls = stubFetch([]);
+    const store = createAgentChatStore("jarvis");
+    await store.getState().loadCatalog();
+    const catalog = calls.find((c) => c.url.startsWith("/api/agent-chat/catalog"));
+    expect(catalog?.url).toBe("/api/agent-chat/catalog?surface=jarvis");
+  });
+
+  it("keeps one draft per surface, under separate keys", async () => {
+    stubFetch([]);
+    const front = createAgentChatStore("jarvis");
+    const ide = createAgentChatStore("agent");
+    await front.getState().setDraft({ cwd: "C:\\front" });
+    await ide.getState().setDraft({ cwd: "C:\\ide" });
+    expect(front.getState().draft.cwd).toBe("C:\\front");
+    expect(ide.getState().draft.cwd).toBe("C:\\ide");
+    expect(JSON.parse(window.localStorage.getItem(draftKey("jarvis")) ?? "{}")).toMatchObject({ cwd: "C:\\front" });
+    expect(JSON.parse(window.localStorage.getItem(draftKey("agent")) ?? "{}")).toMatchObject({ cwd: "C:\\ide" });
+    // A fresh store of each surface reads back its own, not the other's.
+    expect(createAgentChatStore("jarvis").getState().draft.cwd).toBe("C:\\front");
+    expect(createAgentChatStore("agent").getState().draft.cwd).toBe("C:\\ide");
+  });
+});
+
+function timelineWith(text: string): Timeline {
+  const item: UserItem = { type: "user", id: text, tsMs: 1, text, attachments: [] };
+  return { ...EMPTY_TIMELINE, items: [item], lastSeq: 1 };
+}
+
+describe("followup admission", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("shares session creation and preserves rapid message order until every request settles", async () => {
+    let open!: (response: Response) => void;
+    let finishFirst!: (response: Response) => void;
+    const messages: string[] = [];
+    let creations = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/agent-chat/sessions" && init?.method === "POST") {
+        creations += 1;
+        return new Promise<Response>((resolve) => { open = resolve; });
+      }
+      if (url.endsWith("/messages")) {
+        messages.push(JSON.parse(String(init?.body)).text);
+        if (messages.length === 1) return new Promise<Response>((resolve) => { finishFirst = resolve; });
+        return new Response(JSON.stringify({ queued: true, queue_id: "q2" }));
+      }
+      return new Response(JSON.stringify({ sessions: [] }));
+    }));
+    const store = createAgentChatStore("jarvis");
+    const first = store.getState().send("first");
+    const second = store.getState().send("second");
+    await vi.waitFor(() => expect(creations).toBe(1));
+    const target = captureComposerDraftTarget(store, null);
+    const unsent = { text: "still typing while the chat opens", choices: [] };
+    writeComposerDraft(store, null, unsent);
+    open(new Response(JSON.stringify(session("created", "jarvis"))));
+    await vi.waitFor(() => expect(messages).toEqual(["first"]));
+    expect(readComposerDraft(store, "created")).toEqual(unsent);
+    expect(readComposerDraft(store, null).text).toBe("");
+    expect(target.sessionId).toBe("created");
+    const third = store.getState().send("third");
+    expect(store.getState().busy).toBe(true);
+    finishFirst(new Response(JSON.stringify({ turn_id: "t1" })));
+    expect(await Promise.all([first, second, third])).toEqual(["sent", "sent", "sent"]);
+    expect(messages).toEqual(["first", "second", "third"]);
+    expect(creations).toBe(1);
+    expect(store.getState().busy).toBe(false);
+    expect(readComposerDraft(store, "created")).toEqual(unsent);
+  });
+
+  it("continues queued submissions after one HTTP failure without changing the selected chat", async () => {
+    let failFirst!: (response: Response) => void;
+    const messages: { url: string; text: string }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/messages")) {
+        messages.push({ url, text: JSON.parse(String(init?.body)).text });
+        if (messages.length === 1) return new Promise<Response>((resolve) => { failFirst = resolve; });
+        return new Response(JSON.stringify({ queued: true, queue_id: "q" }));
+      }
+      return new Response(JSON.stringify({ sessions: [] }));
+    }));
+    const store = createAgentChatStore("society");
+    store.setState({ activeSessionId: "society:a" });
+    const first = store.getState().send("first");
+    const second = store.getState().send("second");
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    store.setState({ activeSessionId: "society:b", busy: false, lastError: null });
+    failFirst(new Response(JSON.stringify({ detail: "temporarily unavailable" }), { status: 503 }));
+    expect(await first).toBe("failed");
+    expect(await second).toBe("stale");
+    expect(messages.map((row) => row.text)).toEqual(["first", "second"]);
+    expect(messages.every((row) => row.url.includes("society%3Aa"))).toBe(true);
+    expect(store.getState()).toMatchObject({ activeSessionId: "society:b", busy: false, lastError: null });
+  });
+
+  it("does not reopen a new chat after the person switched away during creation", async () => {
+    let open!: (response: Response) => void;
+    const messages: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/agent-chat/sessions" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => { open = resolve; });
+      }
+      if (url.endsWith("/messages")) messages.push(url);
+      return new Response(JSON.stringify({ sessions: [], turn_id: "t" }));
+    }));
+    const store = createAgentChatStore("jarvis");
+    const sending = store.getState().send("for the original chat");
+    await vi.waitFor(() => expect(open).toBeTypeOf("function"));
+    store.setState({ activeSessionId: "elsewhere", busy: false });
+    open(new Response(JSON.stringify(session("created", "jarvis"))));
+    expect(await sending).toBe("stale");
+    expect(messages).toEqual(["/api/agent-chat/sessions/created/messages"]);
+    expect(store.getState().activeSessionId).toBe("elsewhere");
+  });
+
+  it("marks a replaced blank draft so a rejected creation cannot restore into the new chat", async () => {
+    let rejectCreation!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(async (input: string, init?: RequestInit) => {
+      if (String(input) === "/api/agent-chat/sessions" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => { rejectCreation = resolve; });
+      }
+      return new Response(JSON.stringify({ sessions: [], providers: [] }));
+    }));
+    const store = createAgentChatStore("jarvis");
+    const original = captureComposerDraftTarget(store, null);
+    const sending = store.getState().send("original send");
+    await vi.waitFor(() => expect(rejectCreation).toBeTypeOf("function"));
+    store.getState().newChat();
+    writeComposerDraft(store, null, { text: "deliberate new draft", choices: [] });
+    rejectCreation(new Response(JSON.stringify({ detail: "unavailable" }), { status: 503 }));
+    expect(await sending).toBe("failed");
+    expect(original.superseded).toBe(true);
+    expect(captureComposerDraftTarget(store, null)).not.toBe(original);
+    expect(readComposerDraft(store, null).text).toBe("deliberate new draft");
+    expect(store.getState()).toMatchObject({ activeSessionId: null, lastError: null });
+  });
+});
+
+describe("agent-chat store session switch", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("drops the previous transcript the moment another session opens", () => {
+    const store = createAgentChatStore("society");
+    store.setState({
+      activeSessionId: "society:visual-qa",
+      timeline: timelineWith("visual-qa-flowchart"),
+      sessions: [session("society:visual-qa", "society"), session("society:gmail", "society")],
+    });
+    store.getState().openSession("society:gmail");
+    expect(store.getState().activeSessionId).toBe("society:gmail");
+    expect(store.getState().timeline.items).toEqual([]);
+    expect(store.getState().busy).toBe(false);
+  });
+
+  it("restores a visited session's transcript immediately on switch-back", () => {
+    const store = createAgentChatStore("society");
+    store.setState({
+      activeSessionId: "society:visual-qa",
+      timeline: timelineWith("visual-qa-flowchart"),
+      sessions: [session("society:visual-qa", "society"), session("society:gmail", "society")],
+    });
+    store.getState().openSession("society:gmail");
+    store.setState({ timeline: timelineWith("gmail-inbox") });
+    store.getState().openSession("society:visual-qa");
+    expect(store.getState().timeline.items[0]).toMatchObject({ text: "visual-qa-flowchart" });
+    store.getState().openSession("society:gmail");
+    expect(store.getState().timeline.items[0]).toMatchObject({ text: "gmail-inbox" });
+  });
+});
+
+
+it("opening a society catalog never runs paid provider health probes", async () => {
+  const calls = stubFetch([]);
+  await createAgentChatStore("society").getState().loadCatalog();
+  expect(calls.some((call) => call.url.includes("provider-health"))).toBe(false);
+  await createAgentChatStore("jarvis").getState().loadCatalog();
+  expect(calls.some((call) => call.url.includes("provider-health"))).toBe(true);
+});
+
+it("unchanged session refreshes preserve list identity, while title/account changes update it", async () => {
+  const supplied = [session("one", "jarvis"), session("two", "jarvis")];
+  stubFetch(supplied);
+  try {
+    const store = createAgentChatStore("jarvis");
+    await store.getState().loadSessions();
+    const original = store.getState().sessions;
+    await store.getState().loadSessions();
+    expect(store.getState().sessions).toBe(original);
+    supplied[0] = { ...supplied[0], title: "Renamed", account_id: "another-seat" };
+    await store.getState().loadSessions();
+    const updated = store.getState().sessions;
+    expect(updated).not.toBe(original);
+    expect(updated[0]).toMatchObject({ title: "Renamed", account_id: "another-seat" });
+    expect(updated[1]).toBe(original[1]);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});

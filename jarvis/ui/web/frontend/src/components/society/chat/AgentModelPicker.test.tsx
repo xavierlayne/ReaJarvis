@@ -1,0 +1,487 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import * as Dialog from "@radix-ui/react-dialog";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, expect, test, vi, type Mock } from "vitest";
+import { loadLocaleChunk } from "@/i18n";
+import type { AgentChatProvider, AgentConnectionRow } from "@/lib/agentChatApi";
+import { SAMPLE_ROSTER } from "../mockRoster";
+import { rowToAgent, useSocietyAgent, type SocietyAgent } from "../data";
+import { AgentModelPicker } from "./AgentModelPicker";
+import type { SocietyAgentRow } from "@/lib/societyApi";
+import { AgentChatStoreProvider } from "@/components/agentchat/AgentChatStoreContext";
+import { createAgentChatStore, type AgentChatStoreHook } from "@/store/agentChat";
+import { clearModelMenuSnapshot, MODEL_MENU_SNAPSHOT_KEY, writeModelMenuSnapshot } from "./modelMenuSnapshot";
+import { MODEL_ACCESS_KEY } from "@/lib/modelAccess";
+
+const provider = (id: string, overrides: Partial<AgentChatProvider> = {}): AgentChatProvider => ({
+  id, label: id, family: id, runner: "brain", models_source: "curated",
+  curated_models: [{ id: `${id}-small`, label: "Small", efforts: ["low"] }, { id: `${id}-large`, label: "Large", efforts: ["medium", "high"] }],
+  default_model: `${id}-small`, keyless: false, native_resume: false,
+  effort_levels: ["low", "medium", "high"], default_effort: "high", permission_modes: [], default_permission_mode: "ask", cli_installed: null,
+  ...overrides,
+});
+let row: SocietyAgentRow;
+let posts: Record<string, string>[];
+let failSave: boolean;
+let extraProviders: AgentChatProvider[];
+let liveModels: Record<string, { id: string; label: string }[]>;
+let providerRows: unknown[];
+let accessWays: Record<string, string[]>;
+let supportedProviders: string[];
+let runtimeGate: Promise<void> | undefined;
+let failedModelProvider: string;
+let catalogCalls: number;
+let saving: Mock<(saving: boolean) => void>;
+let catalogGate: Promise<void> | undefined;
+let connectionsGate: Promise<void> | undefined;
+let accountsGate: Promise<void> | undefined;
+
+beforeEach(async () => {
+  localStorage.removeItem(MODEL_ACCESS_KEY);
+  clearModelMenuSnapshot();
+  await loadLocaleChunk("society");
+  row = {
+    agent_id: "scout", name: "Scout", title: "Research", description: "Keep my instructions",
+    tier: "specialist", state: "active", provider: "openai", model: "openai-large", effort: "high", account_id: "saved-seat",
+    avatar: {}, grants: [], focus: [], denies: [], approval_rules: {}, stats: { runs: 3, total_cost_usd: 1, last_active_ms: null },
+  } as unknown as SocietyAgentRow;
+  posts = []; failSave = false; saving = vi.fn<(saving: boolean) => void>();
+  extraProviders = []; liveModels = {}; providerRows = []; catalogCalls = 0;
+  accessWays = {};
+  supportedProviders = []; runtimeGate = undefined;
+  failedModelProvider = "";
+  catalogGate = undefined; connectionsGate = undefined; accountsGate = undefined;
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.includes("/catalog")) await catalogGate;
+    if (url.endsWith("/status")) await connectionsGate;
+    if (url.endsWith("/providers")) await accountsGate;
+    const response = (data: unknown, ok = true) => ({ ok, status: ok ? 200 : 503, json: async () => data }) as Response;
+    if (url === "/api/agent-runtimes") {
+      await runtimeGate;
+      return response({ runtimes: [], supported_providers: supportedProviders, access: accessWays });
+    }
+    if (url.endsWith("/model")) {
+      const choice = JSON.parse(String(init?.body));
+      posts.push(choice);
+      if (failSave) return response({}, false);
+      row = { ...row, ...choice };
+      return response({ agent: row, reseated: "society:scout" });
+    }
+    if (url.includes("/catalog")) { catalogCalls++; return response({ providers: [provider("openai"), provider("gemini"), provider("offline"), provider("ollama", { keyless: true, models_source: "live" }), ...extraProviders] }); }
+    if (url.endsWith("/status")) return response({ mapping: [{ jarvis: "openai", key_set: true }, { jarvis: "gemini", key_set: true }, { jarvis: "openrouter", key_set: true }, { jarvis: "offline", key_set: false }] });
+    if (url.endsWith("/models")) {
+      const id = url.split("/").at(-2)!;
+      return response({ models: liveModels[id] ?? [] }, id !== failedModelProvider);
+    }
+    if (url.endsWith("/providers")) return response({ providers: providerRows });
+    if (url.endsWith("/agents")) return response({ agents: [row] });
+    throw new Error(`Unexpected request: ${url}`);
+  }));
+});
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+test.each(["hermes", "openclaw"] as const)("%s never offers unapproved providers while runtime metadata loads or is empty", async (runtime) => {
+  row = { ...row, runtime };
+  let release!: () => void;
+  runtimeGate = new Promise<void>((resolve) => { release = resolve; });
+  mount();
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.queryByTitle("openai-small")).toBeNull();
+  await act(async () => { release(); await runtimeGate; });
+  await screen.findByText("No matching models. Connect a provider or refresh the list.");
+  expect(screen.queryByTitle("openai-small")).toBeNull();
+  supportedProviders = ["gemini"];
+  fireEvent.click(screen.getByRole("button", { name: "Refresh models" }));
+  await screen.findByTitle("gemini-small");
+  expect(screen.queryByTitle("openai-small")).toBeNull();
+  expect(posts).toEqual([]);
+});
+
+test("a failed OpenRouter catalog reports its error without hiding another provider", async () => {
+  extraProviders = [provider("openrouter", { models_source: "live" })];
+  failedModelProvider = "openrouter";
+  mount(); await open(); show("openrouter");
+  await screen.findByRole("alert");
+  show("gemini");
+  expect(screen.getByTitle("gemini-small")).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(posts).toEqual([]);
+});
+
+test("a first open after page reload needs no request when a snapshot is available", async () => {
+  writeModelMenuSnapshot({ version: 1, savedAt: Date.now(),
+    catalog: { providers: [provider("openai")], default_cwd: "", shell: "" },
+    connections: [{ jarvis: "openai", key_set: true, is_active_brain: false }], providers: [], live: {},
+  });
+  const serialized = localStorage.getItem(MODEL_MENU_SNAPSHOT_KEY)!;
+  clearModelMenuSnapshot();
+  localStorage.setItem(MODEL_MENU_SNAPSHOT_KEY, serialized);
+  mount();
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.getByTitle("openai-small")).toBeTruthy();
+  expect(screen.queryByText("Loading the provider catalog…")).toBeNull();
+  expect(catalogCalls).toBe(0);
+});
+
+test("an idle open menu schedules no animation loop and batches layout changes", async () => {
+  const frames: FrameRequestCallback[] = [];
+  const requestFrame = vi.fn((callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
+  vi.stubGlobal("requestAnimationFrame", requestFrame);
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  mount(); await open();
+  expect(requestFrame).not.toHaveBeenCalled();
+  fireEvent.resize(window);
+  fireEvent.resize(window);
+  expect(requestFrame).toHaveBeenCalledTimes(1);
+  act(() => frames[0](0));
+  expect(requestFrame).toHaveBeenCalledTimes(1);
+});
+
+test("reopening reuses prepared model rows without exposing a closed menu to accessibility", async () => {
+  mount(); const input = await open();
+  const prepared = screen.getByTitle("openai-small");
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(screen.getByTitle("openai-small")).toBe(prepared);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
+  expect(screen.getByTitle("openai-small")).toBe(prepared);
+});
+
+test("opening uses geometry prepared before the click", async () => {
+  mount();
+  await waitFor(() => expect(screen.getByTitle("openai-small")).toBeTruthy());
+  const trigger = screen.getByRole("button", { name: "Model" });
+  const measure = vi.spyOn(trigger, "getBoundingClientRect");
+  try {
+    fireEvent.click(trigger);
+    expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
+    expect(measure).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Search models" }), { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.click(trigger);
+    expect(measure).not.toHaveBeenCalled();
+  } finally {
+    measure.mockRestore();
+  }
+});
+
+test("freshly disconnected credentials supersede a display snapshot", async () => {
+  writeModelMenuSnapshot({ version: 1, savedAt: Date.now(),
+    catalog: { providers: [provider("openai")], default_cwd: "", shell: "" },
+    connections: [{ jarvis: "openai", key_set: true, is_active_brain: false }], providers: [], live: {},
+  });
+  const store = createAgentChatStore("society");
+  mount(false, false, store);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.getByTitle("openai-small")).toBeTruthy();
+  act(() => store.setState({
+    catalog: { providers: [provider("openai")], default_cwd: "", shell: "" },
+    connections: [{ jarvis: "openai", key_set: false, api_key_set: false, is_active_brain: false }],
+  }));
+  await waitFor(() => expect(screen.queryByTitle("openai-small")).toBeNull());
+});
+
+function mount(busy = false, inDialog = false, store?: AgentChatStoreHook) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const initial: SocietyAgent = { ...SAMPLE_ROSTER[1], ...rowToAgent(row) };
+  client.setQueryData(["society", "roster"], { agents: [initial], sample: false });
+  function Subject() {
+    const { agent } = useSocietyAgent("scout");
+    const picker = <AgentModelPicker agent={agent ?? initial} busy={busy} onSavingChange={saving} />;
+    return store ? <AgentChatStoreProvider store={store}>{picker}</AgentChatStoreProvider> : picker;
+  }
+  return render(<QueryClientProvider client={client}>{inDialog ? <Dialog.Root defaultOpen>
+    <Dialog.Content><Dialog.Title>Agent</Dialog.Title><Dialog.Description>Model controls</Dialog.Description><Subject /></Dialog.Content>
+  </Dialog.Root> : <Subject />}</QueryClientProvider>);
+}
+
+test("already loaded chat models are immediately selectable while every refresh is stalled", async () => {
+  let release!: () => void;
+  catalogGate = connectionsGate = accountsGate = new Promise<void>((resolve) => { release = resolve; });
+  const store = createAgentChatStore("society");
+  store.setState({
+    catalog: { providers: [provider("openai")], default_cwd: "", shell: "" },
+    connections: [{ jarvis: "openai", key_set: true }] as AgentConnectionRow[],
+  });
+  try {
+    mount(false, false, store);
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    // Synchronous: no await, no timers and none of the requests has resolved.
+    expect(screen.getByTitle("openai-small")).toBeTruthy();
+    expect(screen.queryByText("Loading the provider catalog…")).toBeNull();
+    fireEvent.click(screen.getByTitle("openai-small"));
+    await waitFor(() => expect(posts[0].model).toBe("openai-small"));
+  } finally {
+    await act(async () => { release(); await catalogGate; });
+  }
+});
+
+test("a cold menu renders models without waiting for subscription account discovery", async () => {
+  let release!: () => void;
+  accountsGate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    mount(); await open(); show("gemini");
+    expect(screen.getByTitle("gemini-small")).toBeTruthy();
+    expect(screen.queryByText("Loading the provider catalog…")).toBeNull();
+  } finally {
+    await act(async () => { release(); await accountsGate; });
+  }
+});
+
+test("catalog loading starts when the card mounts, before the picker is clicked", async () => {
+  mount();
+  await waitFor(() => expect(catalogCalls).toBe(1));
+  expect(screen.queryByRole("menu")).toBeNull();
+  await open();
+  expect(catalogCalls).toBe(1);
+});
+
+async function open(expected = "openai-large") {
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  await screen.findByTitle(expected);
+  return screen.getByRole("textbox", { name: "Search models" });
+}
+
+/** Lists one provider's models, as a click on its rail mark does. */
+function show(id: string) {
+  fireEvent.click(screen.getByTestId(`agent-model-rail-${id}`));
+}
+
+test("groups connected models and hides disconnected or empty local endpoints", async () => {
+  mount(); await open();
+  expect(screen.getByRole("group", { name: "openai · API key" })).toBeTruthy();
+  show("gemini");
+  expect(screen.getByTitle("gemini-small")).toBeTruthy();
+  expect(screen.queryByTestId("agent-model-rail-offline")).toBeNull();
+  expect(screen.queryByTestId("agent-model-rail-ollama")).toBeNull();
+  expect(screen.queryByTitle("offline-small")).toBeNull();
+  expect(screen.queryByTitle("ollama-small")).toBeNull();
+  expect(screen.queryByRole("combobox")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Apply model" })).toBeNull();
+});
+
+test("clicking a model persists immediately, preserves the account and updates the roster", async () => {
+  mount(); await open();
+  fireEvent.click(screen.getByTitle("openai-small"));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Model" }).textContent).toContain("openai-small"));
+  expect(posts).toEqual([{ provider: "openai", model: "openai-small", effort: "low", account_id: "saved-seat" }]);
+  expect(row.description).toBe("Keep my instructions");
+  expect(saving.mock.calls.map((call) => call[0])).toEqual([true, false]);
+  await open();
+  expect(screen.getByTitle("openai-small").getAttribute("aria-checked")).toBe("true");
+});
+
+test("changing provider resets the subscription account and uses a supported effort", async () => {
+  mount(); await open(); show("gemini");
+  fireEvent.click(screen.getByTitle("gemini-small"));
+  await waitFor(() => expect(posts).toHaveLength(1));
+  expect(posts[0]).toEqual({ provider: "gemini", model: "gemini-small", effort: "low", account_id: "" });
+});
+
+test("a failed save keeps the current model and permits retry", async () => {
+  failSave = true; mount(); await open();
+  fireEvent.click(screen.getByTitle("openai-small"));
+  expect((await screen.findByRole("alert")).textContent).toContain("Could not save the model");
+  expect(screen.getByRole("button", { name: "Model" }).textContent).toContain("openai-large");
+  failSave = false;
+  fireEvent.click(screen.getByTitle("openai-small"));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Model" }).textContent).toContain("openai-small"));
+});
+
+test("does not permit a switch during a running response", () => {
+  mount(true);
+  expect((screen.getByRole("button", { name: "Model" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+test("search filters by model and provider, and Escape closes without saving", async () => {
+  mount(); const input = await open();
+  fireEvent.change(input, { target: { value: "gemini small" } });
+  expect(screen.getByTitle("gemini-small")).toBeTruthy();
+  expect(screen.queryByTitle("gemini-large")).toBeNull();
+  expect(screen.queryByTitle("openai-small")).toBeNull();
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(posts).toEqual([]);
+});
+
+test("the effort submenu commits the model and chosen effort together", async () => {
+  mount(); await open(); show("gemini");
+  fireEvent.click(within(screen.getByRole("group", { name: "gemini · API key" })).getByRole("button", { name: "Thinking effort: Large" }));
+  fireEvent.click(within(screen.getByRole("menu", { name: "Thinking effort" })).getByRole("menuitemradio", { name: "Medium" }));
+  await waitFor(() => expect(posts[0]).toEqual({ provider: "gemini", model: "gemini-large", effort: "medium", account_id: "" }));
+});
+
+test("OpenCode models are offered without a duplicate app-managed login", async () => {
+  extraProviders = [provider("opencode", { runner: "opencode-cli", cli_installed: true,
+    curated_models: [{ id: "opencode/test-free", label: "Free model" }] })];
+  mount(); await open(); show("opencode");
+  fireEvent.click(screen.getByTitle("opencode/test-free"));
+  await waitFor(() => expect(posts[0].provider).toBe("opencode"));
+  expect(posts[0].model).toBe("opencode/test-free");
+});
+
+test("all connected subscription accounts are selectable for a model", async () => {
+  extraProviders = [provider("openai-codex", { runner: "codex-cli", cli_installed: true })];
+  providerRows = [{ id: "openai-codex", subscription: true, accounts: [
+    { id: "work", label: "Work", connected: true }, { id: "personal", label: "Personal", connected: true },
+    { id: "expired", label: "Expired", connected: false },
+  ] }];
+  mount(); await open(); show("openai-codex");
+  fireEvent.click(screen.getByRole("button", { name: "Account: ChatGPT / Codex subscription" }));
+  expect(screen.queryByRole("menuitemradio", { name: "Expired" })).toBeNull();
+  fireEvent.click(screen.getByRole("menuitemradio", { name: "Personal" }));
+  fireEvent.click(await screen.findByTitle("openai-codex-large"));
+  await waitFor(() => expect(posts[0].account_id).toBe("personal"));
+  expect(posts[0].provider).toBe("openai-codex");
+});
+
+test("refresh reloads catalogs and reveals newly available models", async () => {
+  mount(); await open();
+  extraProviders = [provider("opencode", { runner: "opencode-cli", cli_installed: true })];
+  fireEvent.click(screen.getByRole("button", { name: "Refresh models" }));
+  fireEvent.click(await screen.findByTestId("agent-model-rail-opencode"));
+  fireEvent.click(await screen.findByRole("button", { name: /Show more models/ }));
+  await screen.findByTitle("opencode-small");
+  expect(catalogCalls).toBe(2);
+});
+
+test("local endpoints show only installed models, and search works by model id", async () => {
+  liveModels.ollama = [{ id: "qwen3:8b", label: "Qwen 3" }];
+  mount(); const input = await open();
+  fireEvent.click(await screen.findByTestId("agent-model-rail-ollama"));
+  await screen.findByTitle("qwen3:8b");
+  fireEvent.change(input, { target: { value: "qwen3:8b" } });
+  fireEvent.click(screen.getByTitle("qwen3:8b"));
+  await waitFor(() => expect(posts[0].provider).toBe("ollama"));
+});
+
+test("keyboard navigation moves through results and closes back to the trigger", async () => {
+  mount(); const input = await open();
+  fireEvent.keyDown(input, { key: "ArrowDown" });
+  expect(document.activeElement).toBe(screen.getByTitle("openai-small"));
+  fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+  expect(document.activeElement).toBe(screen.getByTitle("openai-large"));
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Model" }));
+});
+
+test("Escape closes a nested menu before the surrounding agent card", async () => {
+  mount(false, true); const input = await open();
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Model" }));
+});
+
+test("subscriptions precede OpenCode, which initially shows only explicit free models", async () => {
+  extraProviders = [provider("opencode", { runner: "opencode-cli", cli_installed: true, curated_models: [
+    { id: "opencode/paid", label: "Paid" }, { id: "opencode/test-free", label: "Free" },
+    { id: "opencode/big-pickle", label: "Big Pickle" },
+  ] }), provider("z-plan", { runner: "grok-cli", cli_installed: true })];
+  mount(); await open();
+  const rail = screen.getAllByTestId(/^agent-model-rail-/).map((mark) => mark.getAttribute("aria-label"));
+  expect(rail.slice(0, 3)).toEqual(["Favorites", "Grok subscription", "opencode"]);
+  show("opencode");
+  expect(screen.getByTitle("opencode/test-free")).toBeTruthy();
+  expect(screen.getByTitle("opencode/big-pickle")).toBeTruthy();
+  expect(screen.queryByTitle("opencode/paid")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /Show more models/ }));
+  expect(screen.getByTitle("opencode/paid")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Show fewer models" }));
+  expect(screen.queryByTitle("opencode/paid")).toBeNull();
+  expect(posts).toEqual([]);
+});
+
+test("OpenRouter folds independently, searching finds hidden models, and clearing restores the fold", async () => {
+  extraProviders = [provider("openrouter")];
+  mount(); const input = await open(); show("openrouter");
+  const toggle = within(screen.getByRole("menu", { name: "Model" })).getByRole("button", { name: "openrouter · API key" });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(screen.queryByTitle("openrouter-small")).toBeNull();
+  fireEvent.click(toggle);
+  expect(screen.getByTitle("openrouter-small")).toBeTruthy();
+  fireEvent.click(toggle);
+  fireEvent.change(input, { target: { value: "openrouter large" } });
+  expect(screen.getByTitle("openrouter-large")).toBeTruthy();
+  expect(screen.queryByTitle("openrouter-small")).toBeNull();
+  fireEvent.change(input, { target: { value: "" } });
+  expect(screen.queryByTitle("openrouter-large")).toBeNull();
+  expect(posts).toEqual([]);
+});
+
+test("hidden OpenCode models remain selectable through search and a reopened menu is compact", async () => {
+  extraProviders = [provider("opencode", { runner: "opencode-cli", cli_installed: true })];
+  mount(); const input = await open(); show("opencode");
+  fireEvent.click(screen.getByRole("button", { name: /Show more models/ }));
+  fireEvent.keyDown(input, { key: "Escape" });
+  const reopened = await open();
+  expect(screen.queryByTitle("opencode-large")).toBeNull();
+  fireEvent.change(reopened, { target: { value: "opencode large" } });
+  fireEvent.click(screen.getByTitle("opencode-large"));
+  await waitFor(() => expect(posts[0]).toEqual({ provider: "opencode", model: "opencode-large", effort: "high", account_id: "" }));
+});
+
+test.each([
+  ["kimi", "kimi-cli"], ["cursor", "cursor-cli"], ["opencode", "opencode-cli"],
+  ["glm", "glm-cli"], ["deepseek-harness", "dsh-cli"],
+] as const)("%s can use its CLI account without a published model list", async (id, runner) => {
+  extraProviders = [provider(id, { runner, cli_installed: true, curated_models: [], default_model: "", effort_levels: [], default_effort: "" })];
+  mount(); await open(); show(id);
+  const group = screen.getByRole("group", { name: id });
+  fireEvent.click(within(group).getByRole("menuitemradio", { name: /Default model/ }));
+  await waitFor(() => expect(posts[0]).toEqual({ provider: id, model: "", effort: "", account_id: "" }));
+});
+
+test("one logo covers OpenAI access, defaults to subscription and retains an explicit API choice", async () => {
+  extraProviders = [provider("openai-codex", { family: "openai", runner: "codex-cli", cli_installed: true })];
+  providerRows = [{ id: "openai-codex", subscription: true, accounts: [{ id: "work", label: "Work", connected: true }] }];
+  mount(); await open("openai-codex-small");
+  expect(screen.queryByTestId("agent-model-rail-openai-codex")).toBeNull();
+  expect(screen.getByTestId("agent-model-rail-openai")).toBeTruthy();
+  expect(screen.getByRole("radio", { name: "Subscription" }).getAttribute("aria-checked")).toBe("true");
+  expect(screen.getByTitle("openai-codex-small")).toBeTruthy();
+  fireEvent.click(screen.getByRole("radio", { name: "API key" }));
+  expect(screen.getByTitle("openai-small")).toBeTruthy();
+  expect(posts).toEqual([]);
+  fireEvent.keyDown(screen.getByRole("radio", { name: "API key" }), { key: "Escape" });
+  await open();
+  expect(screen.getByRole("radio", { name: "API key" }).getAttribute("aria-checked")).toBe("true");
+  show("gemini"); show("openai");
+  expect(screen.getByRole("radio", { name: "API key" }).getAttribute("aria-checked")).toBe("true");
+});
+
+test("a dual Claude row saves the exact access and never carries a subscription account onto its API", async () => {
+  row = { ...row, provider: "claude-api", model: "claude-sonnet-5", account_id: "work" };
+  accessWays = { "claude-api": ["api", "subscription"] };
+  extraProviders = [provider("claude-api", { family: "claude", runner: "claude-cli", cli_installed: true,
+    curated_models: [{ id: "opusplan", label: "Opus Plan" }, { id: "claude-sonnet-5", label: "Sonnet" }] })];
+  providerRows = [{ id: "claude-api", subscription: true, accounts: [{ id: "work", label: "Work", connected: true }] }];
+  mount(); await open("claude-sonnet-5");
+  await screen.findByRole("radio", { name: "Subscription" });
+  fireEvent.click(screen.getByRole("button", { name: /Older models/ }));
+  expect(screen.getByTitle("opusplan")).toBeTruthy();
+  fireEvent.click(screen.getByRole("radio", { name: "API key" }));
+  expect(screen.queryByTitle("opusplan")).toBeNull();
+  expect(screen.queryByRole("button", { name: /^Account:/ })).toBeNull();
+  fireEvent.click(screen.getByTitle("claude-sonnet-5"));
+  await waitFor(() => expect(posts[0]).toMatchObject({ provider: "claude-api", model: "claude-sonnet-5", account_id: "api-key" }));
+  await open("claude-sonnet-5");
+  fireEvent.click(screen.getByRole("radio", { name: "Subscription" }));
+  fireEvent.click(screen.getByRole("button", { name: /Older models/ }));
+  fireEvent.click(screen.getByTitle("opusplan"));
+  await waitFor(() => expect(posts[1]).toMatchObject({ provider: "claude-api", model: "opusplan", account_id: "subscription" }));
+});
+
+test("rail marks move with Alt+Arrow and keep their place on reopen", async () => {
+  localStorage.removeItem("jarvis.chat.providerOrder");
+  mount(); const input = await open();
+  const railOrder = () => screen.getAllByTestId(/^agent-model-rail-(?!favorites)/).map((mark) => mark.getAttribute("data-testid"));
+  expect(railOrder()).toEqual(["agent-model-rail-gemini", "agent-model-rail-openai"]);
+  fireEvent.keyDown(screen.getByTestId("agent-model-rail-openai"), { key: "ArrowUp", altKey: true });
+  expect(railOrder()).toEqual(["agent-model-rail-openai", "agent-model-rail-gemini"]);
+  fireEvent.keyDown(input, { key: "Escape" });
+  await open();
+  expect(railOrder()).toEqual(["agent-model-rail-openai", "agent-model-rail-gemini"]);
+  localStorage.removeItem("jarvis.chat.providerOrder");
+});

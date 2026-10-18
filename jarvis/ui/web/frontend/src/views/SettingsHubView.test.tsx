@@ -1,0 +1,314 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
+import type { SectionHealth } from "@/hooks/useProviders";
+
+// Mutable mock store state — hoisted so the vi.mock factories below can close
+// over it. Each test sets `activeSection` before rendering and inspects the
+// `setActiveSection` spy.
+const { mockState } = vi.hoisted(() => ({
+  mockState: {
+    activeSection: "settings" as string,
+    setActiveSection: vi.fn(),
+  },
+}));
+
+const { mockHealth } = vi.hoisted(() => ({
+  mockHealth: {} as Record<string, SectionHealth>,
+}));
+
+vi.mock("@/store/events", () => ({
+  useEventStore: (selector: (s: typeof mockState) => unknown) => selector(mockState),
+}));
+
+vi.mock("@/i18n", () => ({
+  // Identity translator: labels resolve to their keys (or the English
+  // fallback where the nav item defines one), so assertions match keys.
+  useT: () => (key: string) => key,
+  useUiLanguage: () => "en",
+}));
+
+vi.mock("@/hooks/useProviders", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/hooks/useProviders")>();
+  return {
+    ...actual,
+    useSectionHealth: () => ({ health: mockHealth, reload: vi.fn() }),
+  };
+});
+
+// ViewHeader lives in ChatsView, which drags in the whole chat surface. The
+// hub only needs the header's shape, so stub it. `right` must pass through:
+// the hub's search box lives in that slot.
+vi.mock("@/views/ChatsView", () => ({
+  ViewHeader: ({
+    title,
+    subtitle,
+    right,
+  }: {
+    title: string;
+    subtitle?: string;
+    right?: ReactNode;
+  }) => (
+    <header data-testid="view-header">
+      <span data-testid="view-header-title">{title}</span>
+      <span data-testid="view-header-subtitle">{subtitle}</span>
+      {right}
+    </header>
+  ),
+}));
+
+// Stub every tab — the hub is a thin shell; what matters is WHICH tab it
+// renders for an active id, not the tabs' own behaviour.
+function stub(testid: string) {
+  return () => <div data-testid={testid}>{testid}</div>;
+}
+
+vi.mock("@/views/SettingsView", () => ({
+  SettingsView: ({ searchTarget }: { searchTarget?: string }) => (
+    <div data-testid="TAB_SETTINGS" data-search-target={searchTarget} />
+  ),
+}));
+vi.mock("@/views/ProfileView", () => ({ ProfileView: stub("TAB_PROFILE") }));
+vi.mock("@/views/AssistantProfileView", () => ({
+  AssistantProfileView: stub("TAB_INSTRUCTIONS"),
+}));
+vi.mock("@/views/socials/SocialsView", () => ({ SocialsView: stub("TAB_SOCIALS") }));
+vi.mock("@/views/ApiKeysView", () => ({ ApiKeysView: stub("TAB_APIKEYS") }));
+vi.mock("@/views/TelephonyView", () => ({
+  TelephonySetupView: stub("TAB_TELEPHONY_SETUP"),
+}));
+vi.mock("@/views/PetsView", () => ({ PetsView: stub("TAB_PETS") }));
+vi.mock("@/views/CostsView", () => ({ CostsView: stub("TAB_COSTS") }));
+vi.mock("@/views/feedback/FeedbackView", () => ({
+  FeedbackView: stub("TAB_FEEDBACK"),
+}));
+
+import { SettingsHubDialog, SettingsHubView as HubView } from "@/views/SettingsHubView";
+
+const SettingsHubView = () => <HubView />;
+
+const NAV_IDS = [
+  "settings",
+  "pets",
+  "profile",
+  "agent-instructions",
+  "socials",
+  "apikeys",
+  "costs",
+  "feedback",
+] as const;
+
+beforeEach(() => {
+  mockState.activeSection = "settings";
+  mockState.setActiveSection = vi.fn();
+  for (const key of Object.keys(mockHealth)) delete mockHealth[key];
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("SettingsHubView header and navigation", () => {
+  it("separates the navigation from the content and opens with the heading", async () => {
+    render(<HubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+    expect(screen.getByTestId("settings-hub-sidebar").className).toContain("jarvis-nav-surface");
+    expect(screen.getByTestId("settings-hub-content").parentElement?.className).toContain("jarvis-sheet");
+    // The caption's back arrow leaves the page; the nav has no row for it.
+    expect(screen.queryByTestId("settings-hub-close")).toBeNull();
+    expect(screen.queryByText("settings_hub.back_to_app")).toBeNull();
+  });
+
+  it("starts below the window caption so its controls stay visible", async () => {
+    render(<SettingsHubDialog onClose={vi.fn()} />);
+    const dialog = await screen.findByTestId("settings-hub-dialog");
+    expect(dialog.className).toContain("top-8");
+    expect(dialog.className).not.toContain("inset-0");
+  });
+
+  it("opens as a named dialog that Escape closes", async () => {
+    const onClose = vi.fn();
+    render(<SettingsHubDialog onClose={onClose} />);
+    const dialog = await screen.findByRole("dialog", { name: "nav.settings" });
+    expect(dialog.getAttribute("data-testid")).toBe("settings-hub-dialog");
+    expect(screen.getByPlaceholderText("settings_hub.search_placeholder")).toBeTruthy();
+    await screen.findByTestId("TAB_SETTINGS");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("clears a filled search on Escape before closing", async () => {
+    const onClose = vi.fn();
+    render(<SettingsHubDialog onClose={onClose} />);
+    await screen.findByTestId("TAB_SETTINGS");
+    const search = screen.getByTestId("settings-hub-search");
+    fireEvent.change(search, { target: { value: "wall" } });
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect((search as HTMLInputElement).value).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("lists every mocked entry in the left navigation", async () => {
+    render(<SettingsHubView />);
+
+    for (const id of NAV_IDS) {
+      expect(screen.getByTestId(`settings-hub-nav-${id}`)).toBeTruthy();
+    }
+    await screen.findByTestId("TAB_SETTINGS");
+  });
+
+  it("marks the active entry current", async () => {
+    mockState.activeSection = "costs";
+    render(<SettingsHubView />);
+
+    await screen.findByTestId("TAB_COSTS");
+    expect(
+      screen.getByTestId("settings-hub-nav-costs").getAttribute("aria-current"),
+    ).toBe("page");
+    expect(
+      screen.getByTestId("settings-hub-nav-settings").getAttribute("aria-current"),
+    ).toBeNull();
+  });
+
+  it("navigates when a nav entry is clicked", async () => {
+    mockState.activeSection = "settings";
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    fireEvent.click(screen.getByTestId("settings-hub-nav-costs"));
+    expect(mockState.setActiveSection).toHaveBeenCalledWith("costs");
+  });
+});
+
+describe("SettingsHubView tab resolution", () => {
+  it.each([
+    ["settings", "TAB_SETTINGS"],
+    ["profile", "TAB_PROFILE"],
+    ["agent-instructions", "TAB_INSTRUCTIONS"],
+    ["socials", "TAB_SOCIALS"],
+    ["apikeys", "TAB_APIKEYS"],
+    ["pets", "TAB_PETS"],
+    ["costs", "TAB_COSTS"],
+    ["feedback", "TAB_FEEDBACK"],
+    // Merged-in ids land on the tab hosting their content.
+    ["taskbar", "TAB_SETTINGS"],
+    ["languages", "TAB_SETTINGS"],
+    ["telephony", "TAB_APIKEYS"],
+    ["telephony-setup", "TAB_TELEPHONY_SETUP"],
+  ])("shows %s on the right tab", async (section, tab) => {
+    mockState.activeSection = section;
+    render(<SettingsHubView />);
+
+    expect(await screen.findByTestId(tab)).toBeTruthy();
+  });
+
+  it("highlights API Keys while the telephony setup page is open", async () => {
+    mockState.activeSection = "telephony-setup";
+    render(<SettingsHubView />);
+
+    await screen.findByTestId("TAB_TELEPHONY_SETUP");
+    expect(
+      screen.getByTestId("settings-hub-nav-apikeys").getAttribute("aria-current"),
+    ).toBe("page");
+  });
+
+  it("lists neither Local models nor Contacts", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    expect(screen.queryByTestId("settings-hub-nav-local-models")).toBeNull();
+    expect(screen.queryByTestId("settings-hub-nav-contacts")).toBeNull();
+  });
+
+  it("falls back to Settings for an unexpected section id", async () => {
+    mockState.activeSection = "chats";
+    render(<SettingsHubView />);
+
+    expect(await screen.findByTestId("TAB_SETTINGS")).toBeTruthy();
+  });
+});
+
+describe("SettingsHubView search", () => {
+  it("finds a field on another Settings page", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+    fireEvent.change(screen.getByPlaceholderText("settings_hub.search_placeholder"), {
+      target: { value: "What is it?" },
+    });
+    fireEvent.click(screen.getByTestId("settings-hub-page-feedback"));
+    expect(mockState.setActiveSection).toHaveBeenCalledWith("feedback");
+  });
+
+  it("finds an option inside Settings and opens its group", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    fireEvent.change(screen.getByPlaceholderText("settings_hub.search_placeholder"), {
+      target: { value: "Microphone" },
+    });
+    fireEvent.click(screen.getByTestId("settings-hub-option-audio-devices"));
+
+    expect(mockState.setActiveSection).toHaveBeenCalledWith("settings");
+    expect(screen.getByTestId("TAB_SETTINGS").getAttribute("data-search-target"))
+      .toBe("audio-devices");
+  });
+
+  it("reports when neither pages nor options match", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+    fireEvent.change(screen.getByPlaceholderText("settings_hub.search_placeholder"), {
+      target: { value: "zzz-unmatched-setting" },
+    });
+    expect(screen.getByRole("status").textContent).toBe("settings_hub.no_results");
+  });
+
+  it("filters the nav entries by label", async () => {
+    mockState.activeSection = "settings";
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    fireEvent.change(screen.getByPlaceholderText("settings_hub.search_placeholder"), {
+      target: { value: "spend" },
+    });
+
+    expect(screen.getByTestId("settings-hub-nav-costs")).toBeTruthy();
+    expect(screen.queryByTestId("settings-hub-nav-profile")).toBeNull();
+    expect(screen.queryByTestId("settings-hub-nav-apikeys")).toBeNull();
+  });
+
+  it("shows everything again once the search is cleared", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    const search = screen.getByPlaceholderText("settings_hub.search_placeholder");
+    fireEvent.change(search, { target: { value: "wall" } });
+    expect(screen.queryByTestId("settings-hub-nav-profile")).toBeNull();
+    fireEvent.change(search, { target: { value: "" } });
+    for (const id of NAV_IDS) {
+      expect(screen.getByTestId(`settings-hub-nav-${id}`)).toBeTruthy();
+    }
+  });
+});
+
+describe("SettingsHubView health signals", () => {
+  it("carries the API-Keys alert dot on a provider error", async () => {
+    mockHealth.realtime = {
+      status: "error",
+      reason: "rate_limited",
+      detail: "Gemini Live: rate limited",
+      subject_id: "gemini-live",
+    };
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    expect(screen.getByTestId("settings-hub-alert-apikeys")).toBeTruthy();
+  });
+
+  it("stays calm when nothing is broken", async () => {
+    render(<SettingsHubView />);
+    await screen.findByTestId("TAB_SETTINGS");
+
+    expect(screen.queryByTestId("settings-hub-alert-apikeys")).toBeNull();
+  });
+});

@@ -1,0 +1,25 @@
+# Personal Jarvis — test fixture for Phase-7.2 atomic-writer tests.
+# This comment must survive all 100 mutations (Plan-AC §7.2).
+
+[profile]
+name = "test-runner"
+language = "de"  # de | en | auto
+
+[tts]
+# Default provider for voice tests
+provider = "gemini-flash-tts"
+voice_de = "Charon"
+voice_en = "Charon"
+speed = 1.0
+language_code = "de-DE"
+
+[stt]
+provider = "faster-whisper"
+
+[brain]
+primary = "claude-api"
+
+[ui]
+tray_enabled = true
+
+# Trailing comment — this one must survive too.

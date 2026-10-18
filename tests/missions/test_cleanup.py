@@ -1,0 +1,317 @@
+"""Tests for cleanup.startup_sweep + daily_cleanup_task."""
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+import stat
+import time
+from pathlib import Path
+
+import pytest
+
+from jarvis.missions.cleanup import (
+    DEFAULT_CLEANUP_DAYS,
+    DEFAULT_DAILY_INTERVAL_SECONDS,
+    daily_cleanup_task,
+    startup_sweep,
+)
+from jarvis.missions.standalone_run import write_marker
+
+# --- startup_sweep ---
+
+
+@pytest.mark.asyncio
+async def test_sweep_nonexistent_root_returns_zero(tmp_path: Path) -> None:
+    """If isolation_root does not exist: clean return with zeros."""
+    nonexistent = tmp_path / "nonexistent"
+    stats = await startup_sweep(isolation_root=nonexistent)
+    assert stats == {"scanned": 0, "removed": 0, "errors": 0}
+
+
+@pytest.mark.asyncio
+async def test_sweep_empty_root_no_action(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    root.mkdir()
+    stats = await startup_sweep(isolation_root=root)
+    assert stats["scanned"] == 0
+    assert stats["removed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_recent_directories(tmp_path: Path) -> None:
+    """Directories younger than cleanup_days remain untouched."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    fresh = root / "mission_fresh"
+    fresh.mkdir()
+    (fresh / "log.txt").write_text("x")
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+    assert stats["scanned"] == 1
+    assert stats["removed"] == 0
+    assert fresh.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_old_directories(tmp_path: Path) -> None:
+    """Directories older than cleanup_days are removed."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    old = root / "mission_old"
+    old.mkdir()
+    (old / "log.txt").write_text("old")
+
+    # Set mtime back 30 days
+    thirty_days_ago = time.time() - (30 * 86400)
+    os.utime(old, (thirty_days_ago, thirty_days_ago))
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+    assert stats["scanned"] == 1
+    assert stats["removed"] == 1
+    assert not old.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_mixed_keeps_fresh_removes_old(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    root.mkdir()
+
+    fresh = root / "mission_fresh"
+    fresh.mkdir()
+    (fresh / "x.txt").write_text("fresh")
+
+    old = root / "mission_old"
+    old.mkdir()
+    (old / "x.txt").write_text("old")
+    thirty_days_ago = time.time() - (30 * 86400)
+    os.utime(old, (thirty_days_ago, thirty_days_ago))
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+    assert stats["scanned"] == 2
+    assert stats["removed"] == 1
+    assert fresh.exists()
+    assert not old.exists()
+
+
+def _age(path: Path, days: int = 30) -> None:
+    past = time.time() - (days * 86400)
+    os.utime(path, (past, past))
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_old_runs_that_hold_deliverables(tmp_path: Path) -> None:
+    """A finished run's pages and pictures are the Artifacts section itself.
+
+    The age sweep deleted them after 14 days and the section emptied out
+    (2026-09-29). Scaffolding without deliverables is still reclaimed.
+    """
+    root = tmp_path / "outputs"
+    root.mkdir()
+    artifact = root / "mission_artifact"
+    files = artifact / "tasks" / "task-1" / "artifacts" / "files" / "site"
+    files.mkdir(parents=True)
+    (files / "index.html").write_text("<title>Dashboard</title>")
+    empty_run = root / "mission_failed"
+    (empty_run / "tasks" / "task-1" / "artifacts" / "files").mkdir(parents=True)
+    worktree = root / "20260727T095351__scaffolding__259d2674"
+    (worktree / "tasks" / "task-1" / "workspace").mkdir(parents=True)
+    for entry in (artifact, empty_run, worktree):
+        _age(entry)
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+
+    assert stats["removed"] == 2
+    assert artifact.exists()
+    assert not empty_run.exists()
+    assert not worktree.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_old_standalone_runs(tmp_path: Path) -> None:
+    """Chat media lives in a standalone run; deleting it breaks the transcript."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    media = root / "chat-media-abc"
+    write_marker(media, kind="chat_media", title="Chat media")
+    _age(media)
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+
+    assert stats["removed"] == 0
+    assert media.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_cleanup_days_zero_removes_anything(tmp_path: Path) -> None:
+    """With cleanup_days=0, all found dirs should be removed — the
+    exact count depends on the FS mtime resolution though; we
+    only check that at least one gets removed (no crash, sweep
+    works)."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    a = root / "a"
+    a.mkdir()
+    # Set mtime explicitly in the past so age_seconds > 0 is guaranteed
+    past = time.time() - 1.0
+    os.utime(a, (past, past))
+    b = root / "b"
+    b.mkdir()
+    os.utime(b, (past, past))
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=0)
+    assert stats["scanned"] == 2
+    assert stats["removed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sweep_handles_locked_files_gracefully(tmp_path: Path) -> None:
+    """If rmtree partially fails (e.g. a file lock), the errors counter goes up
+    but the sweep doesn't crash."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    old = root / "mission_old"
+    old.mkdir()
+    (old / "x.txt").write_text("data")
+    thirty_days_ago = time.time() - (30 * 86400)
+    os.utime(old, (thirty_days_ago, thirty_days_ago))
+
+    # Even if rmtree tries with ignore_errors=True, stats should be valid
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+    # In the normal case: removed=1
+    assert stats["scanned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_directories_with_readonly_files(tmp_path: Path) -> None:
+    """Git object/pack files inside mission worktrees are read-only on
+    Windows; a plain ``shutil.rmtree`` fails with PermissionError there, so
+    the backlog was never deleted and grew forever (the 30s-launch bug:
+    128 failing rmtree attempts on every boot)."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    old = root / "mission_old"
+    pack_dir = old / "workspace" / ".git" / "objects" / "pack"
+    pack_dir.mkdir(parents=True)
+    pack = pack_dir / "pack-abc.idx"
+    pack.write_text("binary-ish")
+    pack.chmod(stat.S_IREAD)
+
+    thirty_days_ago = time.time() - (30 * 86400)
+    os.utime(old, (thirty_days_ago, thirty_days_ago))
+
+    stats = await startup_sweep(isolation_root=root, cleanup_days=14)
+
+    assert stats["removed"] == 1
+    assert stats["errors"] == 0
+    assert not old.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep runs at boot on the same loop that serves /api/health; if
+    it blocks, the desktop window cannot appear until the sweep finishes
+    (the 30s-launch bug). A heartbeat task must keep ticking while a slow
+    removal is in progress."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+    old = root / "mission_old"
+    old.mkdir()
+    thirty_days_ago = time.time() - (30 * 86400)
+    os.utime(old, (thirty_days_ago, thirty_days_ago))
+
+    def slow_remove(entry: Path, *, repo_root: Path | None) -> bool:
+        time.sleep(0.5)  # simulates rmtree/git churning through a big tree
+        shutil.rmtree(entry, ignore_errors=True)
+        return True
+
+    monkeypatch.setattr("jarvis.missions.cleanup._remove_entry", slow_remove)
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    hb = asyncio.create_task(heartbeat())
+    try:
+        await startup_sweep(isolation_root=root, cleanup_days=14)
+    finally:
+        hb.cancel()
+
+    assert ticks >= 5, f"event loop was blocked during the sweep (ticks={ticks})"
+
+
+# --- daily_cleanup_task ---
+
+
+@pytest.mark.asyncio
+async def test_daily_task_runs_sweep_then_cancels(tmp_path: Path) -> None:
+    """daily_task fuehrt sweep periodisch aus, cancelable."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+
+    # Task mit kurzem Intervall starten
+    task = asyncio.create_task(
+        daily_cleanup_task(
+            isolation_root=root,
+            cleanup_days=14,
+            interval_seconds=0.1,
+        )
+    )
+
+    # Wait 250ms -> 2 sweeps should have run
+    await asyncio.sleep(0.25)
+
+    # Cancel + clean exit
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_daily_task_continues_on_sweep_error(tmp_path: Path, monkeypatch) -> None:
+    """If a sweep crashes, the task should keep running (catch-and-log)."""
+    root = tmp_path / "outputs"
+    root.mkdir()
+
+    call_count = {"n": 0}
+
+    async def crashing_sweep(*args, **kwargs):
+        call_count["n"] += 1
+        raise RuntimeError("simulated")
+
+    monkeypatch.setattr("jarvis.missions.cleanup.startup_sweep", crashing_sweep)
+
+    task = asyncio.create_task(
+        daily_cleanup_task(
+            isolation_root=root,
+            cleanup_days=14,
+            interval_seconds=0.05,
+        )
+    )
+
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Despite crashes, it was retried multiple times
+    assert call_count["n"] >= 2
+
+
+# --- Konstanten ---
+
+
+def test_default_cleanup_days_is_14() -> None:
+    assert DEFAULT_CLEANUP_DAYS == 14
+
+
+def test_default_daily_interval_is_one_day() -> None:
+    assert DEFAULT_DAILY_INTERVAL_SECONDS == 24 * 60 * 60

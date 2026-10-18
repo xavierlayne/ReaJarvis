@@ -1,0 +1,235 @@
+"""Explicit-delegation gate for LLM-chosen agent spawns (spawn_gate.py).
+
+Maintainer mandate 2026-07-18: a background agent may be spawned by the model
+ONLY when the user explicitly asks for one (or confirms a delegation offer one
+turn later). The two live regression utterances pinned below come verbatim
+from the 2026-07-18 voice sessions (08:25 Gulfstream remark, 08:29 relocation
+remark) — both spawned an unrequested agent before the gate existed.
+"""
+from __future__ import annotations
+
+import pytest
+
+from jarvis.brain.spawn_gate import (
+    OFFER_WINDOW,
+    SPAWN_VEHICLE_TOOL_NAMES,
+    DelegationOfferWindow,
+    llm_spawn_allowed,
+)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_offer_window():
+    OFFER_WINDOW.disarm()
+    yield
+    OFFER_WINDOW.disarm()
+
+
+# ── live regressions: conversational turns must NEVER unlock a spawn ──────
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        # voice-session 2026-07-18 08:25 — a remark, spawned an agent anyway
+        "Kann er jetzt überhaupt, der kann sich ja "  # i18n-allow: live utterance
+        "jeden Tag 'ne Golf Stream kaufen.",  # i18n-allow: live utterance
+        # voice-session 2026-07-18 08:29 — an intention, spawned an agent anyway
+        "Ah, ich will gucken, wo ich als nächstes hinziehe.",  # i18n-allow: live utterance
+        "What is the richest place in Europe after Monaco?",
+        "Wie viele Milliardäre gibt es in Starnberg?",  # i18n-allow: DE turn fixture
+        "Research the best cities to move to.",
+        "",
+    ],
+)
+def test_conversational_turn_blocks_spawn(utterance: str) -> None:
+    assert llm_spawn_allowed(utterance) is False
+
+
+# ── explicit requests: naming the vehicle unlocks the spawn ───────────────
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Spawn an agent to research the best cities.",
+        "Spawne einen Subagenten und recherchier das.",  # i18n-allow: DE trigger
+        "Lass das einen Gustav Agent machen.",  # i18n-allow: DE trigger
+        "Ein Nova-Agent soll das übernehmen.",  # i18n-allow: DE trigger
+        "Delegate this to a worker, please.",
+        "Mach das im Hintergrund.",  # i18n-allow: DE trigger
+        "Do that in the background and tell me later.",
+        "Starte eine Mission dafür.",  # i18n-allow: DE trigger
+        "Delega esto a un agente.",
+    ],
+)
+def test_explicit_delegation_request_allows_spawn(utterance: str) -> None:
+    assert llm_spawn_allowed(utterance) is True
+
+
+def test_wake_word_brand_is_not_hardcoded() -> None:
+    """ANY '<wake-name> Agent' phrasing must match — the brand is dynamic (§4)."""
+    for brand in ("Gustav", "Harald", "Nova"):
+        OFFER_WINDOW.disarm()
+        utterance = f"Frag mal einen {brand} Agent dazu."  # i18n-allow: DE trigger
+        assert llm_spawn_allowed(utterance) is True
+
+
+# ── declines and feature talk must not read as requests ───────────────────
+
+
+def test_spawn_decline_blocks_even_though_it_names_the_vehicle() -> None:
+    assert (
+        llm_spawn_allowed("Nee, spawne bitte keinen Subagenten dafür.")  # i18n-allow: DE decline
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        # voice-session 2026-08-24 10:24 Turn 4 — the user CORRECTS the
+        # assistant's offer to do the job inline. "No" answers that offer;
+        # "worker" is the vehicle he wants, not one he refuses.
+        "No, no, which a worker should do it.",
+        "No, no, a worker should do it.",
+        # the same shape without the stutter, and the positive command form
+        "No, do it with a subagent.",
+        "No, I want an agent for this.",
+        # German never had the bug ("nein" ≠ "kein") — pinned so it stays so
+        "Nein, nein, ein Worker soll das machen.",  # i18n-allow: DE live turn
+    ],
+)
+def test_leading_contradiction_is_not_a_spawn_decline(utterance: str) -> None:
+    """A "No," that answers the assistant's offer must not read as "no worker".
+
+    English collapses German "kein" (negates the noun) and "nein"
+    (contradicts the statement) into one word, and the decline regex's
+    char-window read either as the first. Live: the user asked for a worker
+    three turns running and was refused every time.
+    """
+    assert llm_spawn_allowed(utterance) is True
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "No subagent please, just talk to me.",
+        "No, no subagent!",
+        "No, do not spawn a subagent, talk to me directly.",
+        "No, I don't want a subagent.",
+        "No uses un subagente.",  # i18n-allow: ES decline
+    ],
+)
+def test_real_declines_survive_the_contradiction_strip(utterance: str) -> None:
+    """Dropping the leading particle must not disarm an actual refusal."""
+    assert llm_spawn_allowed(utterance) is False
+
+
+def test_auto_spawn_feature_complaint_blocks() -> None:
+    assert (
+        llm_spawn_allowed(
+            "Das Auto-Spawn-Verhalten nervt, das müssen wir fixen."  # i18n-allow: DE feature talk
+        )
+        is False
+    )
+
+
+# ── the offer window: blocked turn → model offers → short yes unlocks ─────
+
+
+def test_short_yes_after_blocked_turn_unlocks_exactly_once() -> None:
+    remark = "Ich will gucken, wo ich als nächstes hinziehe."  # i18n-allow: live utterance
+    assert llm_spawn_allowed(remark) is False
+    # model offered delegation; the user's short yes unlocks ONE spawn ...
+    assert llm_spawn_allowed("Ja, mach das.") is True  # i18n-allow: DE confirm
+    # ... and only one — the window is consumed
+    OFFER_WINDOW.disarm()
+    assert llm_spawn_allowed("Ja, mach das.") is False  # i18n-allow: DE confirm
+
+
+def test_yes_in_english_and_spanish_unlocks_too() -> None:
+    assert llm_spawn_allowed("figure out where I should move next") is False
+    assert llm_spawn_allowed("Yes, go ahead.") is True
+    OFFER_WINDOW.disarm()
+    assert llm_spawn_allowed("figure out where I should move next") is False
+    assert llm_spawn_allowed("Sí, hazlo.") is True
+
+
+def test_long_sentence_containing_yes_does_not_unlock() -> None:
+    question = "Wo soll ich als nächstes hinziehen?"  # i18n-allow: DE turn fixture
+    assert llm_spawn_allowed(question) is False
+    assert (
+        llm_spawn_allowed(
+            "Ja, und erzähl mir bitte noch mehr über Monaco."  # i18n-allow: DE counter-example
+        )
+        is False
+    )
+
+
+def test_spoken_confirm_naming_the_vehicle_unlocks_past_the_word_cap() -> None:
+    """Live 2026-08-24 10:24 Turn 5 — the user's third ask in a row.
+
+    Every classifier read "just follow the sub and then do it" as a confirm;
+    it was refused on length alone (eight words against a six-word cap).
+    Naming the vehicle — here the clipped "sub" — is the evidence the cap is
+    otherwise only guessing at, so the confirmation stands.
+    """
+    assert llm_spawn_allowed("Give me an overview of my calendar and mails.") is False
+    assert llm_spawn_allowed("Just follow the sub and then do it.") is True
+
+
+def test_longer_cap_needs_the_vehicle_not_merely_length() -> None:
+    """The counter-example the cap exists for must stay blocked.
+
+    It confirms and then changes the subject; the Turn-5 shape confirms and
+    points back at what was offered. Only the second one gets the long cap.
+    """
+    assert llm_spawn_allowed("Where should I move next?") is False
+    assert llm_spawn_allowed("yes and tell me more about Monaco") is False
+
+
+def test_sub_prefixed_words_are_not_the_vehicle() -> None:
+    """"subscribe" / "submit" / "subject" must not buy the longer cap."""
+    assert llm_spawn_allowed("Where should I move next?") is False
+    assert (
+        llm_spawn_allowed("yes and subscribe me to the newsletter today please")
+        is False
+    )
+
+
+def test_veto_closes_the_offer_window_for_good() -> None:
+    assert llm_spawn_allowed("Find out where I should move next.") is False
+    assert llm_spawn_allowed("No, don't.") is False
+    # a later bare yes must not resurrect the declined offer
+    assert llm_spawn_allowed("Yes.") is False
+
+
+def test_blocked_turn_cannot_confirm_itself() -> None:
+    # a bare affirmative with no pending offer arms the window with ITSELF —
+    # a second model attempt in the same turn must still be blocked
+    assert llm_spawn_allowed("Ja bitte.") is False  # i18n-allow: DE confirm
+    assert llm_spawn_allowed("Ja bitte.") is False  # i18n-allow: DE confirm
+
+
+def test_expired_offer_window_does_not_unlock() -> None:
+    window = DelegationOfferWindow(ttl_s=-1.0)
+    window.arm("find out where I should move next")
+    assert window.consume_confirm("yes, do it") is False
+
+
+def test_explicit_request_disarms_a_stale_offer() -> None:
+    assert llm_spawn_allowed("Find out where I should move next.") is False
+    assert llm_spawn_allowed("Spawn an agent for something else.") is True
+    # the explicit spawn consumed the conversation state — a stray later yes
+    # must not unlock another spawn from the stale offer
+    assert llm_spawn_allowed("Yes.") is False
+
+
+# ── parity with the manager's spawn-tool inventory ────────────────────────
+
+
+def test_vehicle_tool_names_match_manager_inventory() -> None:
+    from jarvis.brain.manager import _SPAWN_TOOL_NAMES
+
+    assert SPAWN_VEHICLE_TOOL_NAMES == _SPAWN_TOOL_NAMES

@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Versioned pre-push privacy gate — Wave 2, layer 1 of a 3-layer defence.
+
+This is the LOCAL, fast feedback layer that runs in the maintainer's everyday
+`git push` (wired via .githooks/pre-push). Layer 3 — the non-bypassable CI
+privacy-gate — is the real backstop, so this hook is allowed to FAIL OPEN when
+it genuinely cannot run, but it FAILS CLOSED on every positive finding.
+
+It enforces exactly three things on an ordinary push:
+
+  (A) Public-repo guard. A direct push to the PUBLIC distribution repo
+      (PersonalJarvis/PersonalJarvis) is hard-blocked. The only sanctioned path
+      to public is the depersonalized public-release snapshot, which scrubs the
+      tree first. Detected by remote name == "public" OR a remote URL
+      containing (case-insensitive) "personaljarvis/personaljarvis".
+
+  (B) Private-identity guard. No commit being pushed may carry a private
+      maintainer email (author OR committer). Only the GitHub noreply form is
+      allowed to leave the machine.
+
+  (C) Secret guard. No real secret (API key / token / private-key block /
+      forbidden secret file) may be in the files being pushed. The detection
+      logic is NOT reinvented here — it REUSES the battle-tested SECRET_PATTERNS,
+      FORBIDDEN_BASENAMES and the secret-allowlist loader from the ship skill's
+      strip_and_scan.py.
+
+CRITICAL DESIGN RULE: on a push to the PRIVATE origin we do NOT block the
+maintainer's real name or other PII. The real name legitimately lives in the
+private working repo and is scrubbed ONLY by the ship gate on the way to public.
+This gate therefore applies the SECRET patterns + FORBIDDEN_BASENAMES + the
+private-EMAIL identity check ONLY. It must NOT apply strip_and_scan's PII
+`scrub_rows` -- doing so would falsely block every ordinary private push.
+
+The concrete private emails are NEVER hardcoded here (this file itself ships to
+the public repo); they are read from git config `privacy.private-email` so the
+gate stays generic and PII-free. See load_private_emails().
+
+Structure: pure functions (unit-tested, no IO) + thin git/IO wrappers.
+stdlib only (cloud-first €5-VPS doctrine: must run on a bare python:3.11-slim).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+# A SHA placeholder of all zeros means "the remote has nothing yet" (a brand-new
+# branch) — see the git pre-push hook stdin contract.
+_ALL_ZERO_RE = re.compile(r"^0+$")
+
+# Reviewed public endpoints, deliberately independent of mutable catalog data.
+# A new HTTP manifest requires reviewing its exact endpoint here: opaque URL
+# paths can carry capability credentials even when ordinary secret regexes miss them.
+_PUBLIC_CATALOG_MCP_URLS = {
+    "agentmail": "https://mcp.agentmail.to/mcp",
+    "apollo": "https://mcp.apollo.io/mcp",
+    "atlassian": "https://mcp.atlassian.com/v1/mcp",
+    "aws": "https://aws-mcp.eu-central-1.api.aws/mcp",
+    "github": "https://api.githubcopilot.com/mcp/",
+    "granola": "https://mcp.granola.ai/mcp",
+    "salesforce": "https://api.salesforce.com/platform/mcp/v1/platform/sobject-all",
+    "shopify": "https://setup.shopify.com/mcp",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Pure functions (unit-tested; no subprocess, no filesystem, no network)
+# --------------------------------------------------------------------------- #
+def target_is_public(remote_name: str, remote_url: str) -> bool:
+    """True iff the push target is the PUBLIC distribution repo.
+
+    Matched by remote name == "public" OR the remote URL containing (case-
+    insensitive) "personaljarvis/personaljarvis". Hyphenated or otherwise
+    non-flagship repo slugs deliberately do NOT match.
+    """
+    if remote_name == "public":
+        return True
+    return "personaljarvis/personaljarvis" in (remote_url or "").lower()
+
+
+def offenders_from_log(log_text: str, private_emails: set[str]) -> list[dict]:
+    """Find commits whose author OR committer email is in `private_emails`.
+
+    Input is `git log` output, one line per commit, tab-separated:
+        "<sha>\t<author_email>\t<committer_email>"
+
+    `private_emails` is the lowercased block-set (see load_private_emails).
+    Returns one dict per offending (sha, role) pair:
+        {"sha": ..., "email": ..., "role": "author"|"committer"}
+    A commit that is private in BOTH fields yields two entries.
+    """
+    offenders: list[dict] = []
+    for line in log_text.splitlines():
+        line = line.strip("\r")
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            # Malformed line — be conservative but do not crash; skip it.
+            continue
+        sha, author_email, committer_email = parts[0], parts[1], parts[2]
+        # Compare case-insensitively: git emits the email verbatim, so a
+        # deliberately-cased address must still be caught.
+        if author_email.lower() in private_emails:
+            offenders.append({"sha": sha, "email": author_email, "role": "author"})
+        if committer_email.lower() in private_emails:
+            offenders.append({"sha": sha, "email": committer_email, "role": "committer"})
+    return offenders
+
+
+def forbidden_file(name: str, forbidden: set[str]) -> bool:
+    """True iff the basename is a forbidden secret file (e.g. .env, jarvis.toml)."""
+    return name in forbidden
+
+
+def is_public_catalog_mcp(rel: str, text: str) -> bool:
+    """Recognize only credential-free catalog manifests, using a strict schema subset.
+
+    This exempts the filename only; callers must still scan the original text
+    for secret patterns. Personal MCP configuration is never exempted.
+    """
+    match = re.fullmatch(r"jarvis/marketplace/plugins/([a-z0-9]+(?:-[a-z0-9]+)*)/mcp\.json", rel)
+    if match is None:
+        return False
+    plugin_id = match.group(1)
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate manifest key")
+            result[key] = value
+        return result
+
+    try:
+        manifest = json.loads(text, object_pairs_hook=unique_object)
+        if not isinstance(manifest, dict) or set(manifest) != {"$schema", "mcpServers"}:
+            return False
+        if manifest["$schema"] != "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json":
+            return False
+        servers = manifest["mcpServers"]
+        if not isinstance(servers, dict) or len(servers) != 1:
+            return False
+        name, server = next(iter(servers.items()))
+        if name.replace("_", "-") != plugin_id or not isinstance(server, dict):
+            return False
+        if server.get("type") == "streamable-http":
+            if set(server) != {"type", "url"} or not isinstance(server["url"], str):
+                return False
+            url = server["url"]
+            if url != _PUBLIC_CATALOG_MCP_URLS.get(plugin_id):
+                return False
+            if any(char.isspace() or ord(char) < 32 for char in url):
+                return False
+            parts = urlsplit(url)
+            return bool(
+                parts.scheme == "https"
+                and parts.hostname
+                and parts.username is None
+                and parts.password is None
+                and "?" not in url
+                and "#" not in url
+                and "\\" not in url
+                and parts.port in (None, 443)
+            )
+        if set(server) != {"type", "command", "args"}:
+            return False
+        if server["type"] != "stdio" or server["command"] != "python":
+            return False
+        expected = ["-m", "jarvis.plugins.tool.connected_server", plugin_id.replace("-", "_")]
+        return server["args"] == expected or (
+            plugin_id == "amd-gpu" and server["args"] == ["-m", "jarvis.marketplace.amd_mcp"]
+        )
+    except (ValueError, TypeError, RecursionError):
+        # Malformed or ambiguous JSON/URLs remain forbidden, without echoing content.
+        return False
+
+
+def forbidden_pushed_file(rel: str, text: str, forbidden: set[str]) -> bool:
+    """Apply the basename denylist with the narrow public catalog exception."""
+    return forbidden_file(rel.rsplit("/", 1)[-1], forbidden) and not (
+        is_public_catalog_mcp(rel, text)
+    )
+
+
+def scan_text_for_secrets(
+    rel: str,
+    text: str,
+    compiled_patterns: dict,
+    allowlist: set,
+) -> list[dict]:
+    """Scan a single file's text for high-confidence secret shapes.
+
+    For each compiled secret regex, every match value is reported as a finding
+    unless the exact (value, rel) pair is in the allowlist (the ship skill's
+    secret-allowlist, loaded as a set of (value, path) tuples).
+
+    Returns: list of {"path": rel, "pattern": <name>, "value": <matched>,
+    "line": <1-based line number>}. ``value`` is for allowlist matching only --
+    print a finding with :func:`describe_secret_finding`, never the raw value.
+    """
+    findings: list[dict] = []
+    for name, rx in compiled_patterns.items():
+        for m in rx.finditer(text):
+            value = m.group(0)
+            if (value, rel) in allowlist:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            findings.append({"path": rel, "pattern": name, "value": value, "line": line})
+    return findings
+
+
+def describe_secret_finding(finding: dict) -> str:
+    """Human-readable location of a secret finding WITHOUT the secret itself.
+
+    Terminal output of a git hook ends up in CI logs, agent transcripts and
+    screen shares, so only the pattern name, the file:line and the match
+    length are shown; the author opens the file to see the value.
+    """
+    where = finding["path"]
+    if finding.get("line"):
+        where = f"{where}:{finding['line']}"
+    length = len(finding.get("value") or "")
+    return f"secret ({finding['pattern']}) in {where} [{length} chars, value hidden]"
+
+
+# --------------------------------------------------------------------------- #
+# Thin git / IO wrappers (NOT unit-tested — side-effecting)
+# --------------------------------------------------------------------------- #
+def _repo_root() -> Path:
+    """Best-effort repo root (dir containing this script's `scripts/ci/` parent)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _git(*args: str) -> str:
+    """Run a git command at the repo root and return decoded stdout.
+
+    Raises CalledProcessError on a non-zero git exit so the caller can decide to
+    fail open when it cannot determine the diff range.
+    """
+    out = subprocess.run(
+        ["git", "-C", str(_repo_root()), *args],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return out.decode("utf-8", "surrogateescape")
+
+
+def load_private_emails() -> set[str]:
+    """Private maintainer emails to block, read from git config (lowercased).
+
+    Configured per-repo so the concrete addresses are NEVER hardcoded in a file
+    that ships to the public repo:
+
+        git config --add privacy.private-email you@example.com
+
+    Returns an empty set if none are configured; the caller then warns and skips
+    the identity check (layer-3 CI remains the backstop).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_repo_root()), "config", "--get-all", "privacy.private-email"],
+            check=False,
+            capture_output=True,
+        ).stdout.decode("utf-8", "surrogateescape")
+    except Exception:  # pragma: no cover - defensive fail-open path
+        return set()
+    return {ln.strip().lower() for ln in out.splitlines() if ln.strip()}
+
+
+#: Last-resort secret shapes, used ONLY when the privacy gate cannot be loaded.
+#: The gate's own table stays the single source of truth — this is deliberately
+#: the smaller, highest-confidence subset. It exists because the gate itself is
+#: withheld from the public distribution, so a clone of the public repo has no
+#: `scripts/ci/privacy_gate/` at all: without a built-in fallback the hook would
+#: load nothing, scan nothing, and report success — a secret guard that silently
+#: guards nothing for every contributor who is not the maintainer.
+_FALLBACK_SECRET_PATTERNS: dict[str, str] = {
+    "openai_legacy": r"\bsk-[A-Za-z0-9]{48}\b",
+    "openai_project": r"\bsk-proj-[A-Za-z0-9_-]{40,}\b",
+    "anthropic": r"\bsk-ant-[A-Za-z0-9_-]{60,}\b",
+    "google_api_key": r"\bAIza[0-9A-Za-z_-]{35}\b",
+    "github_token": r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+    "aws_access_key": r"\bAKIA[0-9A-Z]{16}\b",
+    "slack_token": r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b",
+    "groq_key": r"\bgsk_[A-Za-z0-9]{40,}\b",
+    "google_oauth_secret": r"\bGOCSPX-[A-Za-z0-9_-]{20,}\b",
+    "private_key_block": r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
+}
+
+#: Basenames that must never be pushed, mirrored for the same fallback reason.
+_FALLBACK_FORBIDDEN_BASENAMES: frozenset[str] = frozenset(
+    {".env", "jarvis.toml", "credentials.json", "token.json", "id_rsa", "id_ed25519"}
+)
+
+
+def load_secret_scanner(repo_root: Path) -> tuple[dict | None, set, set]:
+    """Import the privacy gate's strip_and_scan.py and return its scan ingredients.
+
+    Returns (compiled_patterns, forbidden_basenames, allowlist). When the gate
+    cannot be loaded — which is the NORMAL case in a clone of the public repo,
+    where the gate is withheld — falls back to the built-in pattern subset above
+    rather than to no scanner at all. Only an unusable fallback (a broken regex
+    in this file) degrades to (None, set(), set()), where the caller fails OPEN
+    and layer 3 (CI) is the backstop.
+    """
+    try:
+        gate_dir = repo_root / "scripts" / "ci" / "privacy_gate"
+        script = gate_dir / "scripts" / "strip_and_scan.py"
+        spec = importlib.util.spec_from_file_location("ship_strip_and_scan", script)
+        if spec is None or spec.loader is None:
+            return None, set(), set()
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        compiled = {name: re.compile(p) for name, p in module.SECRET_PATTERNS.items()}
+        forbidden = set(module.FORBIDDEN_BASENAMES)
+        allowlist = module._load_allowlist(gate_dir)
+        return compiled, forbidden, allowlist
+    except Exception as exc:
+        print(
+            f"privacy-pre-push: NOTE the privacy gate is not available "
+            f"({exc!r}); scanning with the built-in secret patterns instead.",
+            file=sys.stderr,
+        )
+        try:
+            compiled = {name: re.compile(p) for name, p in _FALLBACK_SECRET_PATTERNS.items()}
+        except re.error as bad:  # pragma: no cover - only a bug in this file
+            print(
+                f"privacy-pre-push: WARNING built-in secret patterns are broken "
+                f"({bad!r}); failing OPEN for the secret/forbidden-file checks.",
+                file=sys.stderr,
+            )
+            return None, set(), set()
+        return compiled, set(_FALLBACK_FORBIDDEN_BASENAMES), set()
+
+
+def resolve_base(remote_sha: str, local_sha: str, fallback_base: str = "origin/main") -> str:
+    """Pick the diff base: the remote sha, or ``fallback_base`` for a new ref.
+
+    `local_sha` is accepted for symmetry / future use; an all-zero remote sha
+    means the remote has no copy of this ref yet. The caller passes the PUSH
+    TARGET's own main as the fallback when it exists locally: a brand-new ref
+    (a tag, a first branch push) only ADDS what the target does not already
+    have. The old hardcoded origin/main fallback measured the possibly-stale
+    backup remote instead and re-flagged long-public history on every tag
+    push (v1.1.0 release block, 2026-07-18).
+    """
+    if remote_sha and not _ALL_ZERO_RE.match(remote_sha):
+        return remote_sha
+    return fallback_base
+
+
+def _is_text_bytes(data: bytes) -> bool:
+    return b"\x00" not in data[:8192]
+
+
+def pushed_text_files(base: str, head: str) -> list[tuple[str, str]]:
+    """Return (relpath, text) for every added/changed text file in base..head.
+
+    Uses `git diff --name-only --diff-filter=ACMR base..head`. Deleted files are
+    excluded by the filter. Each surviving path is read from the working tree;
+    binary files and undecodable files are skipped silently (they can't carry a
+    text-shaped secret we scan for here).
+    """
+    raw = _git("diff", "--name-only", "--diff-filter=ACMR", f"{base}..{head}")
+    rels = [r.strip() for r in raw.splitlines() if r.strip()]
+    root = _repo_root()
+    out: list[tuple[str, str]] = []
+    for rel in rels:
+        path = root / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not _is_text_bytes(data):
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("latin-1")
+            except UnicodeDecodeError:
+                continue
+        out.append((rel, text))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def main(argv: list[str], stdin) -> int:
+    """Entry point for the pre-push hook.
+
+    argv: [prog, remote_name, remote_url]
+    stdin: the git pre-push ref lines:
+        "<local_ref> <local_sha> <remote_ref> <remote_sha>"
+
+    Return 1 to BLOCK the push, 0 to allow.
+
+    Fail-closed on positive findings (public target, private-email commit,
+    secret/forbidden file). Fail-open (return 0 + loud stderr) only when the
+    gate genuinely cannot run.
+    """
+    remote_name = argv[1] if len(argv) > 1 else ""
+    remote_url = argv[2] if len(argv) > 2 else ""
+
+    # (A) Public-repo guard DISABLED at the maintainer's explicit request
+    # (2026-07-03): a direct push to the public repo is now ALLOWED. Credential
+    # safety stays with .gitignore + the secret (C) and private-key gates below.
+    # The public target is still detected — for a heads-up log only, never a block.
+    if target_is_public(remote_name, remote_url):
+        print(
+            "privacy-pre-push: public-target block is DISABLED (maintainer "
+            f"request); allowing push to remote {remote_name!r}.",
+            file=sys.stderr,
+        )
+
+    try:
+        # Read and parse the pushed refs once.
+        try:
+            ref_lines = stdin.read().splitlines() if stdin is not None else []
+        except Exception as exc:  # pragma: no cover - defensive
+            print(
+                f"privacy-pre-push: WARNING could not read stdin ref lines "
+                f"({exc!r}); failing OPEN.",
+                file=sys.stderr,
+            )
+            return 0
+
+        compiled, forbidden, allowlist = load_secret_scanner(_repo_root())
+        private_emails = load_private_emails()
+        if not private_emails:
+            print(
+                "privacy-pre-push: WARNING no `privacy.private-email` configured; "
+                "the private-email identity check is DISABLED. Configure with: "
+                "git config --add privacy.private-email you@example.com",
+                file=sys.stderr,
+            )
+
+        # A brand-new ref diffs against the PUSH TARGET's main when we track
+        # it locally; origin/main (possibly a stale backup) is the last resort.
+        fallback_base = "origin/main"
+        target_main_probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{remote_name}/main"],
+            capture_output=True,
+        )
+        if target_main_probe.returncode == 0:
+            fallback_base = f"{remote_name}/main"
+
+        blocked = False
+        for raw in ref_lines:
+            parts = raw.split()
+            if len(parts) < 4:
+                continue
+            local_ref, local_sha, remote_ref, remote_sha = parts[:4]
+
+            # Skip branch deletions (local_sha all zeros) — nothing to inspect.
+            if _ALL_ZERO_RE.match(local_sha):
+                continue
+
+            try:
+                base = resolve_base(remote_sha, local_sha, fallback_base)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"privacy-pre-push: WARNING could not resolve diff base for "
+                    f"{local_ref} ({exc!r}); failing OPEN for this ref.",
+                    file=sys.stderr,
+                )
+                continue
+
+            # (B) Private-identity guard — fail-closed on any offender. -------
+            try:
+                log_text = _git(
+                    "log",
+                    "--format=%H%x09%ae%x09%ce",
+                    f"{base}..{local_sha}",
+                )
+            except subprocess.CalledProcessError as exc:
+                print(
+                    f"privacy-pre-push: WARNING could not read git log for "
+                    f"{base}..{local_sha} ({exc!r}); failing OPEN for the "
+                    f"identity check on this ref.",
+                    file=sys.stderr,
+                )
+                log_text = ""
+
+            offenders = offenders_from_log(log_text, private_emails)
+            if offenders:
+                blocked = True
+                print(
+                    "\nPUSH BLOCKED: a commit carries a PRIVATE maintainer "
+                    "email (use the GitHub noreply form):",
+                    file=sys.stderr,
+                )
+                for off in offenders:
+                    print(
+                        f"   {off['sha'][:12]}  {off['role']}: {off['email']}",
+                        file=sys.stderr,
+                    )
+
+            # (C) Secret / forbidden-file guard — only if the scanner loaded. -
+            if compiled is not None:
+                try:
+                    files = pushed_text_files(base, local_sha)
+                except subprocess.CalledProcessError as exc:
+                    print(
+                        f"privacy-pre-push: WARNING could not diff "
+                        f"{base}..{local_sha} ({exc!r}); failing OPEN for the "
+                        f"secret check on this ref.",
+                        file=sys.stderr,
+                    )
+                    files = []
+
+                for rel, text in files:
+                    if forbidden_pushed_file(rel, text, forbidden):
+                        blocked = True
+                        print(
+                            f"\nPUSH BLOCKED: forbidden secret file in push: {rel}",
+                            file=sys.stderr,
+                        )
+                    secrets = scan_text_for_secrets(rel, text, compiled, allowlist)
+                    if secrets:
+                        blocked = True
+                        for s in secrets:
+                            print(
+                                f"\nPUSH BLOCKED: {describe_secret_finding(s)}",
+                                file=sys.stderr,
+                            )
+
+        if blocked:
+            print(
+                "\nFix the findings above, then push again. (Layer-3 CI is the "
+                "non-bypassable backstop if you bypass this hook.)",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    except Exception as exc:  # pragma: no cover - top-level fail-open guard
+        # An unexpected error must never wedge the agent swarm. Fail OPEN, but
+        # keep the public-target / identity / secret POSITIVE findings above
+        # fail-closed (they returned 1 before reaching here).
+        print(
+            f"privacy-pre-push: WARNING unexpected error ({exc!r}); failing "
+            f"OPEN. Layer-3 CI remains the backstop.",
+            file=sys.stderr,
+        )
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv, sys.stdin))

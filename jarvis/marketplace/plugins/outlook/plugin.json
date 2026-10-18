@@ -1,0 +1,49 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "outlook",
+  "version": "1.0.0",
+  "description": "Read, send and reply to Outlook mail; read and manage Microsoft 365 calendar events",
+  "license": "Apache-2.0",
+  "extensions": {
+    "io.github.personaljarvis": {
+      "display_name": "Outlook Mail & Calendar",
+      "category": "Calendar & Mail",
+      "logo_slug": "outlook",
+      "logo_color": "0078D4",
+      "featured": false,
+      "longevity": "self_renewing",
+      "auth": {
+        "mode": "oauth_pkce_loopback",
+        "authorization_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        "client_id": "REPLACE_WITH_YOUR_CLIENT_ID",
+        "callback_port": 43891,
+        "callback_path": "/oauth/callback",
+        "scopes": [
+          "offline_access",
+          "User.Read",
+          "Mail.Read",
+          "Mail.Send",
+          "Calendars.ReadWrite"
+        ],
+        "scope_separator": "space",
+        "refresh_supported": true
+      },
+      "mcp_server": {
+        "transport": "stdio",
+        "install": [
+          "python",
+          "-m",
+          "jarvis.plugins.tool.connected_server",
+          "outlook"
+        ],
+        "env_template": {
+          "JARVIS_CONNECTOR_TOKEN": "$plugin_outlook_access_token"
+        },
+        "risk_tier": "ask"
+      },
+      "post_install_hint_md": "Click Connect and sign in with your Microsoft account in the browser. The shared sign-in is already included, so you do not create an Azure app. A company directory may ask an administrator to approve Personal Jarvis once.  Permissions: offline_access, User.Read, Mail.Read, Mail.Send, Calendars.ReadWrite.",
+      "oauth_client_family": "microsoft"
+    }
+  }
+}

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Jarvis Orb</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  /* Black as the base — the host window and all WebView2 children are
+     clipped to a circle via SetWindowRgn (see overlay.py). Everything outside
+     the circle is physically clipped away; the black base is just a
+     fallback in case the clipping is off by 1px at the edge. */
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: transparent;
+    overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  .stage {
+    position: fixed; inset: 0;
+    background: transparent;
+    display: grid; place-items: center;
+  }
+  canvas {
+    width: 100%; height: 100%;
+    background: transparent;
+    display: block;
+  }
+</style>
+</head>
+<body>
+  <div class="stage"><canvas id="orb"></canvas></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('orb');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {
+    const r = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(r.width * dpr);
+    canvas.height = Math.floor(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Python bridge
+  let mode = 'idle', extLevel = null, level = 0;
+  window.__orb = {
+    setMode(m) { mode = m; },
+    setLevel(v) { extLevel = Math.max(0, Math.min(1, +v || 0)); },
+    clearLevel() { extLevel = null; },
+  };
+
+  const TAU = Math.PI * 2;
+
+  // Plasma swirl particles (as soft blobs, move slowly inside)
+  const swirls = [];
+  for (let i = 0; i < 6; i++) {
+    swirls.push({
+      angle: Math.random() * TAU,
+      radius: 0.15 + Math.random() * 0.35,
+      speed: 0.015 + Math.random() * 0.035, // deliberately slow, not hypnotic
+      phase: Math.random() * TAU,
+      size: 0.22 + Math.random() * 0.2,
+      hue: 45 + Math.random() * 15, // warm yellow-gold
+    });
+  }
+
+  function currentLevel(t) {
+    if (extLevel !== null) return extLevel;
+    if (mode === 'speak') return 0.35 + 0.25 * Math.sin(t * 1.8) + 0.1 * Math.sin(t * 3.3);
+    if (mode === 'listen') return 0; // external level gets injected
+    return 0;
+  }
+
+  let t0 = performance.now();
+  function frame(now) {
+    const t = (now - t0) / 1000;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const cx = w / 2, cy = h / 2;
+    // -1px buffer so anti-aliasing at the circle edge doesn't blend
+    // against magenta (otherwise pink fringes appear around the orb).
+    const R = Math.min(w, h) * 0.5 - 1;
+
+    const raw = currentLevel(t);
+    level += (raw - level) * 0.08;
+    const breath = (0.5 + 0.5 * Math.sin(t * 0.9)) * 0.1;
+    const energy = Math.max(level, breath);
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Hard circle clip: from here on, drawing only happens inside the orb.
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
+
+    // --- 1. Glass sphere shell (dark, with slight edge light)
+    const shell = ctx.createRadialGradient(
+      cx - R * 0.3, cy - R * 0.3, R * 0.1,
+      cx, cy, R
+    );
+    shell.addColorStop(0, 'rgba(30, 30, 34, 1)');
+    shell.addColorStop(0.6, 'rgba(12, 12, 14, 1)');
+    shell.addColorStop(1, 'rgba(4, 4, 6, 1)');
+    ctx.fillStyle = shell;
+    ctx.fillRect(0, 0, w, h);
+
+    // --- 2. Plasma interior: swirl blobs (additive, so they glow)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const s of swirls) {
+      s.angle += s.speed * 0.01 * (1 + energy * 1.5);
+      const orbitR = R * s.radius * (1 + energy * 0.3);
+      const px = cx + Math.cos(s.angle + s.phase) * orbitR;
+      const py = cy + Math.sin(s.angle + s.phase) * orbitR * 0.8;
+      const size = R * s.size * (1 + energy * 0.35);
+
+      const g = ctx.createRadialGradient(px, py, 0, px, py, size);
+      g.addColorStop(0, `hsla(${s.hue}, 100%, 65%, ${0.55 + energy * 0.3})`);
+      g.addColorStop(0.5, `hsla(${s.hue}, 100%, 50%, ${0.22 + energy * 0.15})`);
+      g.addColorStop(1, 'hsla(45, 100%, 50%, 0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(px, py, size, 0, TAU); ctx.fill();
+    }
+
+    // Bright core in the middle
+    const coreR = R * (0.2 + energy * 0.25);
+    const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
+    core.addColorStop(0, `rgba(255, 250, 210, ${0.9 + energy * 0.1})`);
+    core.addColorStop(0.5, `rgba(255, 220, 80, ${0.5 + energy * 0.3})`);
+    core.addColorStop(1, 'rgba(255, 180, 0, 0)');
+    ctx.fillStyle = core;
+    ctx.beginPath(); ctx.arc(cx, cy, coreR, 0, TAU); ctx.fill();
+    ctx.restore();
+
+    // --- 3. Glass highlight (curved bright arc for a 3D feel)
+    const hi = ctx.createRadialGradient(
+      cx - R * 0.35, cy - R * 0.4, 0,
+      cx - R * 0.35, cy - R * 0.4, R * 0.55
+    );
+    hi.addColorStop(0, 'rgba(255, 255, 255, 0.18)');
+    hi.addColorStop(0.4, 'rgba(255, 255, 255, 0.06)');
+    hi.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    ctx.fillStyle = hi;
+    ctx.fillRect(0, 0, w, h);
+
+    // --- 4. Rim light (fine warm edge around the circle)
+    ctx.strokeStyle = `rgba(255, 210, 90, ${0.25 + energy * 0.25})`;
+    ctx.lineWidth = Math.max(1, R * 0.008);
+    ctx.beginPath(); ctx.arc(cx, cy, R - 1, 0, TAU); ctx.stroke();
+
+    ctx.restore();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

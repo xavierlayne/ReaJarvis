@@ -1,0 +1,350 @@
+"""H2: switch_window must work on macOS (Quartz/AppKit/AX) and Linux/X11,
+degrade cleanly on Wayland / headless / missing-tool with a clear English
+message, and leave the Windows ctypes path untouched (AD-7).
+
+Seam-level only: platform APIs and subprocesses are faked. This proves the
+dispatch and parsing, not behavior on real hardware.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+import types
+
+from jarvis.core.protocols import ExecutionContext
+from jarvis.plugins.tool.switch_window import (
+    SwitchWindowTool,
+    _find_and_focus_linux,
+    _find_and_focus_macos,
+)
+
+
+def _cp(returncode: int, stdout: str = "", stderr: str = ""):
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _ctx() -> ExecutionContext:
+    # switch_window.execute does not read ctx; supply the required fields.
+    return ExecutionContext(
+        config={}, trace_id=None, user_utterance="", memory_read=None
+    )
+
+
+# --- macOS (Quartz/AppKit/AX) ----------------------------------------------
+
+
+def _macos_permission_world(monkeypatch, *, trusted: bool):
+    """A darwin FakeTCC behind the REAL port; the process-wide service sits on it.
+
+    ``trusted=False`` leaves the Accessibility dialog on screen unanswered, so a
+    refusal is "the user has not allowed it yet". Nothing here ran on a real Mac:
+    FakeTCC models the OS.
+    """
+    from tests.fakes.fake_tcc import DialogPolicy, FakeTCC, install_port
+
+    tcc = FakeTCC(
+        granted=("accessibility",) if trusted else (),
+        default_policy=DialogPolicy.NEVER_ANSWERED,
+    )
+    install_port(monkeypatch, tcc.port("darwin"))
+    return tcc
+
+
+def _install_fake_macos_apis(
+    monkeypatch,
+    *,
+    trusted=True,
+    minimized=False,
+    activate_result=True,
+    set_attr_error=None,
+    tcc=None,
+):
+    ax_window = object()
+    ax_root = object()
+    calls: list[tuple] = []
+
+    class _App:
+        def activateWithOptions_(self, options):
+            calls.append(("activate", options))
+            return activate_result
+
+    appkit = types.SimpleNamespace(
+        NSApplicationActivateAllWindows=1,
+        NSApplicationActivateIgnoringOtherApps=2,
+        NSRunningApplication=types.SimpleNamespace(
+            runningApplicationWithProcessIdentifier_=lambda pid: _App(),
+        ),
+    )
+
+    def copy_attr(element, attribute, _out):
+        if element is ax_root and attribute == "AXWindows":
+            return 0, [ax_window]
+        if element is ax_window and attribute == "AXTitle":
+            return 0, "My Editor"
+        if element is ax_window and attribute == "AXMinimized":
+            return 0, minimized
+        return 1, None
+
+    services = types.SimpleNamespace(
+        AXIsProcessTrusted=lambda: trusted,
+        AXUIElementCreateApplication=lambda pid: ax_root,
+        AXUIElementCopyAttributeValue=copy_attr,
+        AXUIElementPerformAction=lambda element, action: calls.append(
+            ("perform", action)
+        ) or 0,
+        AXUIElementSetAttributeValue=lambda element, attr, value: calls.append(
+            ("set", attr)
+        ) or (set_attr_error or {}).get(attr, 0),
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+    monkeypatch.setitem(sys.modules, "ApplicationServices", services)
+    if tcc is None:
+        _macos_permission_world(monkeypatch, trusted=trusted)
+    return calls
+
+
+def _mac_window(title="My Editor", *, on_screen=True):
+    return {
+        "kCGWindowLayer": 0,
+        "kCGWindowName": title,
+        "kCGWindowOwnerName": "Editor",
+        "kCGWindowOwnerPID": 42,
+        "kCGWindowNumber": 7,
+        "kCGWindowIsOnscreen": on_screen,
+    }
+
+
+def test_macos_focus_success(monkeypatch):
+    calls = _install_fake_macos_apis(monkeypatch)
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    found, msg = _find_and_focus_macos("Editor")
+    assert found is True
+    assert msg == "My Editor"
+    assert ("set", "AXMain") in calls
+    assert ("set", "AXFrontmost") in calls
+    assert ("perform", "AXRaise") in calls
+    # AXFocusedWindow on the app element is read-only in AppKit — setting it
+    # returned attribute-unsupported for every Cocoa app and failed the whole
+    # focus. The settable spelling is AXMain on the window (see the fix).
+    assert ("set", "AXFocusedWindow") not in calls
+
+
+def test_macos_focus_restores_minimized_window_from_all_window_catalog(monkeypatch):
+    calls = _install_fake_macos_apis(monkeypatch, minimized=True)
+    catalog_requests: list[bool] = []
+
+    def catalog(*, on_screen_only=True):
+        catalog_requests.append(on_screen_only)
+        return [_mac_window(on_screen=False)]
+
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        catalog,
+    )
+    found, msg = _find_and_focus_macos("Editor")
+
+    assert found is True
+    assert msg == "My Editor"
+    assert catalog_requests == [False]
+    assert ("set", "AXMinimized") in calls
+    assert ("perform", "AXRaise") in calls
+    assert calls.index(("set", "AXMinimized")) < calls.index(("perform", "AXRaise"))
+    assert calls.index(("perform", "AXRaise")) < calls.index(("set", "AXMain"))
+
+
+def test_macos_focus_survives_cooperative_activation_refusal(monkeypatch):
+    """macOS 14+ refuses activation from a background app; AX must still raise."""
+    calls = _install_fake_macos_apis(monkeypatch, activate_result=False)
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    found, msg = _find_and_focus_macos("Editor")
+    assert found is True
+    assert msg == "My Editor"
+    assert ("perform", "AXRaise") in calls
+
+
+def test_macos_focus_tolerates_a_read_only_main_attribute(monkeypatch):
+    """An advisory AXMain refusal must not fail a raise that succeeded."""
+    _install_fake_macos_apis(monkeypatch, set_attr_error={"AXMain": -25205})
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    found, msg = _find_and_focus_macos("Editor")
+    assert found is True
+    assert msg == "My Editor"
+
+
+def test_macos_focus_fails_when_raise_and_frontmost_both_fail(monkeypatch):
+    _install_fake_macos_apis(
+        monkeypatch, set_attr_error={"AXFrontmost": -25204, "AXMain": -25204}
+    )
+    services = sys.modules["ApplicationServices"]
+    services.AXUIElementPerformAction = lambda element, action: -25204
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    found, msg = _find_and_focus_macos("Editor")
+    assert found is False
+    assert "refused to focus" in msg
+
+
+def test_macos_focus_without_accessibility_asks_once_and_refuses_with_the_prefix(monkeypatch):
+    """Focusing is an ACTION: the first one asks macOS; nothing is raised until GRANTED."""
+    tcc = _macos_permission_world(monkeypatch, trusted=False)
+    calls = _install_fake_macos_apis(monkeypatch, trusted=False, tcc=tcc)
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+
+    found, msg = _find_and_focus_macos("Editor")
+    again, _msg_again = _find_and_focus_macos("Editor")
+
+    assert found is False and again is False
+    assert msg.startswith("[permission_needed:accessibility] ")
+    assert "must not retry" in msg
+    assert len(tcc.requests("accessibility")) == 1  # the second call is inside the cooldown
+    assert not [call for call in calls if call[0] in ("perform", "set")]  # nothing was touched
+    assert tcc.implicit_prompts() == []
+
+
+def test_macos_focus_the_dialog_answer_is_picked_up_without_a_restart(monkeypatch):
+    tcc = _macos_permission_world(monkeypatch, trusted=False)
+    calls = _install_fake_macos_apis(monkeypatch, trusted=False, tcc=tcc)
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    assert _find_and_focus_macos("Editor")[0] is False
+
+    tcc.answer("accessibility")  # the user flips the switch
+    from jarvis.platform.permission_service import get_permission_service
+
+    get_permission_service().invalidate()
+    found, msg = _find_and_focus_macos("Editor")
+
+    assert found is True and msg == "My Editor"
+    assert ("perform", "AXRaise") in calls
+
+
+def test_macos_missing_native_frameworks(monkeypatch):
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", None)
+    monkeypatch.setitem(sys.modules, "ApplicationServices", None)
+    found, msg = _find_and_focus_macos("Editor")
+    assert found is False
+    assert "unavailable" in msg.lower()
+
+
+def test_macos_no_match(monkeypatch):
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list", lambda **_kwargs: [],
+    )
+    found, msg = _find_and_focus_macos("Nope")
+    assert found is False
+    assert "Nope" in msg
+
+
+def test_macos_matching_is_case_insensitive(monkeypatch):
+    _install_fake_macos_apis(monkeypatch)
+    monkeypatch.setattr(
+        "jarvis.platform.window_state._quartz_window_list",
+        lambda **_kwargs: [_mac_window()],
+    )
+    found, msg = _find_and_focus_macos("EdItOr")
+    assert found is True
+    assert msg == "My Editor"
+
+
+# --- Linux (wmctrl) --------------------------------------------------------
+
+
+def test_linux_focus_success(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
+
+    def fake_run(cmd, *a, **k):
+        if "-l" in cmd:
+            listing = (
+                "0x0123 0 host1 My Editor — file.py\n"
+                "0x0456 0 host1 Terminal\n"
+            )
+            return _cp(0, stdout=listing)
+        if "-a" in cmd:
+            assert "0x0123" in cmd  # activates the matched id, not the other one
+            return _cp(0)
+        return _cp(1, stderr="unexpected")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    found, msg = _find_and_focus_linux("editor")
+    assert found is True
+    assert "My Editor" in msg
+
+
+def test_linux_missing_wmctrl(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda n: None)
+    found, msg = _find_and_focus_linux("Editor")
+    assert found is False
+    assert "wmctrl" in msg.lower()
+
+
+def test_linux_no_match(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, *a, **k: _cp(0, stdout="0x0456 0 host1 Terminal\n")
+    )
+    found, msg = _find_and_focus_linux("Editor")
+    assert found is False
+    assert "Editor" in msg
+
+
+# --- execute() dispatch + degrade ------------------------------------------
+
+
+async def test_execute_routes_to_macos_with_english_readback(monkeypatch):
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.detect_platform", lambda: "darwin")
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.switch_window._find_and_focus_macos",
+        lambda t: (True, "My Editor"),
+    )
+    res = await SwitchWindowTool().execute({"title_contains": "Editor"}, _ctx())
+    assert res.success is True
+    assert res.output == "Focused window: My Editor"
+
+
+async def test_execute_wayland_degrades_in_english(monkeypatch):
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.detect_platform", lambda: "linux")
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.is_wayland", lambda: True)
+    res = await SwitchWindowTool().execute({"title_contains": "Editor"}, _ctx())
+    assert res.success is False
+    assert "Wayland" in res.error
+
+
+async def test_execute_headless_linux_degrades(monkeypatch):
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.detect_platform", lambda: "linux")
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.is_wayland", lambda: False)
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.display_present", lambda: False)
+    res = await SwitchWindowTool().execute({"title_contains": "Editor"}, _ctx())
+    assert res.success is False
+    assert "display" in res.error.lower()
+
+
+async def test_execute_windows_path_unchanged(monkeypatch):
+    # AD-7: the Windows readback keeps its established wording.
+    monkeypatch.setattr("jarvis.plugins.tool.switch_window.detect_platform", lambda: "win32")
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.switch_window._find_and_focus_windows",
+        lambda t: (True, "Notepad"),
+    )
+    res = await SwitchWindowTool().execute({"title_contains": "Notepad"}, _ctx())
+    assert res.success is True
+    assert res.output == "Focused window: Notepad"

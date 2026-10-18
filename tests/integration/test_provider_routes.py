@@ -1,0 +1,1346 @@
+"""Integration tests for /api/providers, /api/secrets/{key}, /api/brain/switch.
+
+Strategy: keyring + subprocess + Claude cred file are fully mocked.
+The tests run hermetically, without writing real credentials.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from jarvis.core.bus import EventBus
+from jarvis.core.config import JarvisConfig
+from jarvis.core.events import SecretConfigured
+from jarvis.ui.web.server import WebServer
+
+# ----------------------------------------------------------------------
+# Fakes
+# ----------------------------------------------------------------------
+
+
+class _InMemorySecretStore:
+    """Simulates the keyring via a dict — wired into cfg via monkeypatch.
+
+    Like the real ``set_secret``/``delete_secret``, a successful write or
+    delete announces the changed slot (revision, generation, listeners).
+    """
+
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    def get(self, key: str, env_fallback: str | None = None) -> str | None:
+        return self.data.get(key)
+
+    def set(self, key: str, value: str) -> bool:
+        from jarvis.core import config as cfg_mod
+
+        self.data[key] = value
+        cfg_mod._mark_secret_changed(key)
+        return True
+
+    def delete(self, key: str) -> bool:
+        from jarvis.core import config as cfg_mod
+
+        self.data.pop(key, None)
+        cfg_mod._mark_secret_changed(key)
+        return True
+
+
+class _FakeBrainManager:
+    """Minimal BrainManager stub that only implements the switch interface."""
+
+    def __init__(self, *, available: list[str], active: str = "openai", bus: EventBus | None = None) -> None:
+        self._available = available
+        self.active_provider = active
+        self.calls: list[tuple[str, bool]] = []
+        self._bus = bus
+        self.persist_calls: list[bool] = []
+        # Mirrors the real BrainManager: records the actual disk outcome of a
+        # persisting switch. The route reads this to report ``persisted``.
+        self.last_persist_ok: bool | None = None
+
+    def available_providers(self) -> list[str]:
+        return list(self._available)
+
+    async def switch(self, provider: str, *, persist: bool = False) -> None:
+        self.calls.append((provider, persist))
+        self.persist_calls.append(persist)
+        self.active_provider = provider
+        # The fake "writes" successfully when persistence is requested.
+        self.last_persist_ok = bool(persist)
+
+
+# ----------------------------------------------------------------------
+# Fixtures
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def secret_store(monkeypatch: pytest.MonkeyPatch) -> _InMemorySecretStore:
+    store = _InMemorySecretStore()
+    # Patches both import paths — provider_routes.py imports the module
+    # under the alias `cfg_mod`, other places import it directly.
+    from jarvis.core import config as cfg_mod
+    monkeypatch.setattr(cfg_mod, "get_secret", store.get)
+    monkeypatch.setattr(cfg_mod, "set_secret", store.set)
+    monkeypatch.setattr(cfg_mod, "delete_secret", store.delete)
+    return store
+
+
+@pytest.fixture
+def web_server() -> Iterator[WebServer]:
+    cfg = JarvisConfig()
+    cfg.ui.dev_mode = True
+    bus = EventBus()
+    server = WebServer(cfg, bus=bus)
+    yield server
+
+
+@pytest.fixture
+def server_with_brain(web_server: WebServer) -> WebServer:
+    web_server.app.state.brain = _FakeBrainManager(
+        available=["openai", "claude-api", "ollama-local", "openrouter", "codex"],
+        active="openai",
+        bus=web_server.bus,
+    )
+    web_server.app.state.cfg = web_server.cfg
+    web_server.app.state.bus = web_server.bus
+    return web_server
+
+
+# ----------------------------------------------------------------------
+# /api/providers
+# ----------------------------------------------------------------------
+
+
+def test_list_providers_returns_full_catalog(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "providers" in body
+        ids = {p["id"] for p in body["providers"]}
+        assert "openai" in ids
+        assert "codex" in ids
+        assert "openclaw" not in ids
+        assert "gemini-flash-tts" in ids, "Gemini Flash TTS must be in the catalog"
+        assert "faster-whisper" in ids, "Local Whisper must be selectable for keyless STT"
+        assert "nemotron-local" in ids, "Local Nemotron must be selectable for keyless STT"
+        assert "elevenlabs" in ids, "ElevenLabs is a selectable premium TTS provider"
+        assert "ollama-local" not in ids, "Ollama was removed on 2026-04-21"
+
+
+# ----------------------------------------------------------------------
+# /api/providers/section-health — the at-a-glance tab indicators
+# ----------------------------------------------------------------------
+
+
+class _FakeTestResult:
+    """Minimal stand-in for provider_test.ProviderTestResult (``.status`` and
+    ``.detail`` are all a caller reads)."""
+
+    def __init__(self, status: str = "ok", detail: str = "") -> None:
+        self.status = status
+        self.detail = detail
+
+
+@pytest.fixture
+def no_real_provider_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Belt and braces: section-health no longer runs the connectivity test at
+    all, but if a regression made it do so again, this keeps the suite off the
+    network (and off the maintainer's live keyring keys)."""
+    from jarvis.brain import provider_test as _pt
+
+    async def _fake_run(spec: Any, cfg: Any, **kwargs: Any) -> _FakeTestResult:  # noqa: ANN401
+        return _FakeTestResult("ok", "")
+
+    monkeypatch.setattr(_pt, "run_provider_test", _fake_run)
+
+
+def test_section_health_returns_all_tabs(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    no_real_provider_test: None,
+) -> None:
+    """Every tab gets a status drawn from the SSOT vocabulary, and the response
+    is honestly marked uncached on the first call."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/section-health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body["sections"]) == {
+            "brain",
+            "computer-use",
+            "tts",
+            "stt",
+            "realtime",
+            # The optional dictation-polish tier. It appears in the rollup like
+            # every other tab; what makes it different is that a MISSING key
+            # reports "ok" instead of amber (tests/unit/ui/
+            # test_dictation_provider_tier.py owns that rule).
+            "dictation",
+            "subagents",
+            "advanced",
+            "local_models",
+        }
+        valid = {"ok", "needs_setup", "error", "unknown"}
+        for sec in body["sections"].values():
+            assert sec["status"] in valid
+        assert body["cached"] is False
+        assert body["sections"]["brain"]["subject_id"] == "openai"
+        computer_use_cfg = getattr(server_with_brain.cfg.brain, "computer_use", None)
+        expected_cu = (
+            getattr(computer_use_cfg, "provider", None)
+            or server_with_brain.cfg.brain.primary
+        )
+        assert body["sections"]["computer-use"]["subject_id"] == expected_cu
+        # No telephony manager mounted → the optional Advanced tab stays silent.
+        assert body["sections"]["advanced"]["status"] == "unknown"
+
+
+def test_section_health_missing_key_is_needs_setup(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    no_real_provider_test: None,
+) -> None:
+    """The active brain provider with no stored key rolls up to needs_setup —
+    the 'you still have to set this up' (amber) signal, distinct from a broken
+    key (which would be 'error')."""
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers/section-health").json()
+        assert body["sections"]["brain"]["status"] == "needs_setup"
+        assert body["sections"]["brain"]["reason"] == "not_configured"
+
+
+def test_section_health_caches_then_refresh_bypasses(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    no_real_provider_test: None,
+) -> None:
+    """Repeated opens / tab switches reuse the cached rollup; ?refresh=true (used
+    after a key save or provider switch) forces a fresh check."""
+    with TestClient(server_with_brain.app) as client:
+        assert client.get("/api/providers/section-health").json()["cached"] is False
+        assert client.get("/api/providers/section-health").json()["cached"] is True
+        assert (
+            client.get("/api/providers/section-health?refresh=true").json()["cached"]
+            is False
+        )
+
+
+def _slow_credential_check(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_slow: Any,  # noqa: ANN401
+    started: asyncio.Event,
+    cancelled: asyncio.Event,
+) -> None:
+    """Make the (local, free) credential check of one selection hang.
+
+    The rollup no longer probes anything, so the slowest step left is a
+    credential/login read; the cancellation machinery must still keep a slow
+    one for an OLD selection from blocking or labelling the new one.
+    """
+    from jarvis.ui.web import provider_routes
+
+    original = provider_routes._provider_credential_present_for_binary_async
+
+    async def _check(spec: Any, binary_path: str | None) -> bool:  # noqa: ANN401
+        if is_slow(spec):
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return await original(spec, binary_path)
+
+    monkeypatch.setattr(provider_routes, "_provider_credential_present_for_binary_async", _check)
+
+
+@pytest.mark.asyncio
+async def test_section_health_switch_cancels_old_provider_without_misattribution(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow NVIDIA check must never block or label the new OpenRouter card."""
+    from jarvis.brain import provider_health_ledger as ledger
+    from jarvis.ui.web import provider_routes
+
+    secret_store.data.update(
+        {
+            "nvidia_api_key": "nvapi-test",
+            "openrouter_api_key": "sk-or-test",
+        }
+    )
+    ledger.get_ledger().record("openrouter", ledger.MODALITY_BRAIN, "ok")
+    server_with_brain.app.state.brain.active_provider = "nvidia"
+    nvidia_started = asyncio.Event()
+    nvidia_cancelled = asyncio.Event()
+    _slow_credential_check(
+        monkeypatch,
+        is_slow=lambda spec: spec.id == "nvidia",
+        started=nvidia_started,
+        cancelled=nvidia_cancelled,
+    )
+    monkeypatch.setattr(
+        provider_routes,
+        "_jarvis_agent_section_health",
+        lambda cfg: provider_routes.SectionHealth(status="ok", subject_id="openai"),
+    )
+    request = SimpleNamespace(app=server_with_brain.app)
+
+    old_request = asyncio.create_task(provider_routes.section_health(request, refresh=True))
+    await asyncio.wait_for(nvidia_started.wait(), timeout=1.0)
+
+    server_with_brain.app.state.brain.active_provider = "openrouter"
+    new_response = await asyncio.wait_for(
+        provider_routes.section_health(request, refresh=True), timeout=1.0
+    )
+    old_response = await asyncio.wait_for(old_request, timeout=1.0)
+
+    assert nvidia_cancelled.is_set()
+    assert new_response.sections["brain"].subject_id == "openrouter"
+    assert new_response.sections["brain"].status == "ok"
+    assert old_response.sections["brain"].subject_id == "openrouter"
+    assert "NVIDIA" not in old_response.sections["brain"].detail
+
+
+@pytest.mark.asyncio
+async def test_section_health_model_switch_cancels_old_check_for_same_provider(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check still running for an old model must not label the new model."""
+    from jarvis.brain import provider_health_ledger as ledger
+    from jarvis.core.config import BrainProviderConfig
+    from jarvis.ui.web import provider_routes
+
+    secret_store.data["openrouter_api_key"] = "sk-or-test"
+    ledger.get_ledger().record("openrouter", ledger.MODALITY_BRAIN, "ok")
+    server_with_brain.app.state.brain.active_provider = "openrouter"
+    server_with_brain.cfg.brain.providers["openrouter"] = BrainProviderConfig(
+        model="slow-model"
+    )
+    old_started = asyncio.Event()
+    old_cancelled = asyncio.Event()
+    _slow_credential_check(
+        monkeypatch,
+        is_slow=lambda spec: (
+            spec.id == "openrouter"
+            and server_with_brain.cfg.brain.providers["openrouter"].model == "slow-model"
+        ),
+        started=old_started,
+        cancelled=old_cancelled,
+    )
+    monkeypatch.setattr(
+        provider_routes,
+        "_jarvis_agent_section_health",
+        lambda cfg: provider_routes.SectionHealth(status="ok", subject_id="openai"),
+    )
+    request = SimpleNamespace(app=server_with_brain.app)
+
+    old_request = asyncio.create_task(provider_routes.section_health(request, refresh=True))
+    await asyncio.wait_for(old_started.wait(), timeout=1.0)
+
+    server_with_brain.cfg.brain.providers["openrouter"].model = "working-model"
+    new_response = await asyncio.wait_for(
+        provider_routes.section_health(request, refresh=True), timeout=1.0
+    )
+    old_response = await asyncio.wait_for(old_request, timeout=1.0)
+
+    assert old_cancelled.is_set()
+    assert new_response.sections["brain"].subject_id == "openrouter"
+    assert new_response.sections["brain"].status == "ok"
+    assert old_response.sections["brain"].status == "ok"
+
+
+def test_section_health_computer_use_reads_the_tool_model_outcome(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Tool Model tab is judged by what tool-model calls did, not brain turns.
+
+    Its tier runs its own model pin, so a retired tool-model id (404) must turn
+    that tab red while the same provider's brain turns keep answering — and it
+    is learnt from the real call, never from a probe of the page's own.
+    """
+    from jarvis.brain import provider_health_ledger as ledger
+    from jarvis.core.config import BrainProviderConfig, BrainTierConfig
+    from tests.fakes.fake_provider_calls import ProviderCallRecorder
+
+    recorder = ProviderCallRecorder().install(monkeypatch)
+    secret_store.data["gemini_api_key"] = "AIza-test"
+    server_with_brain.app.state.brain.active_provider = "gemini"
+    server_with_brain.cfg.brain.tool_model = BrainTierConfig(provider="gemini")
+    server_with_brain.cfg.brain.providers["gemini"] = BrainProviderConfig(
+        model="general-brain-model", tool_model="pinned-tool-model"
+    )
+    record = ledger.get_ledger()
+    record.record("gemini", ledger.MODALITY_BRAIN, "ok")
+    record.record("gemini", ledger.MODALITY_TOOL, "model_unavailable", model="pinned-tool-model")
+
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers/section-health").json()
+
+    assert body["sections"]["computer-use"]["subject_id"] == "gemini"
+    assert body["sections"]["computer-use"]["status"] == "error"
+    assert body["sections"]["computer-use"]["reason"] == "model_unavailable"
+    assert body["sections"]["brain"]["status"] == "ok"
+    assert recorder.calls == []
+
+
+# Every family a single-key install might hold, so every keyed tier is
+# "configured" — exactly the state in which the rollup used to send a probe.
+_ALL_FAMILY_KEYS = {
+    "openai_api_key": "sk-test",
+    "gemini_api_key": "AIza-test",
+    "openrouter_api_key": "sk-or-test",
+    "grok_api_key": "xai-test",
+    "anthropic_api_key": "sk-ant-test",
+    "nvidia_api_key": "nvapi-test",
+    "groq_api_key": "gsk-test",
+    "elevenlabs_api_key": "el-test",
+    "cartesia_api_key": "ca-test",
+    "inworld_api_key": "iw-test",
+}
+
+
+def test_section_health_and_readiness_send_nothing_to_any_provider(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollup reads credentials and the passive record — zero provider calls.
+
+    Live 2026-09-30: one TTS synthesis and one billed GPT-Live session start per
+    app start / window reload, from this route alone. Mounting the sidebar,
+    the dock, the ready note and the API-Keys page, forced refresh included,
+    must not reach a provider any more.
+    """
+    from tests.fakes.fake_provider_calls import ProviderCallRecorder
+
+    recorder = ProviderCallRecorder().install(monkeypatch)
+    secret_store.data.update(_ALL_FAMILY_KEYS)
+
+    with TestClient(server_with_brain.app) as client:
+        first = client.get("/api/providers/section-health")
+        forced = client.get("/api/providers/section-health?refresh=true")
+        ready = client.get("/api/setup/readiness?refresh=true")
+
+    assert first.status_code == forced.status_code == ready.status_code == 200
+    assert recorder.calls == []
+    brain = forced.json()["sections"]["brain"]
+    # Set up, never used since: silent, and checked by its first real call.
+    assert brain["status"] == "unknown"
+    assert brain["reason"] == "unverified"
+
+
+def test_section_health_reports_the_last_real_outcome(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    """A real call's outcome shows up on the very next read — no refresh, no probe."""
+    from jarvis.brain import provider_health_ledger as ledger
+
+    secret_store.data["openai_api_key"] = "sk-test"
+    with TestClient(server_with_brain.app) as client:
+        before = client.get("/api/providers/section-health").json()
+        ledger.get_ledger().record("openai", ledger.MODALITY_BRAIN, "bad_key")
+        after = client.get("/api/providers/section-health").json()
+
+    assert before["sections"]["brain"]["status"] == "unknown"
+    assert after["cached"] is False
+    assert after["sections"]["brain"]["status"] == "error"
+    assert after["sections"]["brain"]["reason"] == "bad_key"
+    assert "last real call" in after["sections"]["brain"]["detail"]
+
+
+def test_the_test_button_verdict_feeds_the_record(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user-clicked Test is the one real probe left, and its verdict is
+    what the dots show afterwards — without a second probe on the re-read."""
+    from jarvis.brain import provider_health_ledger as ledger
+    from jarvis.brain import provider_test as provider_test_module
+
+    secret_store.data["openai_api_key"] = "sk-test"
+    probes: list[str] = []
+
+    async def _probe(spec: Any, cfg: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        probes.append(spec.id)
+        return provider_test_module.ProviderTestResult(spec.id, "no_credits", "HTTP 429")
+
+    monkeypatch.setattr(provider_test_module, "run_provider_test", _probe)
+
+    with TestClient(server_with_brain.app) as client:
+        verdict = client.post("/api/providers/openai/test").json()
+        body = client.get("/api/providers/section-health").json()
+
+    assert verdict["status"] == "no_credits"
+    assert probes == ["openai"]
+    outcome = ledger.get_ledger().get("openai", ledger.MODALITY_BRAIN)
+    assert outcome is not None and outcome.source == ledger.SOURCE_TEST
+    assert body["sections"]["brain"]["status"] == "error"
+    assert body["sections"]["brain"]["reason"] == "no_credits"
+
+
+def test_saving_a_key_forgets_what_the_old_key_did(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    """A rejected key's red dot must not outlive the key; the new one starts clean."""
+    from jarvis.brain import provider_health_ledger as ledger
+
+    record = ledger.get_ledger()
+    record.record("openai", ledger.MODALITY_BRAIN, "bad_key")
+    record.record("openai-live", ledger.MODALITY_REALTIME, "bad_key")
+    record.record("elevenlabs", ledger.MODALITY_TTS, "no_credits")
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/openai_api_key", json={"value": "sk-new"})
+
+    assert resp.status_code == 200
+    assert record.get("openai", ledger.MODALITY_BRAIN) is None
+    assert record.get("openai-live", ledger.MODALITY_REALTIME) is None
+    # An unrelated provider keeps its history.
+    assert record.get("elevenlabs", ledger.MODALITY_TTS) is not None
+
+
+def test_a_key_saved_through_any_path_forgets_and_refreshes_in_one_place(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    """The Control API, CLI connect flows and the setup wizard all save through
+    ``set_secret``; none of them calls a health route. The ONE listener on the
+    credential store forgets the old verdict and the rollup cache follows."""
+    from jarvis.brain import provider_health_ledger as ledger
+    from jarvis.core import config as cfg_mod
+
+    secret_store.data["openai_api_key"] = "sk-old"
+    ledger.get_ledger().record("openai", ledger.MODALITY_BRAIN, "bad_key")
+    with TestClient(server_with_brain.app) as client:
+        before = client.get("/api/providers/section-health").json()
+        # e.g. PUT /api/control/secrets/openai_api_key → cfg_mod.set_secret
+        assert cfg_mod.set_secret("openai_api_key", "sk-new") is True
+        after = client.get("/api/providers/section-health").json()
+
+    assert before["sections"]["brain"]["status"] == "error"
+    assert after["cached"] is False
+    assert after["sections"]["brain"]["status"] == "unknown"
+    assert after["sections"]["brain"]["reason"] == "unverified"
+
+
+def test_a_key_replaced_in_another_process_voids_the_stale_verdict(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    """The terminal wizard writes the keyring from its own process: no listener
+    fires here. The credential failure carries the fingerprint of the key it
+    was judged against, and a different key voids it on the next read."""
+    from jarvis.brain import provider_health_ledger as ledger
+
+    secret_store.data["openai_api_key"] = "sk-old"
+    ledger.get_ledger().record("openai", ledger.MODALITY_BRAIN, "bad_key")
+    with TestClient(server_with_brain.app) as client:
+        before = client.get("/api/providers/section-health").json()
+        secret_store.data["openai_api_key"] = "sk-new"  # no in-process write
+        after = client.get("/api/providers/section-health?refresh=true").json()
+
+    assert before["sections"]["brain"]["status"] == "error"
+    assert after["sections"]["brain"]["status"] == "unknown"
+    assert ledger.get_ledger().get("openai", ledger.MODALITY_BRAIN) is None
+
+
+def test_a_transient_outcome_is_amber_not_red(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    """A throttle or a blip has usually passed (or a fallback answered):
+    degraded, never the red of a rejected key."""
+    from jarvis.brain import provider_health_ledger as ledger
+
+    secret_store.data["openai_api_key"] = "sk-test"
+    ledger.get_ledger().record("openai", ledger.MODALITY_BRAIN, "rate_limited")
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers/section-health").json()
+
+    assert body["sections"]["brain"]["status"] == "needs_setup"
+    assert body["sections"]["brain"]["reason"] == "rate_limited"
+
+
+def test_list_providers_exposes_credential_help_and_billing(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """The catalog carries the per-provider help text + how it is billed, so the
+    UI can explain 'which key / subscription, and what for' without guessing."""
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        by_id = {p["id"]: p for p in body["providers"]}
+        assert by_id["gemini"]["credential_help"]
+        assert by_id["gemini"]["billing"] == "api"
+        assert by_id["antigravity"]["billing"] == "subscription_or_api"
+        assert by_id["codex"]["billing"] == "subscription_or_api"
+
+
+def test_list_providers_exposes_gemini_vertex_alt_path(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Gemini surfaces the Vertex AI alternative so the user sees AI Studio vs
+    Vertex are different billing accounts (2026-06-22 forensic)."""
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        by_id = {p["id"]: p for p in body["providers"]}
+        alt = by_id["gemini"]["alt_credential"]
+        assert alt is not None
+        assert "vertex" in alt["label"].lower()
+        assert alt["billing"] == "api"
+        assert "cloud.google.com" in alt["dashboard_url"]
+        assert by_id["openai"]["alt_credential"] is None
+
+
+def test_list_providers_marks_active_brain(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        openai = next(p for p in body["providers"] if p["id"] == "openai")
+        claude_api = next(p for p in body["providers"] if p["id"] == "claude-api")
+        assert openai["active"] is True
+        assert claude_api["active"] is False
+
+
+def test_list_providers_reports_configured_for_set_keys(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    secret_store.set("openai_api_key", "sk-test-123")
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        openai = next(p for p in body["providers"] if p["id"] == "openai")
+        gemini = next(p for p in body["providers"] if p["id"] == "gemini")
+        assert openai["configured"] is True
+        assert gemini["configured"] is False
+
+
+def test_list_providers_never_leaks_secret_values(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    secret_store.set("openai_api_key", "SECRET-VALUE-DO-NOT-LEAK")
+    with TestClient(server_with_brain.app) as client:
+        text = client.get("/api/providers").text
+        assert "SECRET-VALUE-DO-NOT-LEAK" not in text
+
+
+def test_list_providers_reports_codex_without_leaking_auth_files(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeCodexService:
+        def __init__(self, binary_path: str | None = None) -> None:
+            self.binary_path = binary_path
+
+        def status(self):
+            from jarvis.codex_auth import CodexAuthStatus
+
+            return CodexAuthStatus(
+                installed=True,
+                connected=True,
+                mode="chatgpt",
+                message="Codex is connected",
+                version="1.2.3",
+                accountLabel="ChatGPT/Codex-Login",
+            )
+
+    monkeypatch.setattr("jarvis.ui.web.provider_routes.CodexAuthService", _FakeCodexService)
+    monkeypatch.setattr("jarvis.codex_auth.CodexAuthService", _FakeCodexService)
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        codex = next(p for p in body["providers"] if p["id"] == "codex")
+        assert codex["configured"] is True
+        assert codex["codex_status"]["mode"] == "chatgpt"
+        assert "auth.json" not in str(codex["codex_status"])
+        forbidden = {"auth", "api_key", "access_token", "refresh_token"}
+        assert not forbidden & codex["codex_status"].keys()
+
+
+def test_codex_binary_path_persists_to_config(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[str] = []
+    monkeypatch.setattr(
+        "jarvis.core.config_writer.set_codex_binary_path",
+        lambda binary_path, **kw: writes.append(binary_path),
+    )
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/codex/binary-path",
+            json={"binary_path": " C:\\Tools\\codex.cmd "},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["binary_path"] == "C:\\Tools\\codex.cmd"
+    assert writes == ["C:\\Tools\\codex.cmd"]
+    assert server_with_brain.cfg.codex.binary_path == "C:\\Tools\\codex.cmd"
+
+
+# ----------------------------------------------------------------------
+# /api/secrets/{key}
+# ----------------------------------------------------------------------
+
+
+def test_set_secret_persists_value(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/openai_api_key", json={"value": "sk-abc"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+    assert secret_store.data["openai_api_key"] == "sk-abc"
+
+
+def test_set_secret_rejects_unknown_key(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/totally_made_up_key", json={"value": "x"})
+        assert resp.status_code == 404
+
+
+def test_set_secret_rejects_empty_value(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/openai_api_key", json={"value": ""})
+        assert resp.status_code == 422  # pydantic min_length=1
+
+
+def test_set_secret_emits_event(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    received: list[SecretConfigured] = []
+
+    async def handler(evt: SecretConfigured) -> None:
+        received.append(evt)
+
+    server_with_brain.bus.subscribe(SecretConfigured, handler)
+    with TestClient(server_with_brain.app) as client:
+        client.post("/api/secrets/openai_api_key", json={"value": "sk-x"})
+    assert any(e.key == "openai_api_key" and e.action == "set" for e in received)
+
+
+def test_set_secret_on_scoped_card_writes_the_family_slot(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """The first Gemini key typed on the Realtime card serves every Gemini surface."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/realtime_gemini_api_key", json={"value": "AIza-1"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["written"] == ["gemini_api_key"]
+    assert secret_store.data == {"gemini_api_key": "AIza-1"}
+
+
+def test_set_secret_asks_before_a_second_different_key(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    secret_store.set("gemini_api_key", "AIza-1")
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/jarvis_agent_gemini_api_key", json={"value": "AIza-2"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is False and body["choice_required"] is True
+        assert body["choice_kind"] == "dedicated_vs_family"
+        assert body["family_label"] == "Google Gemini"
+        # Nothing was written while the question is open.
+        assert secret_store.data == {"gemini_api_key": "AIza-1"}
+
+        here = client.post(
+            "/api/secrets/jarvis_agent_gemini_api_key",
+            json={"value": "AIza-2", "scope": "here"},
+        )
+        assert here.json()["written"] == ["jarvis_agent_gemini_api_key"]
+    assert secret_store.data["jarvis_agent_gemini_api_key"] == "AIza-2"
+    assert secret_store.data["gemini_api_key"] == "AIza-1"
+
+
+def test_set_secret_everywhere_replaces_family_and_old_copies(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    secret_store.set("openai_api_key", "sk-old")
+    secret_store.set("realtime_openai_api_key", "sk-old")
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/secrets/realtime_openai_api_key",
+            json={"value": "sk-new", "scope": "everywhere"},
+        )
+        body = resp.json()
+        assert body["written"] == ["openai_api_key"]
+        assert body["removed"] == ["realtime_openai_api_key"]
+    assert secret_store.data == {"openai_api_key": "sk-new"}
+
+
+def test_set_secret_rejects_unknown_scope(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/secrets/openai_api_key", json={"value": "x", "scope": "there"})
+        assert resp.status_code == 422
+
+
+def test_delete_secret(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    secret_store.set("gemini_api_key", "old")
+    with TestClient(server_with_brain.app) as client:
+        resp = client.delete("/api/secrets/gemini_api_key")
+        assert resp.status_code == 200
+    assert "gemini_api_key" not in secret_store.data
+
+
+# ----------------------------------------------------------------------
+# /api/brain/switch
+# ----------------------------------------------------------------------
+
+
+def test_brain_switch_calls_manager(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    # Since the 409 credential gate, a switch without a key set is
+    # rejected. We set the key before the switch — exactly the UI path
+    # (user saves the API key, then clicks "Set active").
+    secret_store.set("openrouter_api_key", "sk-or-test-123")
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "openrouter", "persist": True})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["active"] == "openrouter"
+        assert body["persisted"] is True
+    assert fake.calls == [("openrouter", True)]
+
+
+def test_brain_switch_rejects_provider_without_key(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Acceptance criterion: a provider without an API key cannot be activated.
+
+    Returns 409 with a clear message so the UI can show a concrete error
+    from `body.detail` (instead of a silent success that only visibly
+    fails on the first voice turn).
+    """
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "openrouter"})
+        assert resp.status_code == 409
+        # Shared app_control wording (one implementation for UI + voice + CLI).
+        assert "API key" in resp.json()["detail"]
+    # BrainManager.switch() must NOT have been called.
+    assert fake.calls == []
+
+
+def test_brain_switch_codex_rejected_as_subagent_only_even_with_openai_key(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Codex remains subagent-only even if an OpenAI key is configured."""
+    secret_store.set("openai_api_key", "sk-openai-test-123")
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "codex", "persist": True})
+        assert resp.status_code == 409
+        assert "subagent-only" in resp.json()["detail"]
+    assert fake.calls == []
+
+
+def _patch_codex_status(monkeypatch: pytest.MonkeyPatch, *, connected: bool) -> None:
+    """Pin provider_routes.CodexAuthService to a connected/disconnected stub so
+    Codex route tests don't depend on the dev machine's real `codex login`."""
+
+    class _Fake:
+        def __init__(self, binary_path: str | None = None) -> None:
+            self.binary_path = binary_path
+
+        def status(self):
+            from jarvis.codex_auth import CodexAuthStatus
+
+            return CodexAuthStatus(
+                installed=True,
+                connected=connected,
+                mode="chatgpt" if connected else "unknown",
+            )
+
+    monkeypatch.setattr("jarvis.ui.web.provider_routes.CodexAuthService", _Fake)
+
+
+def _patch_antigravity_status(monkeypatch: pytest.MonkeyPatch, *, connected: bool) -> None:
+    class _Status:
+        def __init__(self) -> None:
+            self.installed = True
+            self.connected = connected
+            self.mode = "oauth-personal" if connected else "unknown"
+            self.cli_kind = "agy"
+            self.message = "connected" if connected else "not connected"
+            self.version = "1.0.0"
+            self.user_email = "dev@example.com" if connected else None
+            self.binary_path = "agy"
+            self.error = None
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "installed": self.installed,
+                "connected": self.connected,
+                "mode": self.mode,
+                "cli_kind": self.cli_kind,
+                "message": self.message,
+                "version": self.version,
+                "user_email": self.user_email,
+                "binary_path": self.binary_path,
+                "error": self.error,
+            }
+
+    class _Fake:
+        def status(self) -> _Status:
+            return _Status()
+
+    monkeypatch.setattr("jarvis.google_cli.auth_service.GoogleCliAuthService", _Fake)
+
+
+def test_brain_switch_codex_rejected_as_subagent_only_even_with_chatgpt_login(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No OpenAI key, but a ChatGPT login -> 200: CodexBrain drives the slow
+    ``codex exec`` CLI path over the OAuth token, so the toggle is usable."""
+    _patch_codex_status(monkeypatch, connected=True)
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "codex", "persist": True})
+        assert resp.status_code == 409
+        assert "subagent-only" in resp.json()["detail"]
+    assert fake.calls == []
+
+
+def test_brain_switch_codex_rejected_without_any_auth(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No OpenAI key AND no ChatGPT login -> 409: nothing can back the brain."""
+    _patch_codex_status(monkeypatch, connected=False)
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "codex"})
+        assert resp.status_code == 409
+        assert "subagent-only" in resp.json()["detail"]
+    # No silent switch — the manager must not have been called.
+    assert fake.calls == []
+
+
+def test_brain_switch_antigravity_rejected_as_subagent_only(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Antigravity is OAuth-connected but not selectable as the main brain.
+
+    It remains available through the dedicated subagent switch; the main-brain
+    endpoint must reject it before calling BrainManager.switch().
+    """
+    _patch_antigravity_status(monkeypatch, connected=True)
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    fake._available.append("antigravity")
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "antigravity"})
+
+    assert resp.status_code == 409
+    assert "Subagent" in resp.json()["detail"]
+    assert fake.calls == []
+
+
+def test_brain_switch_unknown_provider_returns_404(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "nonexistent-provider"})
+        assert resp.status_code == 404
+
+
+def test_brain_switch_provider_not_in_registry_returns_404(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    # gemini is in the spec but not in the fake's available_providers
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "gemini"})
+        assert resp.status_code == 404
+
+
+def test_brain_switch_blocked_in_airgapped_profile(server_with_brain: WebServer, secret_store: _InMemorySecretStore) -> None:
+    server_with_brain.cfg.profile.name = "airgapped"
+    server_with_brain.app.state.cfg = server_with_brain.cfg
+    with TestClient(server_with_brain.app) as client:
+        # Cloud-Provider blockiert (alle Brain-Provider sind aktuell cloud)
+        resp = client.post("/api/brain/switch", json={"provider": "openai"})
+        assert resp.status_code == 403
+        resp = client.post("/api/brain/switch", json={"provider": "claude-api"})
+        assert resp.status_code == 403
+
+
+def test_brain_switch_503_when_brain_missing(web_server: WebServer, secret_store: _InMemorySecretStore) -> None:
+    # No app.state.brain → headless mode
+    with TestClient(web_server.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "openai"})
+        assert resp.status_code == 503
+
+
+def test_brain_switch_codex_requires_api_key(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex is rejected as main Brain before credential checks."""
+    _patch_codex_status(monkeypatch, connected=False)
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/brain/switch", json={"provider": "codex"})
+        assert resp.status_code == 409
+    assert fake.calls == []
+
+
+def test_brain_switch_codex_with_api_key(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Even with a Codex key saved, Codex remains subagent-only."""
+    secret_store.set("codex_openai_api_key", "sk-codex-123")
+    fake: _FakeBrainManager = server_with_brain.app.state.brain
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/brain/switch", json={"provider": "codex", "persist": False}
+        )
+        assert resp.status_code == 409, resp.text
+        assert "subagent-only" in resp.json()["detail"]
+    assert fake.calls == []
+
+
+# ----------------------------------------------------------------------
+# /api/tts/switch
+# ----------------------------------------------------------------------
+
+
+def test_list_providers_includes_grok_voice_tts(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """grok-voice ist als TTS-Provider im Katalog (UI-Sichtbarkeit)."""
+    with TestClient(server_with_brain.app) as client:
+        body = client.get("/api/providers").json()
+        ids = {p["id"] for p in body["providers"]}
+        assert "grok-voice" in ids
+        grok = next(p for p in body["providers"] if p["id"] == "grok-voice")
+        assert grok["tier"] == "tts"
+        assert grok["secret_keys"] == ["grok_api_key"]
+
+
+def test_tts_switch_persists_and_acks_restart(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy-Path: Provider mit Credentials -> 200 + restart_required."""
+    secret_store.set("grok_api_key", "xai-test-key")
+
+    write_calls: list[str] = []
+    monkeypatch.setattr(
+        "jarvis.core.config_writer.set_tts_provider",
+        lambda name, **kw: write_calls.append(name),
+    )
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/tts/switch", json={"provider": "grok-voice", "persist": True}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["active"] == "grok-voice"
+        assert body["persisted"] is True
+        assert body["restart_required"] is True
+
+    assert write_calls == ["grok-voice"]
+
+
+def test_tts_switch_rejects_unconfigured_provider(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Without an API key → 409, so the user sets a key first."""
+    # No grok_api_key set
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/tts/switch", json={"provider": "grok-voice", "persist": True}
+        )
+        assert resp.status_code == 409
+
+
+def test_tts_switch_rejects_brain_provider(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    """Tier mismatch: openai is a Brain provider, not TTS → 400."""
+    secret_store.set("openai_api_key", "sk-test")
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/tts/switch", json={"provider": "openai", "persist": True}
+        )
+        assert resp.status_code == 400
+
+
+def test_tts_switch_unknown_provider_returns_404(
+    server_with_brain: WebServer, secret_store: _InMemorySecretStore
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/tts/switch", json={"provider": "doesnt-exist", "persist": True}
+        )
+        assert resp.status_code == 404
+
+
+def test_tts_switch_no_persist_skips_toml_write(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """persist=false → no TOML write, but the switch response is still OK."""
+    secret_store.set("grok_api_key", "xai-test-key")
+
+    write_calls: list[str] = []
+    monkeypatch.setattr(
+        "jarvis.core.config_writer.set_tts_provider",
+        lambda name, **kw: write_calls.append(name),
+    )
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post(
+            "/api/tts/switch", json={"provider": "grok-voice", "persist": False}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["persisted"] is False
+
+    assert write_calls == []
+
+
+# ----------------------------------------------------------------------
+# /api/providers/{pid}/login
+# ----------------------------------------------------------------------
+
+
+def test_provider_login_returns_409_when_cli_missing(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = monkeypatch
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/providers/openclaw/login")
+        assert resp.status_code == 404
+        # Detail can be a string or dict — both are valid in FastAPI
+        detail = resp.json().get("detail")
+        assert detail is not None
+
+
+def test_provider_login_starts_subprocess(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = monkeypatch
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/providers/openclaw/login")
+        assert resp.status_code == 404
+
+
+def test_provider_login_rejects_api_key_provider(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/providers/openai/login")
+        assert resp.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# /api/providers/{pid}/login/status
+# ----------------------------------------------------------------------
+
+
+def test_login_status_reports_logged_in_for_valid_claude_creds(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = monkeypatch
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/openclaw/login/status")
+        assert resp.status_code == 404
+
+
+def test_login_status_logged_in_false_when_creds_missing(
+    server_with_brain: WebServer,
+    secret_store: _InMemorySecretStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = monkeypatch
+
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/openclaw/login/status")
+        assert resp.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# /api/providers/{pid}/pullable-models + /pull  (in-app local downloads)
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_pull(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stub the pull module so the routes never touch a real Ollama server."""
+    from jarvis.brain import ollama_pull
+
+    calls: dict[str, Any] = {"started": [], "status": []}
+
+    async def _recommendations() -> dict[str, Any]:
+        return {
+            "server": "http://localhost:11434",
+            "server_reachable": True,
+            "message": "",
+            "memory_gb": 32.0,
+            "models": [{"id": "qwen3-vl", "installed": False, "fit": "comfortable"}],
+            "installed": [],
+        }
+
+    async def _start_pull(model: str) -> dict[str, Any]:
+        calls["started"].append(model)
+        return {"state": "running", "model": model, "message": "Starting…"}
+
+    async def _pull_status(model: str) -> dict[str, Any]:
+        calls["status"].append(model)
+        return {"state": "running", "model": model, "percent": 12.5}
+
+    monkeypatch.setattr(ollama_pull, "recommendations", _recommendations)
+    monkeypatch.setattr(ollama_pull, "start_pull", _start_pull)
+    monkeypatch.setattr(ollama_pull, "pull_status", _pull_status)
+    return calls
+
+
+def test_pullable_models_lists_the_shortlist(
+    server_with_brain: WebServer, fake_pull: dict[str, Any]
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/ollama/pullable-models")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["server_reachable"] is True
+        assert body["models"][0]["id"] == "qwen3-vl"
+
+
+def test_pull_starts_a_download_and_reports_progress(
+    server_with_brain: WebServer, fake_pull: dict[str, Any]
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        started = client.post("/api/providers/ollama/pull", json={"model": "qwen3-vl"})
+        assert started.status_code == 200
+        assert started.json()["state"] == "running"
+        status = client.get("/api/providers/ollama/pull/status", params={"model": "qwen3-vl"})
+        assert status.status_code == 200
+        assert status.json()["percent"] == 12.5
+    assert fake_pull["started"] == ["qwen3-vl"]
+
+
+def test_pull_rejects_a_provider_whose_server_cannot_be_told_to_fetch(
+    server_with_brain: WebServer, fake_pull: dict[str, Any]
+) -> None:
+    """A generic OpenAI-compatible server has no download API — the honest
+    answer is 400 with the reason, never a silent no-op."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.post("/api/providers/local-openai/pull", json={"model": "x"})
+        assert resp.status_code == 400
+        assert "no download API" in resp.json()["detail"]
+    assert fake_pull["started"] == []
+
+
+def test_pull_on_an_unknown_provider_is_404(
+    server_with_brain: WebServer, fake_pull: dict[str, Any]
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/nope/pullable-models")
+        assert resp.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# /api/providers/{pid}/library/…  (browse the FULL public model library)
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_library(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stub the library module so the routes never touch ollama.com."""
+    from jarvis.brain import ollama_library
+
+    calls: dict[str, Any] = {"searched": [], "tagged": []}
+
+    async def _search_library(query: str) -> dict[str, Any]:
+        calls["searched"].append(query)
+        return {
+            "query": query,
+            "models": [{"name": "qwen3.5", "description": "…", "installed": False}],
+            "error": None,
+        }
+
+    async def _library_tags(model: str) -> dict[str, Any]:
+        calls["tagged"].append(model)
+        return {
+            "model": model,
+            "tags": [{"tag": "4b", "id": f"{model}:4b", "size_gb": 3.4, "fit": "comfortable"}],
+            "error": None,
+        }
+
+    monkeypatch.setattr(ollama_library, "search_library", _search_library)
+    monkeypatch.setattr(ollama_library, "library_tags", _library_tags)
+    return calls
+
+
+def test_library_search_returns_models_from_the_public_catalog(
+    server_with_brain: WebServer, fake_library: dict[str, Any]
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/ollama/library/search", params={"q": "qwen"})
+        assert resp.status_code == 200
+        assert resp.json()["models"][0]["name"] == "qwen3.5"
+    assert fake_library["searched"] == ["qwen"]
+
+
+def test_library_search_without_a_query_browses_the_popular_models(
+    server_with_brain: WebServer, fake_library: dict[str, Any]
+) -> None:
+    """Someone who does not know what to look for still gets a list."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/ollama/library/search")
+        assert resp.status_code == 200
+    assert fake_library["searched"] == [""]
+
+
+def test_library_tags_list_the_installable_sizes(
+    server_with_brain: WebServer, fake_library: dict[str, Any]
+) -> None:
+    """A bare model name is not installable — the tag carries the size."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/ollama/library/qwen3.5/tags")
+        assert resp.status_code == 200
+        assert resp.json()["tags"][0]["id"] == "qwen3.5:4b"
+    assert fake_library["tagged"] == ["qwen3.5"]
+
+
+def test_library_routes_reject_a_card_without_a_download_api(
+    server_with_brain: WebServer, fake_library: dict[str, Any]
+) -> None:
+    """Browsing a library the card could not pull from would be a dead end."""
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/local-openai/library/search")
+        assert resp.status_code == 400
+    assert fake_library["searched"] == []
+
+
+def test_library_search_on_an_unknown_provider_is_404(
+    server_with_brain: WebServer, fake_library: dict[str, Any]
+) -> None:
+    with TestClient(server_with_brain.app) as client:
+        resp = client.get("/api/providers/nope/library/search")
+        assert resp.status_code == 404

@@ -1,0 +1,136 @@
+import { useCallback, useEffect, useState } from "react";
+
+import { bootSettled } from "@/lib/bootStagger";
+
+/**
+ * Result of GET /api/update/status. ``managed`` is false on any checkout that is
+ * not an installer-managed install (a dev tree, a manual clone) — the update
+ * button never renders there. ``update_available`` is only ever true on a
+ * managed install with a newer published GitHub Release.
+ */
+export interface UpdateStatus {
+  managed: boolean;
+  current: string;
+  latest: string | null;
+  update_available: boolean;
+  notes: string | null;
+  published_at: string | null;
+  release_url?: string | null;
+  check_failed?: boolean;
+  /**
+   * A downloaded-but-not-yet-installed transaction staged by an earlier apply
+   * (the restart finishes it). Reported live so a failed/skipped restart still
+   * surfaces as "finish the update" instead of silently starting over.
+   */
+  pending_update?: { version: string | null; target_revision: string } | null;
+  /**
+   * The relauncher's verdict on the last finalized update. ``ok: false`` means
+   * the install failed after the restart and the app was rolled back — the UI
+   * must say so, or the failure is indistinguishable from "nothing happened".
+   */
+  last_result?: {
+    ok: boolean;
+    rolled_back: boolean;
+    completed_at?: number | null;
+  } | null;
+  /**
+   * A native install that cannot replace itself where it runs (macOS app in a
+   * temporary or read-only location, Linux not started from a writable
+   * AppImage). The update is still announced; ``blocked_code`` picks the
+   * translated explanation and ``blocked_reason`` is the English fallback.
+   */
+  blocked_code?: string | null;
+  blocked_reason?: string | null;
+}
+
+/**
+ * Live state of an update that is being applied right now, from
+ * GET /api/update/progress. The apply call is one long request, so this is the
+ * only way to learn anything before it returns.
+ *
+ * ``phase`` walks idle -> resolving -> downloading -> verifying -> installing ->
+ * ready, or lands on failed. ``percent`` is a phase model fed by real
+ * measurements (bytes off the socket, git's object counters) and never rewinds,
+ * so it is safe to bind a bar width straight to it.
+ */
+export interface UpdateProgress {
+  active: boolean;
+  phase:
+    | "idle"
+    | "resolving"
+    | "downloading"
+    | "verifying"
+    | "installing"
+    | "ready"
+    | "failed";
+  percent: number;
+  /** Human sub-status, e.g. "64.0 MB / 128.0 MB". Null when there is none. */
+  detail: string | null;
+  version: string | null;
+  kind: string | null;
+  error: string | null;
+  restart_required: boolean;
+}
+
+// Slow poll: a new release is a rare event, so 6h keeps the button fresh
+// without hammering GitHub. A window focus also triggers a check.
+const POLL_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Read the live progress of an in-flight update.
+ *
+ * Returns null on any failure — and during an update that is a MEANINGFUL null,
+ * not just a hiccup: the restart kills this server mid-poll, so an unreachable
+ * progress endpoint is the expected end of a successful update, never something
+ * to surface as an error.
+ */
+export async function fetchUpdateProgress(): Promise<UpdateProgress | null> {
+  try {
+    const res = await fetch("/api/update/progress");
+    if (!res.ok) return null;
+    return (await res.json()) as UpdateProgress;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchStatus(force = false): Promise<UpdateStatus | null> {
+  try {
+    const res = await fetch(`/api/update/status${force ? "?force=true" : ""}`);
+    if (!res.ok) return null;
+    return (await res.json()) as UpdateStatus;
+  } catch {
+    // A failed status check must never disrupt the app — the button just
+    // stays hidden until the next successful poll.
+    return null;
+  }
+}
+
+/**
+ * Polls /api/update/status so the top bar can surface an "Update available"
+ * button on its own, like a native auto-updater. Applying + restarting is done
+ * by the caller (TopBar), which owns the toast + mission-guard (409) UX.
+ */
+export function useUpdate() {
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+
+  const refresh = useCallback(async (force = false) => {
+    const data = await fetchStatus(force);
+    if (data) setStatus(data);
+    return data;
+  }, []);
+
+  useEffect(() => {
+    // Non-critical: the first status check waits out the boot burst.
+    void bootSettled().then(() => refresh());
+    const id = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refresh]);
+
+  return { status, refresh };
+}

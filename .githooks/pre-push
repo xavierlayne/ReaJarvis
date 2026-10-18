@@ -1,0 +1,114 @@
+#!/bin/sh
+# pre-push: credential protection only. Everything else is CI's job.
+#
+# WHY THIS HOOK IS SMALL (rewritten 2026-08-05)
+# --------------------------------------------
+# This hook used to run fifteen gates, thirteen of which scanned the WHOLE tree
+# rather than the change being pushed. Two consequences made ordinary pushing
+# unaffordable:
+#
+#   1. Every push inherited whatever was already broken anywhere in the repo, so
+#      a one-line fix was blocked by findings in files nobody had touched. The
+#      fix-the-unrelated-thing loop, not the push, was the actual cost.
+#   2. The boot-budget gate booted the entire application on every push (420 s
+#      timeout) and counted a failed boot — the normal outcome in a fresh
+#      worktree without installed deps — as a budget violation.
+#
+# Those gates did not disappear: .github/workflows/ci.yml runs every one of them
+# on GitHub's runners, where a red result is a report instead of a roadblock.
+# The pre-commit hook keeps the cheap diff-scoped checks (language, dist
+# consistency, private keys, denylist) at the moment the change is authored.
+#
+# What stays HERE is only what must never leave the machine, and only what can
+# be judged from the pushed commits alone:
+#
+#   1. CREDENTIAL gate (FAIL-CLOSED) — scripts/ci/privacy_pre_push.py
+#        (A) logs a heads-up when the target is the public repo (never blocks);
+#        (B) blocks a commit carrying a private maintainer email;
+#        (C) blocks a real secret / forbidden secret file in the pushed files.
+#      Fails OPEN only when it genuinely cannot run (no python, scanner import
+#      fails, diff range unknown) — layer-3 CI is the backstop.
+#
+#   2. PRIVATE-KEY gate (FAIL-CLOSED) — scripts/ci/check_no_private_keys.py
+#      Signing private keys live ONLY in GitHub Actions secrets (AP-29). A
+#      leaked key is permanent and unrecoverable, which is why this one is worth
+#      its ~1.5 s even though CI also runs it.
+#
+# Together: under two seconds. A push is a push again.
+#
+# This hook is VERSIONED in .githooks/; the orchestrator wires it via
+# `git config core.hooksPath .githooks` (this hook never sets that itself).
+#
+# Bypass once:  git push --no-verify
+#
+# git passes the remote name as $1 and the remote URL as $2; the pushed refs
+# arrive on stdin, one line per ref:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+
+remote_name="$1"
+remote_url="$2"
+
+# Prefer the repository venv because the gates import the project's dev
+# dependencies. Cover POSIX and Windows layouts, then retain the historical
+# known-good Windows interpreter before falling back to PATH. No Python at all
+# -> fail OPEN.
+PY=".venv/bin/python3"
+[ -x "$PY" ] || PY=".venv/bin/python"
+[ -x "$PY" ] || PY=".venv/Scripts/python.exe"
+[ -x "$PY" ] || PY="/c/Program Files/Python311/python.exe"
+[ -x "$PY" ] || PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+[ -n "$PY" ] || exit 0
+
+# Read all pushed refs from stdin FIRST (into a temp file), so each gate's own
+# subprocess can never consume the hook's stdin pipe and corrupt the loop.
+refs_file="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/prepush_refs.$$")"
+cat > "$refs_file"
+
+status=0
+privacy_hit=0
+privkey_hit=0
+
+# --- 1) CREDENTIAL gate (FAIL-CLOSED) -----------------------------------------
+# Feed the buffered refs to the privacy gate on stdin; it reads remote name/url
+# from argv. A non-zero exit means a CONFIRMED credential block.
+privacy_gate="scripts/ci/privacy_pre_push.py"
+if [ -f "$privacy_gate" ]; then
+    "$PY" "$privacy_gate" "$remote_name" "$remote_url" < "$refs_file"
+    if [ "$?" -ne 0 ]; then
+        status=1
+        privacy_hit=1
+    fi
+fi
+
+# --- 2) PRIVATE-KEY gate (FAIL-CLOSED) ----------------------------------------
+# Signing private keys (and the retired signing passphrase) must NEVER enter the
+# repo — they live ONLY in GitHub Actions secrets (WAVE2_OFFLINE_KEY_B64 /
+# WAVE4_MLDSA65_KEY_B64). Blocks a full PEM PRIVATE KEY block, a tracked
+# *.key/*.key.enc file, or a WAVE2_CEREMONY_PASSPHRASE=<value> line. The demo
+# passphrase once leaked into 14 permanent public snapshots; this guards that
+# class. Public keys are fine. Stdlib + git only, so it runs anywhere.
+privkey_gate="scripts/ci/check_no_private_keys.py"
+if [ -f "$privkey_gate" ]; then
+    "$PY" "$privkey_gate" </dev/null
+    if [ "$?" -ne 0 ]; then
+        status=1
+        privkey_hit=1
+    fi
+fi
+
+rm -f "$refs_file"
+
+if [ "$status" -ne 0 ]; then
+    echo ""
+    if [ "$privacy_hit" -ne 0 ]; then
+        echo "pre-push BLOCKED: CREDENTIAL gate (private email / secret in pushed files)."
+        echo "  See the findings above. Remove the credential from the commit, then retry."
+    fi
+    if [ "$privkey_hit" -ne 0 ]; then
+        echo "pre-push BLOCKED: PRIVATE-KEY gate (private key / passphrase in the tree)."
+        echo "  Signing private keys live ONLY in GitHub Actions secrets, never in the"
+        echo "  repo. Remove the key material shown above (public keys are fine)."
+    fi
+    echo "Bypass once with:  git push --no-verify   (layer-3 CI is the backstop)."
+fi
+exit "$status"

@@ -1,0 +1,267 @@
+"""Unit tests for jarvis/mcp/client.py — MCPClient lifecycle.
+
+AP-23 wave-2 finding 10: a stdio MCP server whose launcher binary (typically
+``npx``/``node``) is absent from PATH must fail with an actionable message
+("install Node.js 18+ ...") instead of a raw ``FileNotFoundError`` string
+reaching the plugin badge (caught generically at ``mcp/registry.py``).
+"""
+from __future__ import annotations
+
+import asyncio
+import shutil
+from types import SimpleNamespace
+
+import pytest
+
+from jarvis.mcp.client import MCPClient, _stdio_launcher_missing_message
+from jarvis.mcp.registry import MCPServerSpec
+
+
+def _stdio_spec(command: str = "npx", name: str = "some-plugin") -> MCPServerSpec:
+    return MCPServerSpec(
+        name=name,
+        display=name.title(),
+        description="Test stdio MCP server",
+        install_command=[command, "-y", "@example/server"],
+        transport="stdio",
+    )
+
+
+# --- _stdio_launcher_missing_message (pure message shaping) -----------------
+
+
+def test_missing_message_names_node_for_npx() -> None:
+    msg = _stdio_launcher_missing_message("some-plugin", "npx")
+    assert "Node.js" in msg
+    assert "npx" in msg
+    assert "some-plugin" in msg
+
+
+def test_missing_message_names_node_for_node() -> None:
+    msg = _stdio_launcher_missing_message("some-plugin", "node")
+    assert "Node.js" in msg
+
+
+def test_missing_message_names_launcher_for_non_node_command() -> None:
+    msg = _stdio_launcher_missing_message("docker-plugin", "docker")
+    assert "docker" in msg
+    assert "docker-plugin" in msg
+    # No Node.js hint for a non-Node launcher.
+    assert "Node.js" not in msg
+
+
+# --- MCPClient.start() — actionable failure on a missing launcher -----------
+
+
+@pytest.mark.asyncio
+async def test_start_raises_actionable_error_when_npx_missing(monkeypatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    client = MCPClient(_stdio_spec(command="npx", name="brave-search"))
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await client.start()
+    message = str(excinfo.value)
+    # The actionable hint, not a raw errno string like
+    # "[Errno 2] No such file or directory: 'npx'".
+    assert "Node.js" in message
+    assert "18" in message
+    assert "brave-search" in message
+    assert "Errno" not in message
+
+
+@pytest.mark.asyncio
+async def test_start_actionable_error_is_readable_via_registry_style_format(
+    monkeypatch,
+) -> None:
+    """Mirrors how mcp/registry.py's start_enabled formats the failure:
+    ``f"{type(e).__name__}: {e}"``. Must read as an instruction, not a raw
+    OS error line.
+    """
+    monkeypatch.setattr(shutil, "which", lambda _cmd: None)
+    client = MCPClient(_stdio_spec(command="npx", name="brave-search"))
+    try:
+        await client.start()
+        pytest.fail("expected start() to raise")
+    except Exception as e:  # noqa: BLE001 — mirrors registry.py's catch-all
+        formatted = f"{type(e).__name__}: {e}"
+    assert "install Node.js 18+" in formatted
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_which_check_when_launcher_present(monkeypatch) -> None:
+    """When the launcher IS on PATH, the which()-check must not block startup
+    — this test only proves the guard doesn't misfire on a present binary; the
+    real transport handshake is exercised by higher-level/integration tests."""
+    monkeypatch.setattr(shutil, "which", lambda _cmd: r"C:\fake\npx.cmd")
+
+    class _BoomStdioClient:
+        def __init__(self, *_a, **_k) -> None:
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("boom past the which()-check, as expected")
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    import mcp.client.stdio as stdio_mod
+
+    monkeypatch.setattr(stdio_mod, "stdio_client", lambda params: _BoomStdioClient())
+
+    client = MCPClient(_stdio_spec(command="npx", name="brave-search"))
+    with pytest.raises(RuntimeError, match="boom past the which"):
+        await client.start()
+
+
+# --- MCPClient.stop() — bounded so a wedged transport can't hang teardown ----
+
+
+@pytest.mark.asyncio
+async def test_stop_times_out_instead_of_hanging_on_a_stalled_transport(
+    monkeypatch,
+) -> None:
+    """A cross-task ``anyio`` cancel-scope exit can make
+    ``AsyncExitStack.aclose()`` stall for ~20 s before it even errors. ``stop()``
+    MUST bound that so a load-bearing teardown (a realtime voice-session end, app
+    shutdown) can never hang on it — the live 2026-07-23 bug where a bar-X hangup
+    of a realtime session froze the JarvisBar on "listening" and deafened wake
+    until the stalled close gave up.
+    """
+    import jarvis.mcp.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_STOP_TIMEOUT_S", 0.05)
+
+    class _StalledExitStack:
+        async def aclose(self) -> None:
+            # Never completes — models the wedged transport close.
+            await asyncio.Event().wait()
+
+    client = MCPClient(_stdio_spec())
+    client._exit_stack = _StalledExitStack()
+    client._session = object()
+
+    # Bounded by the test itself, so a regression (unbounded stop) FAILS here
+    # instead of hanging the whole suite.
+    await asyncio.wait_for(client.stop(), timeout=2.0)
+
+    # The stall was abandoned and the client reset so a later start() is clean.
+    assert client._exit_stack is None
+    assert client._session is None
+
+
+@pytest.mark.asyncio
+async def test_start_and_stop_keep_contexts_on_one_owner_task(monkeypatch) -> None:
+    """Transport contexts stay task-bound across separate public call tasks."""
+
+    context_tasks: list[tuple[str, asyncio.Task[object] | None]] = []
+
+    class _TaskBoundTransport:
+        async def __aenter__(self):
+            context_tasks.append(("transport-enter", asyncio.current_task()))
+            return object(), object()
+
+        async def __aexit__(self, *_exc):
+            context_tasks.append(("transport-exit", asyncio.current_task()))
+
+    class _TaskBoundSession:
+        def __init__(self, *_args) -> None:
+            pass
+
+        async def __aenter__(self):
+            context_tasks.append(("session-enter", asyncio.current_task()))
+            return self
+
+        async def __aexit__(self, *_exc):
+            context_tasks.append(("session-exit", asyncio.current_task()))
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    import mcp
+    import mcp.client.stdio as stdio_mod
+
+    monkeypatch.setattr(shutil, "which", lambda _cmd: r"C:\fake\npx.cmd")
+    monkeypatch.setattr(stdio_mod, "stdio_client", lambda _params: _TaskBoundTransport())
+    monkeypatch.setattr(mcp, "ClientSession", _TaskBoundSession)
+
+    client = MCPClient(_stdio_spec())
+    start_task = asyncio.create_task(client.start())
+    await start_task
+    owner_task = client._owner_task
+    assert owner_task is not None
+    assert owner_task is not start_task
+
+    stop_task = asyncio.create_task(client.stop())
+    await stop_task
+
+    assert [name for name, _task in context_tasks] == [
+        "transport-enter",
+        "session-enter",
+        "session-exit",
+        "transport-exit",
+    ]
+    assert {task for _name, task in context_tasks} == {owner_task}
+    assert client._session is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_finishes_owner_cleanup_and_allows_restart(
+    monkeypatch,
+) -> None:
+    """Caller cancellation cannot strand stale lifecycle state."""
+
+    exit_started = asyncio.Event()
+    release_exit = asyncio.Event()
+
+    class _SlowExitTransport:
+        async def __aenter__(self):
+            return object(), object()
+
+        async def __aexit__(self, *_exc):
+            exit_started.set()
+            await release_exit.wait()
+
+    class _Session:
+        def __init__(self, *_args) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    import mcp
+    import mcp.client.stdio as stdio_mod
+
+    monkeypatch.setattr(shutil, "which", lambda _cmd: r"C:\fake\npx.cmd")
+    monkeypatch.setattr(stdio_mod, "stdio_client", lambda _params: _SlowExitTransport())
+    monkeypatch.setattr(mcp, "ClientSession", _Session)
+
+    client = MCPClient(_stdio_spec())
+    await client.start()
+    owner = client._owner_task
+    assert owner is not None
+
+    stop_task = asyncio.create_task(client.stop())
+    await exit_started.wait()
+    stop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    release_exit.set()
+    await asyncio.wait_for(asyncio.shield(owner), timeout=1.0)
+    assert client._owner_task is None
+    assert client._session is None
+
+    await client.start()
+    assert client._session is not None
+    await client.stop()

@@ -1,0 +1,895 @@
+"""Unit tests for the YouTube Music tool.
+
+Weighted towards what decides whether the plugin is usable: the deep links it
+opens (a song must open as its own radio, an album as its playlist), the OS
+media session it steers, the rationed search, and Google's three real
+refusals — quota, API not enabled, missing scope.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+from jarvis.platform.media_session import MediaSessionCapability, NowPlaying
+from jarvis.plugins.tool.youtube_music_rest import (
+    HOME_URL,
+    YouTubeMusicRestTool,
+    match_playlist,
+    playlist_url,
+    song_url,
+)
+
+_FAKE_TOKEN = "tok123"  # noqa: S105 — a literal for MockTransport, not a credential
+
+_SONG_HIT = {
+    "id": {"kind": "youtube#video", "videoId": "vid123"},
+    "snippet": {"title": "Karma Police", "channelTitle": "Radiohead - Topic"},
+}
+_ALBUM_HIT = {
+    "id": {"kind": "youtube#playlist", "playlistId": "OLAK5uy_abc"},
+    "snippet": {"title": "OK Computer", "channelTitle": "Radiohead - Topic"},
+}
+_MY_PLAYLISTS = {
+    "items": [
+        {
+            "id": "PLrun",
+            "snippet": {"title": "Running 2026"},
+            "contentDetails": {"itemCount": 12},
+        },
+        {"id": "PLchill", "snippet": {"title": "Chill evenings"}, "contentDetails": {}},
+    ]
+}
+
+
+class FakeMedia:
+    """A media session that remembers what it was told to do."""
+
+    def __init__(
+        self,
+        now: NowPlaying | None = None,
+        can_read: bool = True,
+        can_control: bool = True,
+        backend: str = "fake",
+        note: str = "",
+        after_open: NowPlaying | None = None,
+    ) -> None:
+        self.now = now
+        self.after_open = after_open
+        self.cap = MediaSessionCapability(can_read, can_control, backend, note)
+        self.calls: list[str] = []
+        self.opened = False
+
+    async def capability(self):
+        return self.cap
+
+    async def now_playing(self):
+        if self.opened and self.after_open is not None:
+            return self.after_open
+        return self.now
+
+    async def play(self):
+        self.calls.append("play")
+        return True
+
+    async def pause(self):
+        self.calls.append("pause")
+        return True
+
+    async def toggle(self):
+        self.calls.append("toggle")
+        return True
+
+    async def next(self):
+        self.calls.append("next")
+        return True
+
+    async def previous(self):
+        self.calls.append("previous")
+        return True
+
+
+def _playing(title="Karma Police", artist="Radiohead", app="Google Chrome", browser=True):
+    return NowPlaying(title, artist, "OK Computer", app, "playing", 10.0, 260.0, browser)
+
+
+def _paused(title="Karma Police", artist="Radiohead"):
+    return NowPlaying(title, artist, "", "Google Chrome", "paused", 10.0, 260.0, True)
+
+
+class Opener:
+    def __init__(self, ok: bool = True, media: FakeMedia | None = None) -> None:
+        self.ok = ok
+        self.urls: list[str] = []
+        self.media = media
+
+    def __call__(self, url: str) -> bool:
+        self.urls.append(url)
+        if self.media is not None:
+            self.media.opened = True
+        return self.ok
+
+
+class FakePlayer:
+    """The background player as the tool sees it: a state machine over a page.
+
+    ``script`` lists the states ``state()`` answers in order (the last one
+    repeats), so a test can stage "consent page, then playing" or "paused
+    forever". Every command is recorded."""
+
+    def __init__(
+        self,
+        script: list[dict[str, Any]] | None = None,
+        *,
+        available: tuple[bool, str] = (True, ""),
+        running: bool = False,
+    ) -> None:
+        self.script = list(script or [])
+        self._available = available
+        self.running = running
+        self.calls: list[tuple[str, Any]] = []
+        self.loaded: list[str] = []
+        self.shown = 0
+        self.hidden = 0
+
+    def available(self) -> tuple[bool, str]:
+        return self._available
+
+    def is_running(self) -> bool:
+        return self.running
+
+    def load(self, url: str) -> bool:
+        self.loaded.append(url)
+        self.running = True
+        return True
+
+    def state(self) -> dict[str, Any]:
+        if not self.script:
+            return {}
+        if len(self.script) > 1:
+            return self.script.pop(0)
+        return dict(self.script[0])
+
+    def show(self) -> bool:
+        self.shown += 1
+        return True
+
+    def hide(self) -> bool:
+        self.hidden += 1
+        return True
+
+    def play(self) -> bool:
+        self.calls.append(("play", None))
+        return True
+
+    def pause(self) -> bool:
+        self.calls.append(("pause", None))
+        return True
+
+    def next(self) -> bool:
+        self.calls.append(("next", None))
+        return True
+
+    def previous(self) -> bool:
+        self.calls.append(("previous", None))
+        return True
+
+    def set_volume(self, level: int) -> bool:
+        self.calls.append(("volume", level))
+        return True
+
+
+def _page(title="Karma Police", artist="Radiohead", *, paused=False, position=3.0, **extra):
+    base = {
+        "url": "https://music.youtube.com/watch?v=vid123",
+        "title": title,
+        "artist": artist,
+        "album": "OK Computer",
+        "has_video": True,
+        "paused": paused,
+        "position": position,
+        "duration": 260.0,
+        "volume": 40,
+        "ready": True,
+        "consent": False,
+    }
+    base.update(extra)
+    return base
+
+
+def _tool(
+    handler,
+    media=None,
+    opener=None,
+    token=_FAKE_TOKEN,
+    refresher=None,
+    player=None,
+    playback="browser",
+):
+    return YouTubeMusicRestTool(
+        access_token_provider=lambda: token,
+        transport=httpx.MockTransport(handler),
+        token_refresher=refresher,
+        media=media or FakeMedia(),
+        opener=opener or Opener(),
+        confirm_timeout_s=0.6,
+        player=player or FakePlayer(available=(False, "no player in this test")),
+        playback_mode=lambda: playback,
+        player_confirm_timeout_s=1.5,
+    )
+
+
+def _google_error(status: int, reason: str, message: str = "nope") -> httpx.Response:
+    return httpx.Response(
+        status,
+        json={
+            "error": {
+                "code": status,
+                "message": message,
+                "errors": [{"reason": reason, "domain": "youtube.quota"}],
+            }
+        },
+    )
+
+
+def _search_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path.endswith("/search"):
+        kind = request.url.params.get("type")
+        if kind == "video":
+            assert request.url.params.get("videoCategoryId") == "10"
+            return httpx.Response(200, json={"items": [_SONG_HIT]})
+        return httpx.Response(200, json={"items": [_ALBUM_HIT]})
+    if request.url.path.endswith("/playlists"):
+        return httpx.Response(200, json=_MY_PLAYLISTS)
+    return httpx.Response(404, json={"error": {"code": 404, "message": "?"}})
+
+
+# -- deep links ---------------------------------------------------------------
+
+
+def test_song_url_opens_the_song_as_its_own_radio():
+    assert song_url("abc") == "https://music.youtube.com/watch?v=abc&list=RDAMVMabc"
+
+
+def test_playlist_url_shapes():
+    assert playlist_url("PL1") == "https://music.youtube.com/watch?list=PL1"
+    assert playlist_url("LM", "v1") == "https://music.youtube.com/watch?v=v1&list=LM"
+
+
+def test_match_playlist_exact_contains_fuzzy_and_floor():
+    lists = [{"title": "Running 2026"}, {"title": "Chill evenings"}, {"title": "Workout"}]
+    assert match_playlist("running 2026", lists)["title"] == "Running 2026"
+    assert match_playlist("my running playlist", lists)["title"] == "Running 2026"
+    assert match_playlist("chill evening", lists)["title"] == "Chill evenings"
+    assert match_playlist("wrkout", lists)["title"] == "Workout"
+    assert match_playlist("jazz classics", lists) is None
+    assert match_playlist("", lists) is None
+
+
+# -- search -------------------------------------------------------------------
+
+
+async def test_search_song_slims_and_strips_topic_suffix():
+    out = await _tool(_search_handler).search(query="karma police", item_type="song")
+    assert out["results"] == [
+        {
+            "title": "Karma Police",
+            "type": "song",
+            "artist": "Radiohead",
+            "video_id": "vid123",
+            "url": song_url("vid123"),
+        }
+    ]
+
+
+async def test_search_is_cached_per_process_because_google_rations_it():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return _search_handler(request)
+
+    tool = _tool(handler)
+    await tool.search(query="Karma Police", item_type="song")
+    await tool.search(query="karma police", item_type="song")
+    assert calls["n"] == 1
+
+
+async def test_search_album_asks_for_playlists_and_labels_olak_as_album():
+    out = await _tool(_search_handler).search(query="OK Computer", item_type="album")
+    assert out["results"][0]["type"] == "album"
+    assert out["results"][0]["url"] == playlist_url("OLAK5uy_abc")
+
+
+async def test_search_playlist_prefers_the_users_own_lists():
+    out = await _tool(_search_handler).search(query="my running playlist", item_type="playlist")
+    assert out["own"] is True
+    assert out["results"][0]["playlist_id"] == "PLrun"
+
+
+async def test_not_connected_without_token():
+    tool = YouTubeMusicRestTool(
+        access_token_provider=lambda: None, media=FakeMedia(), playback_mode=lambda: "browser"
+    )
+    out = await tool.search(query="x")
+    assert "not connected" in out["error"].lower()
+
+
+# -- play ---------------------------------------------------------------------
+
+
+async def test_play_song_pauses_the_old_player_opens_the_radio_link_and_confirms():
+    media = FakeMedia(now=_playing("Old song", "Someone"), after_open=_playing())
+    opener = Opener(media=media)
+    out = await _tool(_search_handler, media=media, opener=opener).play(query="karma police")
+    assert opener.urls == [song_url("vid123")]
+    assert media.calls == ["pause"]
+    assert out["paused_previous"] == "Google Chrome"
+    assert out["started"]["title"] == "Karma Police"
+    assert out["playback_confirmed"] is True
+    assert out["now"]["track"] == "Karma Police"
+
+
+async def test_play_reports_when_the_browser_withholds_autoplay():
+    media = FakeMedia(now=None, after_open=_paused())
+    opener = Opener(media=media)
+    out = await _tool(_search_handler, media=media, opener=opener).play(query="karma police")
+    assert out["ok"] is True and out["playback_confirmed"] is False
+    assert "press play" in out["note"]
+
+
+async def test_play_without_browser_returns_the_link_honestly():
+    opener = Opener(ok=False)
+    out = await _tool(_search_handler, opener=opener).play(query="karma police")
+    assert out["url"] == song_url("vid123")
+    assert "cannot open a browser" in out["error"]
+
+
+async def test_play_artist_opens_top_song_radio_with_a_note():
+    opener = Opener()
+    out = await _tool(_search_handler, opener=opener).play(query="Radiohead", item_type="artist")
+    assert opener.urls == [song_url("vid123")]
+    assert "radio" in out["started"]["note"]
+
+
+async def test_play_album_opens_the_album_playlist():
+    opener = Opener()
+    out = await _tool(_search_handler, opener=opener).play(query="OK Computer", item_type="album")
+    assert opener.urls == [playlist_url("OLAK5uy_abc")]
+    assert out["started"]["type"] == "album"
+
+
+async def test_play_own_playlist_by_fuzzy_name_costs_no_search():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert not request.url.path.endswith("/search"), "own playlist must not burn a search"
+        return _search_handler(request)
+
+    opener = Opener()
+    tool = _tool(handler, opener=opener)
+    out = await tool.play(query="my running playlist", item_type="playlist")
+    assert opener.urls == [playlist_url("PLrun")]
+    assert out["started"]["own"] is True
+
+
+async def test_play_liked_songs_uses_the_first_like_and_the_lm_list():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/videos"):
+            assert request.url.params.get("myRating") == "like"
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"id": "likedvid", "snippet": {"title": "Angels", "channelTitle": "Robbie"}}
+                    ]
+                },
+            )
+        return _search_handler(request)
+
+    opener = Opener()
+    out = await _tool(handler, opener=opener).play(query="liked songs", item_type="playlist")
+    assert opener.urls == [playlist_url("LM", "likedvid")]
+    assert out["started"]["type"] == "liked"
+
+
+async def test_play_without_query_resumes_the_paused_session():
+    media = FakeMedia(now=_paused())
+    out = await _tool(_search_handler, media=media).play(query="")
+    assert media.calls == ["play"] and out["resumed"] is True and out["track"] == "Karma Police"
+
+
+async def test_play_without_query_and_nothing_paused_asks_for_a_name():
+    media = FakeMedia(now=None)
+    out = await _tool(_search_handler, media=media).play(query="")
+    assert "say what to play" in out["error"]
+
+
+async def test_play_unknown_song_says_so():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": []})
+
+    out = await _tool(handler).play(query="zzz")
+    assert "nothing called" in out["error"]
+
+
+# -- media session actions ---------------------------------------------------
+
+
+async def test_now_playing_reports_the_session_and_its_source():
+    media = FakeMedia(now=_playing())
+    out = await _tool(_search_handler, media=media).now_playing()
+    assert out["track"] == "Karma Police" and out["is_playing"] and out["source"] == "browser"
+
+
+async def test_now_playing_without_read_capability_carries_the_fix():
+    media = FakeMedia(now=None, can_read=False, backend="media-keys", note="install X")
+    out = await _tool(_search_handler, media=media).now_playing()
+    assert out["is_playing"] is False and out["note"] == "install X"
+
+
+async def test_pause_and_next_report_the_app_and_new_track():
+    media = FakeMedia(now=_playing())
+    tool = _tool(_search_handler, media=media)
+    out = await tool.pause()
+    assert out["ok"] and out["app"] == "Google Chrome" and out["track"] == "Karma Police"
+    out = await tool.next_track()
+    assert out["ok"] and out["now"]["track"] == "Karma Police"
+    assert media.calls == ["pause", "next"]
+
+
+async def test_control_without_capability_is_an_honest_error():
+    media = FakeMedia(now=None, can_read=False, can_control=False, note="brew install it")
+    out = await _tool(_search_handler, media=media).pause()
+    assert "cannot control" in out["error"] and "brew install it" in out["error"]
+
+
+async def test_control_with_nothing_registered_is_an_error():
+    out = await _tool(_search_handler, media=FakeMedia(now=None)).next_track()
+    assert "Nothing is registered" in out["error"]
+
+
+# -- blind media keys (a machine that cannot read its media session) ---------
+#
+# Live 2026-08-26 19:50: "play some cool music" arrived as play without a
+# title, the machine had no winrt, the tool pressed the play/pause toggle
+# blindly and answered ``ok: true, resumed: true`` — the voice said "I've
+# just started some cool music on YouTube Music" over a silent machine.
+
+
+def _blind() -> FakeMedia:
+    return FakeMedia(now=None, can_read=False, backend="media-keys", note="install X")
+
+
+async def test_blind_play_with_nothing_known_paused_presses_nothing_and_says_so():
+    media = _blind()
+    out = await _tool(_search_handler, media=media).play(query="")
+    assert media.calls == []
+    assert "say what to play" in out["error"]
+
+
+async def test_blind_pause_is_an_attempt_not_a_result():
+    media = _blind()
+    out = await _tool(_search_handler, media=media).pause()
+    assert media.calls == ["pause"]
+    assert out["ok"] is True and out["verified"] is False
+    assert "cannot confirm" in out["note"] and "install X" in out["note"]
+    assert "track" not in out
+
+
+async def test_blind_play_after_a_blind_pause_is_a_resume_attempt():
+    media = _blind()
+    tool = _tool(_search_handler, media=media)
+    await tool.pause()
+    out = await tool.play(query="")
+    assert media.calls == ["pause", "play"]
+    assert out["ok"] is True and out["resumed"] is True and out["verified"] is False
+    # The resume spent the pause: a second bare play is a guess again.
+    out = await tool.play(query="")
+    assert media.calls == ["pause", "play"] and "say what to play" in out["error"]
+
+
+async def test_readable_session_control_is_verified():
+    media = FakeMedia(now=_playing())
+    out = await _tool(_search_handler, media=media).pause()
+    assert out["ok"] is True and out["verified"] is True and out["track"] == "Karma Police"
+
+
+async def test_blind_play_of_a_song_opens_the_link_but_never_claims_playback():
+    media = _blind()
+    opener = Opener(media=media)
+    out = await _tool(_search_handler, media=media, opener=opener).play(query="Karma Police")
+    assert opener.urls == [song_url("vid123")]
+    assert out["ok"] is True and out["playback_confirmed"] is False
+    assert out["verified"] is False and "cannot confirm" in out["note"]
+
+
+# -- library writes -----------------------------------------------------------
+
+
+async def test_like_current_song_looks_it_up_by_title_and_artist():
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/search"):
+            seen["q"] = request.url.params.get("q")
+            return httpx.Response(200, json={"items": [_SONG_HIT]})
+        if request.url.path.endswith("/videos/rate"):
+            seen["rate"] = dict(request.url.params)
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    media = FakeMedia(now=_playing())
+    out = await _tool(handler, media=media).like()
+    assert seen["q"] == "Karma Police Radiohead"
+    assert seen["rate"] == {"id": "vid123", "rating": "like"}
+    assert out["ok"] and out["song"]["title"] == "Karma Police"
+
+
+async def test_like_with_nothing_playing_asks_for_the_song():
+    out = await _tool(_search_handler, media=FakeMedia(now=None)).like()
+    assert "name the song" in out["error"]
+
+
+async def test_add_to_playlist_inserts_into_the_matched_list():
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/playlistItems"):
+            import json
+
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "item1"})
+        return _search_handler(request)
+
+    out = await _tool(handler).add_to_playlist(query="karma police", playlist="running")
+    assert seen["body"]["snippet"]["playlistId"] == "PLrun"
+    assert seen["body"]["snippet"]["resourceId"]["videoId"] == "vid123"
+    assert out["playlist"]["title"] == "Running 2026"
+
+
+async def test_add_to_playlist_unknown_list_says_create_it():
+    out = await _tool(_search_handler).add_to_playlist(query="x", playlist="jazz classics")
+    assert "create it first" in out["error"]
+
+
+async def test_create_playlist_is_private_by_default():
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"id": "PLnew", "snippet": {"title": "Late night"}, "contentDetails": {}}
+        )
+
+    out = await _tool(handler).create_playlist(name="Late night")
+    assert seen["body"]["status"]["privacyStatus"] == "private"
+    assert out["playlist"]["playlist_id"] == "PLnew" and out["playlist"]["privacy"] == "private"
+
+
+async def test_playlist_tracks_lists_a_named_playlist():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/playlistItems"):
+            assert request.url.params.get("playlistId") == "PLchill"
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "snippet": {
+                                "title": "Angels",
+                                "videoOwnerChannelTitle": "Robbie Williams - Topic",
+                                "resourceId": {"videoId": "v9"},
+                            }
+                        }
+                    ]
+                },
+            )
+        return _search_handler(request)
+
+    out = await _tool(handler).playlist_tracks(name="chill evenings")
+    assert out["playlist"] == "Chill evenings"
+    assert out["tracks"] == [
+        {"title": "Angels", "artist": "Robbie Williams", "video_id": "v9", "url": song_url("v9")}
+    ]
+
+
+# -- background player ---------------------------------------------------------
+
+
+async def test_play_prefers_the_background_player_and_confirms_from_its_page():
+    player = FakePlayer([_page(position=0.0), _page(position=2.5)])
+    opener = Opener()
+    tool = _tool(_search_handler, opener=opener, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert player.loaded == [song_url("vid123")]
+    assert opener.urls == []  # no browser tab
+    assert out["sink"] == "background_player" and out["playback_confirmed"] is True
+    assert out["now"]["track"] == "Karma Police" and out["now"]["source"] == "background_player"
+    assert out["now"]["volume_percent"] == 40
+
+
+async def test_play_shows_the_player_for_youtubes_cookie_choice():
+    player = FakePlayer([{"url": "https://consent.youtube.com/m?x", "consent": True}])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert out["needs_attention"] == "consent" and player.shown == 1
+    assert "cookie choice" in out["note"]
+
+
+async def test_play_nudges_then_shows_the_player_when_it_stays_paused():
+    player = FakePlayer([_page(paused=True, position=0.0)])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert ("play", None) in player.calls  # one programmatic nudge
+    assert out["playback_confirmed"] is False and out["needs_attention"] == "press_play"
+    assert player.shown == 1
+
+
+async def test_play_confirm_is_bounded_by_wall_clock_when_the_player_is_slow():
+    """Live 2026-08-22 20:01:52: every state read sat out its transport timeout,
+    the loop counted only its naps, and one play took 199 s. The loop now runs
+    on a wall-clock deadline, so a slow host costs the deadline, not its
+    multiple — and a page that never got past loading brings no window
+    forward (there is nothing to press yet); the note says it is still
+    starting."""
+    import time as _time
+
+    class SlowPlayer(FakePlayer):
+        def state(self, **_kw):
+            _time.sleep(0.4)  # a busy host: every read is slow
+            return {"loading": True}
+
+    player = SlowPlayer([], running=True)
+    tool = _tool(_search_handler, player=player, playback="background")
+    tool._player_confirm_timeout_s = 1.0
+
+    started = _time.monotonic()
+    out = await tool.play(query="karma police")
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 3.0, f"confirm loop ran {elapsed:.1f}s for a 1.0s deadline"
+    assert out["playback_confirmed"] is False and "needs_attention" not in out
+    assert "still loading" in out["note"]
+    assert player.shown == 0, "no video to press play on yet — the window stays minimized"
+
+
+async def test_play_confirms_the_moment_the_video_is_unpaused():
+    """``paused`` false is the confirmation; the position advancing later is
+    buffering, not more truth — waiting for it cost the whole voice budget on
+    a cold start (the live model is released at 5 s)."""
+    player = FakePlayer([_page(position=0.0)])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert out["playback_confirmed"] is True
+    assert out["now"]["is_playing"] is True and out["now"]["position_s"] == 0
+
+
+def test_the_player_confirm_fits_under_the_voice_tool_budget():
+    from jarvis.core.tool_budget import VOICE_TOOL_BUDGET_S
+    from jarvis.plugins.tool import youtube_music_rest as mod
+
+    # Search (~0.4 s live) + load + confirm + a show must stay under the budget
+    # the live model is released at.
+    assert mod._PLAYER_CONFIRM_TIMEOUT_S + 1.0 < VOICE_TOOL_BUDGET_S
+    assert mod._CONFIRM_TIMEOUT_S + 1.0 < VOICE_TOOL_BUDGET_S
+    assert mod._PLAYER_SHOW_TIMEOUT_S <= 2.0
+
+
+async def test_play_keeps_polling_while_the_host_says_loading():
+    """The host answers "loading" instead of blocking; the loop waits it out
+    and confirms from the first real page state."""
+    player = FakePlayer([{"loading": True}, {"loading": True}, _page(position=2.5)])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert out["playback_confirmed"] is True
+
+
+async def test_play_passes_a_per_call_timeout_to_a_player_that_takes_one():
+    """The shipped MusicPlayer accepts ``timeout=``; the confirm loop uses it
+    so one stuck read costs seconds, not the 10 s transport default."""
+    seen: list[float] = []
+
+    class TimeoutAwarePlayer(FakePlayer):
+        def state(self, *, timeout: float | None = None):
+            seen.append(timeout)
+            return super().state()
+
+        def show(self, *, timeout: float | None = None):
+            seen.append(timeout)
+            return super().show()
+
+    player = TimeoutAwarePlayer([{"url": "https://consent.youtube.com/m?x", "consent": True}])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert out["needs_attention"] == "consent"
+    assert seen and all(isinstance(t, float) and 0 < t <= 10 for t in seen)
+
+
+async def test_play_falls_back_to_the_browser_when_the_player_cannot_run():
+    player = FakePlayer(available=(False, "no display here"))
+    opener = Opener()
+    tool = _tool(_search_handler, opener=opener, player=player, playback="background")
+    out = await tool.play(query="karma police")
+    assert opener.urls == [song_url("vid123")]
+    assert out["sink"] == "browser" and out["fallback_reason"] == "no display here"
+
+
+async def test_browser_setting_never_touches_the_player():
+    player = FakePlayer([_page()])
+    opener = Opener()
+    tool = _tool(_search_handler, opener=opener, player=player, playback="browser")
+    out = await tool.play(query="karma police")
+    assert player.loaded == [] and opener.urls == [song_url("vid123")]
+    assert out["sink"] == "browser"
+
+
+async def test_controls_and_now_playing_go_to_the_running_player_first():
+    player = FakePlayer([_page()], running=True)
+    media = FakeMedia(now=_playing("Other", "Someone"))
+    tool = _tool(_search_handler, media=media, player=player, playback="background")
+    now = await tool.now_playing()
+    assert now["source"] == "background_player" and now["track"] == "Karma Police"
+    out = await tool.pause()
+    assert out["app"] == "the background player" and ("pause", None) in player.calls
+    assert media.calls == []  # the OS session was never asked
+    out = await tool.set_volume(volume_percent=55)
+    assert out["ok"] and ("volume", 55) in player.calls
+
+
+async def test_volume_without_the_player_is_an_honest_error():
+    out = await _tool(_search_handler, playback="background").set_volume(volume_percent=30)
+    assert "background player" in out["error"]
+
+
+async def test_open_shows_the_player_and_hide_minimizes_it():
+    player = FakePlayer([_page()])
+    tool = _tool(_search_handler, player=player, playback="background")
+    out = await tool.open_home()
+    assert out["shown"] is True and player.loaded == [HOME_URL] and player.shown == 1
+    out = await tool.hide_player()
+    assert out["hidden"] is True and player.hidden == 1
+
+
+async def test_open_in_browser_mode_opens_the_browser():
+    opener = Opener()
+    out = await _tool(_search_handler, opener=opener, playback="browser").open_home()
+    assert opener.urls == [HOME_URL] and out["sink"] == "browser"
+
+
+# -- auth + Google's refusals -------------------------------------------------
+
+
+async def test_401_triggers_one_refresh_and_retry():
+    current = {"value": "old"}
+    calls: list[str] = []
+
+    async def refresher() -> bool:
+        current["value"] = "new"
+        return True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["Authorization"])
+        if request.headers["Authorization"] == "Bearer old":
+            return httpx.Response(401, json={"error": {"code": 401, "message": "expired"}})
+        return httpx.Response(200, json=_MY_PLAYLISTS)
+
+    tool = YouTubeMusicRestTool(
+        access_token_provider=lambda: current["value"],
+        transport=httpx.MockTransport(handler),
+        token_refresher=refresher,
+        media=FakeMedia(),
+        opener=Opener(),
+    )
+    out = await tool.list_playlists()
+    assert calls == ["Bearer old", "Bearer new"]
+    assert len(out["playlists"]) == 2
+
+
+async def test_failed_refresh_asks_to_reconnect():
+    async def refresher() -> bool:
+        return False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"code": 401}})
+
+    out = await _tool(handler, refresher=refresher).list_playlists()
+    assert "Reconnect" in out["error"]
+
+
+async def test_execute_explains_search_quota_api_disabled_and_scope():
+    def quota(request: httpx.Request) -> httpx.Response:
+        return _google_error(403, "quotaExceeded")
+
+    res = await _tool(quota).execute({"action": "search", "query": "x"}, ctx=None)  # type: ignore[arg-type]
+    assert not res.success and "100 YouTube searches" in res.error
+
+    def disabled(request: httpx.Request) -> httpx.Response:
+        return _google_error(403, "accessNotConfigured", "YouTube Data API v3 has not been used")
+
+    res = await _tool(disabled).execute({"action": "list_playlists"}, ctx=None)  # type: ignore[arg-type]
+    assert "not enabled" in res.error
+
+    # Live 2026-08-22 19:21: Google's SERVICE_DISABLED error names the exact
+    # console page for the project behind the bring-your-own OAuth client.
+    # The link travels with the error so the Plugins view shows the one click.
+    activation = (
+        "https://console.developers.google.com/apis/api/youtube.googleapis.com/"
+        "overview?project=940985062784"
+    )
+
+    def disabled_with_link(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "error": {
+                    "code": 403,
+                    "message": "YouTube Data API v3 has not been used in project …",
+                    "errors": [{"reason": "accessNotConfigured", "domain": "usageLimits"}],
+                    "status": "PERMISSION_DENIED",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": "SERVICE_DISABLED",
+                            "metadata": {"activationUrl": activation},
+                        }
+                    ],
+                }
+            },
+        )
+
+    res = await _tool(disabled_with_link).execute({"action": "list_playlists"}, ctx=None)  # type: ignore[arg-type]
+    assert "not enabled" in res.error
+    assert activation in res.error
+
+    def scope(request: httpx.Request) -> httpx.Response:
+        return _google_error(403, "insufficientPermissions")
+
+    res = await _tool(scope).execute({"action": "liked_songs"}, ctx=None)  # type: ignore[arg-type]
+    assert "approve the YouTube permission" in res.error
+
+
+# -- tool protocol ------------------------------------------------------------
+
+
+def test_risk_tiers_reads_safe_everything_else_monitor():
+    tool = YouTubeMusicRestTool(
+        access_token_provider=lambda: None, media=FakeMedia(), playback_mode=lambda: "browser"
+    )
+    for action in ("now_playing", "search", "list_playlists", "playlist_tracks", "liked_songs"):
+        assert tool.risk_tier_for_args({"action": action}) == "safe"
+    for action in (
+        "play", "pause", "next", "previous", "open", "like", "add_to_playlist",
+        "set_volume", "hide_player",
+    ):
+        assert tool.risk_tier_for_args({"action": action}) == "monitor"
+    assert tool.risk_tier_for_args({"action": "nuke"}) == "ask"
+
+
+async def test_execute_routes_and_validates():
+    opener = Opener()
+    tool = _tool(_search_handler, media=FakeMedia(now=_playing()), opener=opener)
+    res = await tool.execute({"action": "open"}, ctx=None)  # type: ignore[arg-type]
+    assert res.success and opener.urls == [HOME_URL]
+    res = await tool.execute({"action": "search"}, ctx=None)  # type: ignore[arg-type]
+    assert not res.success and "needs a query" in res.error
+    res = await tool.execute({"action": "playlist_tracks"}, ctx=None)  # type: ignore[arg-type]
+    assert not res.success and "playlist name" in res.error
+    res = await tool.execute({"action": "teleport"}, ctx=None)  # type: ignore[arg-type]
+    assert not res.success and "unknown action" in res.error
+    res = await tool.execute({"action": "now_playing"}, ctx=None)  # type: ignore[arg-type]
+    assert res.success and res.output["track"] == "Karma Police"
+
+
+def test_activation_link_must_be_a_google_console_host() -> None:
+    """The link is shown to the user to click, so its host is parsed, not grepped."""
+    from jarvis.plugins.tool.youtube_music_rest import _is_google_console_url
+
+    assert _is_google_console_url(
+        "https://console.developers.google.com/apis/api/youtube.googleapis.com/overview"
+    )
+    assert _is_google_console_url("https://console.cloud.google.com/apis/library")
+    assert not _is_google_console_url("https://console.evil.example/google.com/")
+    assert not _is_google_console_url("https://console.google.com.evil.example/x")
+    assert not _is_google_console_url("https://console.x.google.com@evil.example/")
+    assert not _is_google_console_url("http://console.cloud.google.com/")

@@ -1,0 +1,1862 @@
+# OS Feature Parity — macOS / Linux Gap Register
+
+## Local voice and audio topology refresh (issue #464, T2)
+
+Local final transcription uses its configured model independently of the wake
+model. Preview is disabled when it would share a non-concurrent native engine
+with final transcription; cloud preview remains available. CUDA construction
+preserves the configured compute type, and STT failure speech uses the shared
+reply/conversation/UI language resolution.
+
+On Windows, macOS and Linux, topology refresh waits for playback and native
+stream operations to finish, refuses to terminate PortAudio after a failed
+stream close, and retries a deferred refresh. Transient device enumeration
+changes that disappear during settling do not trigger re-initialization.
+Regression tests use fake devices and models on Windows. Ubuntu/PipeWire,
+macOS audio devices and NVIDIA T600 inference have not been verified live.
+
+## Screenshots paste anywhere (2026-10-05, T2)
+
+Appshots taken by shortcut or button and Jarvis X screenshots go on the
+clipboard in several formats at once (`jarvis/platform/clipboard_image.py`):
+Windows `PNG` + `CF_DIB` (transparency laid on white in the bitmap), macOS
+`public.png` + `public.tiff` through `osascript -l JavaScript` with an
+AppleScript PNG-only fallback, Linux `image/png` through `wl-copy` or `xclip`.
+The Linux copy commands (images and text) no longer wait on a pipe that the
+forked clipboard owner keeps open, which used to report every copy as failed
+after the five-second timeout. Verified live on Windows (PNG, DIB and the
+derived bitmap formats read back); macOS and Linux are covered by unit tests
+of the exact commands, not by a real pasteboard or X11/Wayland session.
+
+## AppShot colour fidelity: HDR and wide gamut (2026-10-05, T3)
+
+Screenshots and recordings decide at capture time, per monitor, whether the
+desktop holds more than 8-bit sRGB (`jarvis/platform/display_color.py`).
+
+- **Windows** reads the active colour mode (SDR / wide colour gamut / HDR on
+  Windows 11 24H2+, "advanced colour" on older builds), the bit depth, the SDR
+  white level and the monitor's ICC profile. On an HDR or WCG monitor both
+  capture paths read the framebuffer at full depth through FP16 Desktop
+  Duplication (`jarvis/platform/win_duplication.py`, ctypes only):
+  - recordings convert each frame on the GPU (compute shader) to BT.2020 PQ
+    P010 and encode 10-bit AV1 or HEVC Main 10, hardware first, then
+    SVT-AV1 / x265, tagged BT.2020 / SMPTE ST 2084 / BT.2020-NCL
+    (`jarvis/appshot/hdr_recording.py`). The pointer is drawn in; windows
+    excluded from capture stay out. Clip exports keep the 10-bit depth and
+    the tags (`jarvis/appshot/video_edit.py`).
+  - appshots read the rectangle once at full depth and derive the model's
+    8-bit frame from it (SDR white = sRGB white), so redaction boxes cover the
+    same pixels in both. The user's copy is a lossless full-resolution PNG
+    plus a 16-bit BT.2020 PQ PNG with `cICP`/`cLLi`
+    (`jarvis/appshot/master.py`, `jarvis/platform/hdr_image.py`); Save writes
+    both (`appshot-….png`, `appshot-…-hdr.png`), the library keeps both.
+  - Both PQ outputs place the monitor's SDR white at PQ reference white
+    (203 nits, ITU-R BT.2408), the level HDR viewers and players show at
+    their screen's SDR white; highlights keep their ratio to it. Encoding
+    the absolute SDR white (e.g. 284 nits) made white pages glare.
+  - A rotated monitor, a rectangle across two monitors, or any duplication
+    failure falls back to the 8-bit path; a still desktop gets one repaint
+    nudge before that fallback.
+- **macOS** reports EDR headroom and the screen's colour space from NSScreen;
+  captures stay 8-bit (no full-depth ScreenCaptureKit path yet). Appshot
+  copies carry the screen's ICC profile, recordings carry sRGB tags.
+- **Linux / headless** has no portable colour API: captures are 8-bit sRGB,
+  said so by `DisplayColor.source == "default"`.
+
+Every SDR recording now states the matrix its encoder used (BT.601 for NVENC
+RGB input and swscale) plus sRGB primaries and transfer. Untagged files had
+been decoded with BT.709 by players, shifting saturated colours by up to 39 of
+255 levels.
+
+Verified on Windows 11 with a 10-bit HDR monitor: 4K60 HDR recording
+(AV1 hardware), decoded pixels within 0.0002 scRGB of the framebuffer; HDR
+appshot master through the real Screen Context service; SDR tag correctness
+by decoding colour bars. macOS and Linux paths are covered by unit tests only.
+
+## Native macOS window controls (2026-10-03, T2)
+
+Main, reopened main, and detached windows retain Cocoa's native title bar on
+macOS. The red, yellow, and green traffic lights belong to the operating system;
+the frontend renders no duplicate caption buttons. Native zoom/fullscreen no
+longer goes through the web-caption maximize/restore toggle, whose pywebview
+Cocoa restore operation only deminiaturizes. Existing close/background and
+detached-window lifecycle handling remains attached to the native window events.
+Windows and Linux retain their existing frameless web captions.
+
+Regression coverage checks all three platform configurations, reopened and
+detached window creation, the chrome API, and the existing close/background
+lifecycle. The macOS desktop lane runs these tests on Intel, Apple Silicon,
+and standalone Python alongside its dependency and application-bundle checks.
+These automated checks do not replace a physical Mac acceptance pass: verify
+red close, yellow minimize/Dock restore, green fullscreen/exit and Option-green
+zoom in light and dark appearance, including a detached view and a reopened
+main window. This Windows development host cannot qualify those native clicks.
+
+## Reopening the desktop with detached windows (2026-10-07, T2)
+
+A second launch reopens the main window when a detached view keeps the desktop
+process alive. It uses the same serialized creation path as the tray's Open
+action, preserving the running backend and detached views. A quitting process
+or a host without a desktop window loop still reports that no window can open.
+The recovery decision is shared across Windows, macOS and Linux; native window
+creation and each platform's frame controls are unchanged. Regression tests cover
+the focus HTTP route through launcher recovery, repeated opens, background mode,
+and native creation failure. Native macOS and Linux execution remains unverified.
+An isolated Windows WebView2 smoke closed main with a detached window alive,
+reopened it through the real focus handler and launcher recovery twice, and
+confirmed that exactly one main and the original detached window remained.
+
+## Current cryptography and SSH channel validation (2026-10-01, T3)
+
+Every architecture now requires cryptography >=50.0.2 and AsyncSSH >=2.24.0.
+Intel macOS 13+ and Windows ARM64 use project-built cp311-abi3 wheels with
+statically linked OpenSSL, published through an explicit supplemental index.
+Apple Silicon, Windows x64 and Linux continue to use upstream PyPI artifacts.
+The old Intel/ARM dependency downgrades are removed. Source installers and
+frozen browser packaging select the reviewed wheel automatically; raw pip/pipx
+users must supply the index documented in the installation guide.
+
+The 24-cell CPython 3.11-3.14 base/full resolution gate checks exact artifact
+URLs, identities, architecture tags and hashes. Native CI additionally installs
+the hashed base on Intel and Apple Silicon macOS (Python 3.11/3.14) and Windows
+ARM64 (Python 3.12/3.14), then exercises X.509 name constraints, bounded issuer
+verification, Ed25519, signing-identity PKCS12 and encrypted SSH keys. Native
+build jobs check the actual Mach-O deployment floor and Windows PE architecture.
+These checks do not imply physical microphone, UI or device verification.
+
+All SSH connections reject zero effective channel packet sizes before AsyncSSH
+can enter its send loop, including the compressed Dropbear size-one form.
+Real loopback contracts cover rejection and ordinary channel traffic, while
+unit tests preserve the password-authentication callback and host-key handling.
+
+## Remote agents retain Jarvis tools (2026-10-01, T3)
+
+Remote coding turns carry their Jarvis MCP tools over a reverse forward on
+the existing pinned SSH connection. Both listeners bind to loopback. The
+remote credential belongs to one active chat turn; the Control API key stays
+on the main computer. Session headers cannot change the owner, and stale
+requests cannot acquire the next turn's user context. The existing session
+catalog and ToolExecutor still enforce grants, approvals and cancellation.
+Routine execution chats retain their owner's computer placement.
+
+The transport uses portable AsyncSSH and asyncio/uvicorn, with no native OS
+imports or boot-time initialization. Windows remote launchers and POSIX argv
+receive the remote endpoint through their existing launch paths. Claude,
+Codex, Antigravity, Grok, OpenCode, Kimi and Cursor have MCP configuration
+adapters; other runners fail before starting model work. Project-discovered
+configurations are restored after the turn and cannot overlap in one
+workspace. Native files and society_shell remain remote; Jarvis's browser,
+memory and file-tool workspace remain on the main computer.
+
+Verification: real in-process SSH forwarding tests cover authentication,
+session isolation, expired and revoked credentials, connection refusal,
+cleanup, configuration adapters, and routine creation/readback through MCP
+with a real SQLite store and scheduler. Reopening the store preserves the
+calendar schedule. Existing Windows launcher tests cover the launch path.
+Native macOS/Linux hosts and all seven real vendor CLIs are not qualified
+by those tests; SSH servers must permit TCP forwarding. No browser is
+started by this transport.
+
+Live qualification on Windows: a resumed Claude subscription chat on a
+connected Windows computer discovered the Jarvis tools, created a temporary
+daily routine, read back its persisted ID and next run,
+deleted it and verified the empty routine list. The final CLI configuration
+uses an explicit HTTP transport type; omitting it hid the server from the
+actual Claude tool catalog despite successful protocol-level tests. Browser
+actions were not executed in this qualification.
+
+Behavioral acceptance uses a fresh agent and an ordinary request to check
+repository issues every day at 09:00, without tool names, an implementation
+sequence or earlier chat history. The agent independently saves the routine,
+reads it back and confirms the next execution without a clarification round.
+The shared execution guidance stays at the front of compact briefings and is
+refreshed on resumed CLI turns. Recoverable tool failures can trigger one
+continuation even after a successful process exit; unrelated successful calls
+do not erase failed task parts. User denials, policy blocks, missing login and
+quota failures do not trigger that continuation. This is a receipt check,
+not a semantic guarantee that every arbitrary user goal was accomplished.
+
+Protocol references: [AsyncSSH port forwarding](https://asyncssh.readthedocs.io/en/latest/),
+[OpenCode MCP](https://opencode.ai/docs/mcp-servers/),
+[Kimi MCP configuration](https://github.com/MoonshotAI/kimi-cli/blob/main/README.md),
+[Cursor MCP](https://docs.cursor.com/en/cli/mcp).
+
+## Linux CLI discovery and headless credentials (2026-10-01, T2)
+
+The Linux installer exposes `jarvis` and `jarvisctl` through symlinks in
+`~/.local/bin`, including headless installs and updates. Existing unrelated
+commands are preserved. When that directory is absent from `PATH`, the installer
+prints a shell-quoted export command and a profile hint. Windows and macOS skip
+this step. Covered by `tests/unit/install/test_cli_links.py` and the installer
+flow tests; a complete fresh installation on each OS is not implied.
+
+An absent OS credential store is an expected headless configuration, so its
+working file-store fallback logs at INFO. A previously available vault failing
+still logs a warning. Credential storage and recovery behavior remain covered
+by the headless-keyring, locked-keyring, and backend-recovery tests.
+
+## Remote agents retain Jarvis tools (2026-10-01, T3)
+
+Remote coding turns carry their Jarvis MCP tools over a reverse forward on
+the existing pinned SSH connection. Both listeners bind to loopback. The
+remote credential belongs to one active chat turn; the Control API key stays
+on the main computer. Session headers cannot change the owner, and stale
+requests cannot acquire the next turn's user context. The existing session
+catalog and ToolExecutor still enforce grants, approvals and cancellation.
+Routine execution chats retain their owner's computer placement.
+
+The transport uses portable AsyncSSH and asyncio/uvicorn, with no native OS
+imports or boot-time initialization. Windows remote launchers and POSIX argv
+receive the remote endpoint through their existing launch paths. Claude,
+Codex, Antigravity, Grok, OpenCode, Kimi and Cursor have MCP configuration
+adapters; other runners fail before starting model work. Project-discovered
+configurations are restored after the turn and cannot overlap in one
+workspace. Native files and society_shell remain remote; Jarvis's browser,
+memory and file-tool workspace remain on the main computer.
+
+Verification: real in-process SSH forwarding tests cover authentication,
+session isolation, expired and revoked credentials, connection refusal,
+cleanup, configuration adapters, and routine creation/readback through MCP
+with a real SQLite store and scheduler. Reopening the store preserves the
+calendar schedule. Existing Windows launcher tests cover the launch path.
+Native macOS/Linux hosts and all seven real vendor CLIs are not qualified
+by those tests; SSH servers must permit TCP forwarding. No browser is
+started by this transport.
+
+Live qualification on Windows: a resumed Claude subscription chat on a
+connected Windows computer discovered the Jarvis tools, created a temporary
+daily routine, read back its persisted ID and next run,
+deleted it and verified the empty routine list. The final CLI configuration
+uses an explicit HTTP transport type; omitting it hid the server from the
+actual Claude tool catalog despite successful protocol-level tests. Browser
+actions were not executed in this qualification.
+
+Protocol references: [AsyncSSH port forwarding](https://asyncssh.readthedocs.io/en/latest/),
+[OpenCode MCP](https://opencode.ai/docs/mcp-servers/),
+[Kimi MCP configuration](https://github.com/MoonshotAI/kimi-cli/blob/main/README.md),
+[Cursor MCP](https://docs.cursor.com/en/cli/mcp).
+
+## AppShot capture pixel integrity (2026-10-04, T2)
+
+Packed RGB capture frames are mapped read-only, copied with their actual row
+stride, and unmapped before entering the encoder queue. They do not go through
+Qt's GPU presentation conversion. This fixes intermittent striped/color-shifted
+frames seen in native Windows area recordings. Zero-filled startup buffers are
+skipped; Windows opaque-desktop sources also reject uninitialized alpha values.
+Valid opaque black frames remain recordable. The first usable video frame starts
+at timestamp zero, avoiding an empty startup interval in MP4 playback.
+
+A separate visible Windows test application supplied moving content to the real
+picker/capture/encoder flow. A 15.5-second, 1918-by-948 capture produced 947
+decoded frames with no color-patch corruption, a zero first timestamp, and 226
+distinct positions of the moving marker. Regression tests cover row padding,
+buffer reuse, map failure/cleanup, rotation, mirror, startup transparency and
+opaque black frames. YUV portal sources retain Qt conversion with a detached
+copy; macOS/Linux native capture remains unverified. This evidence supersedes
+the earlier frame-count-only check for visual recording correctness.
+
+## AppShot recording quality and output audio (2026-10-04, T2)
+
+Recording presets default to 1080p at 60 FPS and a 12 Mbps video target.
+Resolution choices through 4K plus native preserve source aspect ratio without
+upscaling; 30/60/120 FPS choices are capped by the selected monitor's refresh
+rate. Missing portal refresh information caps at 60 FPS. The same validation,
+size calculation, MP4 encoding and settings routes apply on every OS. Qt
+Multimedia supplies streaming frames after explicit selection; encoder startup
+tries available hardware H.264 backends, then software H.264/MPEG-4. Missing
+drivers or unsupported dimensions fall back before any packet is written.
+Windows full-screen capture from a 4K/60 Hz monitor to Full HD measured about
+59.6 captured frames/second, with a 120 FPS request correctly capped at 60.
+High-resolution timestamps avoid discarding distinct frames due to coarse
+Windows clock ticks. Native macOS/Linux performance is still unverified.
+
+System audio is opt-in and captures only the default playback device's loopback.
+Windows uses WASAPI through the optional SoundCard desktop dependency. A real
+Windows capture produced an MP4 with synchronized video and audible AAC stereo
+at 48 kHz; deterministic tests cover silent recording, rescaling, all three
+frame rates, invalid settings, and audio retention through trim/speed edits.
+Linux uses PulseAudio/PipeWire monitor sources; native Linux audio remains
+unverified. macOS audio loopback is unavailable and is visibly disabled, while
+silent recording keeps working. No fallback ever opens a microphone. Headless
+installs need no audio backend and keep their existing capture-unavailable state.
+
+## AppShot recording startup latency (2026-10-03, T2)
+
+The primary desktop instance prepares one idle recording worker after shortcut
+arming when AppShots are enabled. Standby loads Qt and the encoder libraries;
+it creates no capture session, windows, video files, or permission prompts and
+takes no pixels. A user start still checks current permissions before sending
+the selection command. After a recording finishes, a fresh worker is prepared.
+Disabling AppShots releases standby; application shutdown also finalizes any
+active recording and reaps its process.
+
+Windows native checks measured about 150–260 ms from a prepared start to the
+visible picker, versus about 1.7 seconds for a cold process on the same desktop.
+Two consecutive selected-area recordings produced playable MP4s and reused their
+prepared workers. Timeout, cancellation during spawn, dead-worker recovery,
+permission revocation and shutdown have focused regression coverage. Standby
+was checked to create neither widgets nor screen grabs. macOS and Linux use the
+same ownership protocol; their native latency remains unmeasured, and a first
+permission dialog or Wayland portal selection still requires user interaction.
+
+## AppShot recording frame and completion card (2026-10-03, T2)
+
+The selected recording area keeps a click-through border until recording stops.
+Elapsed time and a stop button sit below it; the toolbar moves above the area or
+inside the work area when the selection reaches the screen edges. A finalized
+video uses the existing screenshot flight animation to enter a bottom-right
+preview card. Its poster shows the first video frame with a prominent play button
+and a video/duration label. The card can play the local file, save a separate copy
+to Downloads, or drag the MP4 to another application. Screenshot and video previews share the
+indicator process and its shutdown/capture-suppression lifecycle.
+
+Windows area and 4K full-screen recordings were verified with the desktop Python
+runtime: persistent frame, elapsed time, stop-button completion, playable MP4,
+and a visible corner card. Both the frame and toolbar successfully enabled
+native capture exclusion. A separate explicitly capturable visual pass verified
+their geometry and appearance without confusing that pass with clean video output.
+
+macOS and X11 use the same Qt positioning code but remain unverified on real
+desktops. Native capture exclusion is Windows-specific; controls are placed outside
+the recorded area when space permits. Wayland portals do not expose global source
+coordinates: the normal stop window remains available there, while a desktop-wide
+boundary and corner flight retain the indicator's existing Wayland limitation.
+
+## Live computer control by the session's own model (2026-10-03, T3)
+
+Voice sessions operate the screen through `computer` (ADR-0039). The same
+code runs on every OS through the existing capture and input backends; only
+the readiness check differs. macOS requires Screen Recording to look and
+Accessibility plus Input Control to act, and Secure Input blocks typing.
+Windows refuses on the secure desktop and against elevated windows when Jarvis
+is not elevated. Linux refuses on Wayland and without a display, with the
+reason spoken to the user. Unit tests cover every branch with platform probes.
+A live run passed on Windows 11; macOS and Linux X11 live runs are unverified.
+
+## Windows clipboard read deadline (2026-10-02, T2)
+
+Windows clipboard reads now run in a disposable helper with a one-second
+communication timeout. This prevents a stalled delayed-rendering owner from
+holding dictation before the paste for Windows' 30-second render timeout.
+Timeout kills and reaps the reader before returning `None`, releasing its
+clipboard lock. Dictation then skips restoring unreadable previous content
+and keeps the new transcript available. Text travels only through a pipe.
+The private helper supports source and windowed/frozen entry points.
+
+Linux and macOS retain their existing clipboard commands and five-second
+timeouts; headless hosts still return unavailable without starting a helper.
+Tests cover helper termination, Unicode, empty/unavailable data, concurrent
+reads, private dispatch and the Windows windowed stdout pipe. A packaged
+installer and a live third-party stalled clipboard owner remain unverified.
+
+## Headless installer and control CLI (#303, #296, #297)
+
+Explicit headless installs and automatically detected Linux server installs
+skip optional agent-browser provisioning, including Chromium downloads and
+privileged Playwright system-library setup. The installer prints the optional
+setup command; desktop-profile provisioning keeps its existing behavior.
+Linux installs expose `jarvis` and `jarvisctl` through `~/.local/bin`, preserve
+unrelated commands, and show a PATH hint when needed. Other platforms do not
+create these Linux links. An absent OS credential store logs at INFO while
+retaining the owner-only file fallback; failures of a usable store still warn.
+Focused tests cover profile selection, repeat installs, PATH discovery and
+fresh control CLI processes using fake HTTP responses. They do not verify a
+complete installation or actual Chromium provisioning on a physical host.
+
+## Embedded Chrome menus and native input
+
+On Windows, the managed browser preview composites native menus and dialogs
+whose owner chain leads to the selected Chrome window. Mouse coordinates map
+back to the corresponding owned HWND, including popup offsets and DPI scaling.
+Hover, right/middle/double clicks and scrolling target that widget; keyboard
+input follows the owned focus. Offscreen positions from older builds recover
+onto a monitor without activating Chrome. Hooks and captures have bounded
+cleanup, and stale geometry rejects input.
+
+The owned Windows browser and its native popups use zero desktop opacity and
+non-activating tool-window styles while their original pixels remain available
+to Windows Graphics Capture. This prevents a separate window or edge strip
+from appearing outside the Jarvis preview. Regular Chrome keeps rendering while
+occluded so the embedded view can update. This applies only to Jarvis-owned
+windows; attached user Chrome windows and the page streams on other operating
+systems are unchanged. Fake Win32 tests cover ownership, popup visibility,
+input, and failure handling; a live Windows check covers invisible window
+startup and continued capture. macOS and Linux native window capture remains
+unverified.
+
+Manual website sign-in stays inside the embedded viewer. Vision-capable agents
+with unrestricted website access can use approved native window controls;
+domain-restricted agents keep page-only tools because a complete Chrome frame
+can expose unrelated tabs. Native OS file dialogs require manual control to
+preserve workspace file-access boundaries. Other operating systems retain the
+existing page/CDP view and input; no native Chrome-menu parity is claimed.
+Portable fake tests cover ownership, composition, input mapping and lifecycle.
+The installed Browser-Use runtime's tool schema/dispatch was checked without
+launching a browser. Real Chrome menus, authentication and visual acceptance
+still require an interactive Windows check.
+
+## Browser profile sharing and Chrome connection
+
+Profile assignments and extension pairing use portable SQLite and Python.
+The Chrome extension connects through authenticated loopback HTTP/WebSocket on
+Windows, macOS and Linux; no native host or Windows service is required.
+Opening a connected browser requires visible, unlocked Chrome with the
+extension installed. Without it, the app remains usable and reports the browser
+as disconnected instead of launching a fallback. The extension currently needs
+manual unpacked installation. Fake transport, registry and UI checks do not
+prove native Chrome behavior on these platforms, actual OS-reboot persistence,
+or real X publication. See [browser profiles](browser-profiles.md) for scope.
+
+## Remote agents retain Jarvis tools (2026-10-01, T3)
+
+Remote coding turns carry their Jarvis MCP tools over a reverse forward on
+the existing pinned SSH connection. Both listeners bind to loopback. The
+remote credential belongs to one active chat turn; the Control API key stays
+on the main computer. Session headers cannot change the owner, and stale
+requests cannot acquire the next turn's user context. The existing session
+catalog and ToolExecutor still enforce grants, approvals and cancellation.
+Routine execution chats retain their owner's computer placement.
+
+The transport uses portable AsyncSSH and asyncio/uvicorn, with no native OS
+imports or boot-time initialization. Windows remote launchers and POSIX argv
+receive the remote endpoint through their existing launch paths. Claude,
+Codex, Antigravity, Grok, OpenCode, Kimi and Cursor have MCP configuration
+adapters; other runners fail before starting model work. Project-discovered
+configurations are restored after the turn and cannot overlap in one
+workspace. Native files and society_shell remain remote; Jarvis's browser,
+memory and file-tool workspace remain on the main computer.
+
+Verification: real in-process SSH forwarding tests cover authentication,
+session isolation, expired and revoked credentials, connection refusal,
+cleanup, configuration adapters, and routine creation/readback through MCP
+with a real SQLite store and scheduler. Reopening the store preserves the
+calendar schedule. Existing Windows launcher tests cover the launch path.
+Native macOS/Linux hosts and all seven real vendor CLIs are not qualified
+by those tests; SSH servers must permit TCP forwarding. No browser is
+started by this transport.
+
+Live qualification on Windows: a resumed Claude subscription chat on a
+connected Windows computer discovered the Jarvis tools, created a temporary
+daily routine, read back its persisted ID and next run,
+deleted it and verified the empty routine list. The final CLI configuration
+uses an explicit HTTP transport type; omitting it hid the server from the
+actual Claude tool catalog despite successful protocol-level tests. Browser
+actions were not executed in this qualification.
+
+Protocol references: [AsyncSSH port forwarding](https://asyncssh.readthedocs.io/en/latest/),
+[OpenCode MCP](https://opencode.ai/docs/mcp-servers/),
+[Kimi MCP configuration](https://github.com/MoonshotAI/kimi-cli/blob/main/README.md),
+[Cursor MCP](https://docs.cursor.com/en/cli/mcp).
+
+## Connected computers on Linux, macOS and Windows (2026-10-01, T3)
+
+This one is about the REMOTE side: the machine Jarvis connects to under
+Computers, whatever OS Jarvis itself runs on. `jarvis/computers/remote_os.py`
+asks each computer once which shell it speaks (one `echo` that sh, cmd and
+PowerShell answer differently) and, on Linux and macOS, which `PATH` the
+user's own login shell builds (`$SHELL -ilc`, then `-lc`, between markers so
+rc-file chatter cannot leak in). Two rules then hold on every OS:
+
+- **Nothing of substance travels on the SSH command line.** The server hands
+  that line to the user's login shell — bash, zsh, fish, tcsh or `cmd.exe` —
+  and each parses it differently: fish has no `if …; then`, and `cmd.exe`
+  turned every non-ASCII letter into two U+FFFD characters, ends at a line
+  break and stops at 8 191 characters (measured). Scripts go on stdin to
+  `/bin/bash -s` (or `/bin/sh -s`); programs that need stdin or a terminal
+  start from a launcher file uploaded over SFTP (`/bin/sh <file>`, Git Bash on
+  Windows). The only lines a login shell ever parses are that `echo`, the two
+  script runners and a launcher's name (pinned by
+  `test_no_script_ever_reaches_the_login_shell`).
+- **Programs are found the way the user's own terminal finds them.** Over SSH
+  the search path is short: `~/.local/bin` (Claude Code's own installer) and
+  `/opt/homebrew/bin` (Homebrew on Apple silicon) were missing, so a turn said
+  "Install claude" while the readiness panel said it was installed. Every
+  script and launcher now starts with the login shell's `PATH`, plus the
+  well-known install folders that exist.
+
+| Feature | Linux | macOS | Windows |
+|---|---|---|---|
+| Health check and facts | POSIX probe | same probe; uptime from `kern.boottime`, memory from `vm_stat`, disk from the Data volume | PowerShell probe on stdin, same sections; no load average |
+| Planting the app's key (password login) | `~/.ssh/authorized_keys` | same | `administrators_authorized_keys` for admins, ACL by SID (works on a German Windows), UTF-8 without BOM |
+| Readiness: what counts as there | tmux, git, a CLI and its login; Node.js below 18 counts as missing (Ubuntu 22.04 ships 12) | Homebrew tools; Apple's placeholder `git` (no command-line tools) counts as missing and is never run — it opens an install dialog on the Mac's screen | git (Git for Windows), Node.js, CLIs; no tmux |
+| Install | tmux/git from the distribution (root or password-less sudo); Claude Code from its own installer into `~/.local/bin` (no Node.js, no root); Node.js from nodejs.org into `~/.local` (no root) when Codex needs it; Codex through npm into `~/.local` | everything through Homebrew, without root (it refuses root); without Homebrew the panel says to install it | winget and npm; needs an administrator login |
+| Claude Code login for the agents | `~/.claude/.credentials.json` or "Use my login" | the Keychain is locked in SSH sessions (documented by Anthropic): a `claude setup-token` token saved owner-only in `~/.config/jarvis/agent.env`, read by every launcher ("Use a token" in the readiness panel) | `~/.claude/.credentials.json`; the token works too |
+| Society agent's CLI turn | launcher + prompt file; cancel ends the process group the SSH server gave the command, then hangs up | same | Git Bash launcher; cancel ends the tree with `taskkill /T` — hanging up ends only cmd and bash and left the CLI running (measured) |
+| Society agent's shell tool | bash in `~/jarvis-agents/<id>`; each step stops on its own failure, so `cd x; ls` can no longer run half in the home folder; a timeout ends the command there | same | Git Bash in the same folder; PowerShell when Git for Windows is missing |
+| IDE panes | tmux, started by an uploaded launcher; survives app close and network loss, re-attached; a missing folder stops with a sentence instead of starting the agent in the home folder | same, tmux from Homebrew; a plain terminal is the user's zsh | no tmux: the agent runs in the SSH terminal (ConPTY) and ends with the channel; a plain terminal is PowerShell |
+| IDE folder sync, conversation copy | POSIX scripts on stdin | same | the same scripts in Git Bash; SFTP paths as `/C:/…` |
+| Keep working when this PC closes | offered | offered (keep the Mac awake: `pmset`, in the setup prompt) | not offered, and refused on quit |
+
+The SSH connect timeout is 20 s: a busy machine took longer than the old 12 s
+to log in. The setup prompt a coding agent runs on the target computer covers
+each OS: Remote Login and `pmset` on a Mac, Homebrew with tmux and git, and the
+Claude token saved straight into `~/.config/jarvis/agent.env`.
+
+Verified live:
+
+- **Windows 11 Pro** (German locale; this development PC reached over its LAN
+  address): facts, readiness, a CLI start through the launcher, a cancelled
+  turn leaving no process behind, an agent shell command with non-ASCII
+  output, a PowerShell pane (closing it, or the app, ends its program there),
+  and a git folder sent over and brought back with an edit made there.
+- **Linux** (Ubuntu 24.04 in Docker with a real OpenSSH server), as a zsh user
+  whose tmux lives in `/opt/homebrew/bin` and whose Claude Code lives in
+  `~/.local/bin` (both only on the rc files' `PATH`, as on a Mac) and as a
+  fish user: both found through the login `PATH`; readiness, an agent shell
+  command, a CLI turn with the runner's real argv and stream-json stdin, a
+  cancelled turn ending its process, a pane in the user's own shell that
+  survives the app quitting and is re-attached, a missing pane folder, and
+  the token file written with mode 600.
+
+Not verified live: a real Mac (the Keychain behaviour and `vm_stat`/
+`kern.boottime` parsing are covered by tests and Anthropic's documentation
+only), the install jobs on any OS (unit-tested scripts), planting a key with
+a password on Windows, a Windows `DefaultShell` of PowerShell, and Windows
+Server without winget. Covered by `tests/unit/computers/test_posix_remote.py`,
+`test_windows_remote.py`, `test_remote_terminal.py` and
+`tests/unit/society/test_remote_placement.py` against scripted SSH servers.
+
+
+## Background agent service (2026-10-01, T3)
+
+Quitting the desktop app with an armed routine or a running chat channel hands
+the app to a windowless service (`launcher --background-service`), which hands
+it back when the app opens again (`docs/background-service.md`). The service
+is the headless backend, so it boots wherever `--headless` boots, including a
+bare `python:3.11-slim`.
+
+- **Spawn:** Windows uses `DETACHED_PROCESS | CREATE_NO_WINDOW |
+  CREATE_BREAKAWAY_FROM_JOB` with `pythonw.exe`, and WMI
+  `Win32_Process.Create` when the app's job refuses breakaway (the PTY host's
+  route). macOS and Linux use `start_new_session`. A frozen build re-enters
+  its own executable with `--background-service` first.
+- **Tray:** Windows and Linux desktops with a notification area show a pystray
+  icon (Open / Stop background agents). macOS shows none (status items need
+  the main thread) and logs one line; a host without a display logs one line.
+- **Login:** `[autostart] background_only` puts `--background-service` into the
+  login entry on all three (Task Scheduler / startup shortcut, LaunchAgent via
+  LaunchServices `--args`, XDG `.desktop`).
+- **Verified:** Windows 11 live (detached spawn, parent wait, routine fired,
+  hand-back 2.4 s). Linux: headless `python:3.11-slim` in Docker (boot, no
+  tray, hand-back 3.1 s). macOS: same code paths, unit-tested, not run live.
+
+## Persistent Agentic IDE terminals (2026-09-28, T3)
+
+Coding-agent panes now live in a separate PTY host process
+(`jarvis/terminal/pty_host.py`) instead of the app process, so closing, quitting
+or restarting the app detaches from the agents rather than killing them. The
+next start attaches to the host, reopens the last open workspaces in their
+saved layout, and re-joins every pane whose agent is still running (with its
+screen replayed). A reboot ends the host with everything in it; those panes
+then continue through the existing `--resume` path. Closing a pane or a
+workspace still ends its agent.
+
+One capability probe, `pty_host_client.host_available()` (a PTY backend exists
+and the build is not frozen), decides it on every OS. The host is spawned
+detached through `jarvis.ui.relauncher.spawn_detached`: on Windows with
+`DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB` (retried
+without breakaway when a parent job forbids it), on macOS and Linux with
+`start_new_session`. It owns the ConPTY / POSIX PTYs and their kill-on-close
+containers (Job Object / process group), listens on 127.0.0.1 with a random
+token handed over in the environment, and exits after 60 s with no terminal
+and no client. Where the probe fails, or the host cannot start, the registry
+keeps the in-process pool: terminals work as before and die with the app. A
+headless `python:3.11-slim` without `ptyprocess` reports the same missing-PTY
+error it always did.
+
+After a power-off the host is gone, so the next start resumes every agent that
+was running on its own conversation (each CLI's resume argument), in every
+workspace. Jarvis types nothing into any pane: Claude Code panes are resumed
+with the CLI's own `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`, which finishes a
+turn the power cut interrupted (measured: killed at step 26 of 30, resumed to
+30 with nothing typed; without it the pane waited). That path is identical on
+every OS; it depends only on login autostart, which is on by default on
+Windows, macOS and Linux (and a no-op on a headless host).
+
+Which conversation a Claude pane is on is tracked the way Herdr tracks it: each
+pane is launched with `--settings` adding a `SessionStart` hook
+(`jarvis/agentic_ide/claude_session_hook.py`, stdlib only, forward-slash
+command that runs under bash or cmd) that records every conversation start,
+including `/clear`, `/resume` and compaction, so a reboot resumes the current
+one rather than the launch id (herdrdev/herdr#4059). Verified live on Windows
+with Claude Code 2.1.283; POSIX runs the same script through `sys.executable`.
+
+"Rebooted" is measured, not guessed: the host records the machine's boot time
+(`psutil.boot_time()`, all three OSes), and a host whose process is alive in
+this boot but slow to answer raises `HostUnreachable` — the app waits instead
+of resuming a second copy of each agent. Windows only: the host is started
+with `CREATE_BREAKAWAY_FROM_JOB`, and when the app's job refuses breakaway,
+through WMI `Win32_Process.Create` (verified: parent `WmiPrvSE.exe`, ConPTY
+output works); POSIX uses `start_new_session`, which no job semantics can
+override. A host that dies under a running app is replaced and its agents
+resumed the same way.
+
+Evidence: Windows verified live — the host survives its client's hard exit
+with the same PIDs and a replayed screen, and a real Claude Code pane killed
+together with its host came back `--resume`d on the same session id and
+recalled its conversation. Linux: the host process test and the client suite
+pass in `python:3.11-slim` (kernel 6.6, `ptyprocess`). macOS runs the same
+`ptyprocess` path and has not had a live run yet.
+
+## iGentic project workspaces (T3)
+
+Project ownership, workspace snapshots, eight-session ordering and addressed
+task receipts use portable Python/SQLite and the same browser UI on all three
+OSes. Terminal capability is checked through `workspace.agents.pty_available`:
+Windows retains ConPTY, Linux and macOS retain the existing POSIX backend, and
+an unavailable backend is reported without importing a new native dependency.
+ChatGPT Live and native Gemini/local voice use the same supervisor tool and
+permission boundary. There is no OS-specific routing or credential path.
+
+`tests/contract/test_workspace_orchestration.py` covers explicit and ambient
+resolution, ambiguous references, background dispatch, immutable targets and
+durable retry behavior. Native macOS desktop/PTY acceptance and real-device
+audio are not established by the portable tests. See
+[workspace architecture](igentic-workspaces.md) for the product and execution
+contract.
+
+## Whole-window zoom (2026-10-01, T2)
+
+Ctrl + `+` / `-` / `0` (Command on macOS; rebindable under Settings → Keyboard
+shortcuts) zoom the whole app window. The level goes to the WebView engine,
+never to CSS `zoom`, so `100vh` layouts reflow instead of overflowing:
+Windows sets WebView2 `ZoomFactor` on the UI thread, macOS 11+ sets
+WKWebView `pageZoom` on the main thread, Linux sets WebKitGTK
+`zoom_level` on the GLib loop (`jarvis/ui/window_zoom.py`). The Qt backend,
+macOS 10.x, a browser tab and a headless server answer `ok: false`; the page
+then leaves the keys alone (a browser keeps its own zoom). `+` and `-` are
+matched by the character typed, so German and US layouts both work
+(`lib/appZoom.ts`). Windows verified live on the Dev instance; macOS and
+Linux branches are unit-tested with fakes only. Tests:
+`tests/unit/ui/test_window_zoom.py`, `src/lib/appZoom.test.ts`,
+`src/hooks/useAppZoom.test.tsx`.
+
+## Window caption (2026-09-21, T2)
+
+The desktop window is frameless on Windows, macOS and Linux. The page draws
+one title strip: drag to move, and theme, restart, minimize, maximize and
+close at the end of that row. macOS puts the window buttons on the left;
+Windows and Linux put them on the right. A browser tab and a headless server
+draw no window buttons (`frameless: false`).
+
+Windows adds edge resize and a maximized work-area inset in
+`jarvis/ui/window_frame.py`, so the missing native frame does not cover the
+taskbar. macOS keeps pywebview's resizable window mask. Linux stays
+undecorated: moving and the buttons work; dragging an edge to resize depends
+on the window manager and is not claimed as parity. Tests:
+`tests/unit/ui/test_window_command.py` and `tests/unit/ui/test_window_frame.py`.
+
+## Prepaid search hop (2026-09-17, T2)
+
+`search_web` may use an optional Apifare HTTP hop
+(`POST https://apifare.com/v1/call/dataforseo`) when a token is stored.
+Windows, macOS and Linux share the same `httpx` path; a missing token or a
+402/error degrades to the existing key-free DuckDuckGo chain. No OS-specific
+code. Tests: `tests/unit/plugins/tool/test_search_backends.py` (MockTransport).
+Live Apifare account consent is not part of this change.
+
+## GPT-Live migration (acceptance pending)
+
+The new continuous voice core uses portable Python, SQLite and WebRTC/WebSocket
+transports. Browser audio is selected by provider capability and owns echo
+cancellation on desktop and remote surfaces. OS-specific capture and actuation
+remain behind the existing screen/desktop adapters and ToolExecutor.
+
+Windows contract tests, OpenAI/Gemini synthetic tool-and-audio recovery probes,
+and a fresh Python 3.11 slim installation passed. The Linux installation boots
+without PortAudio and passes the 34 Live contract cases plus an isolated OpenAI
+one-key synthetic tool/reconnect probe. Native-device audio, fresh desktop
+installations, long-call recovery and comparative latency remain unverified.
+See [the continuous voice architecture](gpt-live.md).
+
+## Full Chrome window preview (2026-09-12, T3; acceptance open)
+
+Windows interactive sessions now capture the owned Chrome window with Windows
+Graphics Capture, including the original tab strip and address bar. The browser
+worker probes the input desktop and capture package before selecting this path.
+Its frame dimensions drive pointer mapping, and input targets only the owned
+Chrome process. The capture thread is stopped and joined before browser cleanup.
+Dependencies are platform-marked inside the isolated, hash-locked browser runtime;
+base installation and headless boot do not import native capture packages.
+
+macOS, Linux and non-interactive Windows retain the existing page-only CDP stream
+and controls. Full native Chrome UI capture/input is **not implemented** on macOS
+or Linux and must not be described as native-window parity or release-complete.
+The existing page-stream behavior on those hosts is intentionally preserved.
+Current native evidence is Windows-only; cross-platform full-window acceptance
+remains open under RUB-17.
+
+## Service connectors (2026-09-10, T3)
+
+The 21 cloud-service additions use the same HTTP/OAuth code on Windows, macOS
+and Linux, with optional credentials entered through Plugins. REST bridges have
+no vendor SDK or native-library dependency; worker bridges use the running Python
+interpreter. The new local AMD connector probes AMD SMI before enabling and
+reports missing or unsupported telemetry explicitly. Linux hosts with supported
+AMD SMI can return device data; native Windows/macOS have no telemetry backend
+in this connector. None of these integrations runs a device probe at boot.
+
+Contract evidence: `tests/contract/test_service_connectors.py`; AMD absence is
+tested for all three platform values, and HTTP requests use fake transports.
+Real account consent and live AMD hardware remain separate acceptance steps.
+See [coverage and provider limits](marketplace/service-connector-coverage.md).
+
+## Mars world reference foundation (2026-09-19, in progress)
+
+The new Mars namespace uses a packaged metre/Y-up definition and the existing
+React/Three client on Windows, macOS and Linux. Rendering is optional and gated
+by the shared WebGL capability probe; Agents/status remains accessible without
+it. Authoring uses Blender only in development. No native graphics or authoring
+dependency enters the Python definition or station interfaces.
+
+The implementation is T3 and unfinished. Windows native close/reopen and
+clientless task progress are verified: 213 observations recorded an active
+real draft after main-window destruction, followed by completion and an
+authenticated reopen under the same backend. The default close policy remains
+Quit unless the user enables background mode for that session. This mode needs
+persistent WebView storage and verified native tray registration. The blank
+keeper has no application URL; browser-dependent voice is not kept alive.
+
+Native tray registration is currently proved on Windows only. Other desktop
+backends report background mode unavailable while ordinary windows and the
+headless server remain usable. Native macOS/Linux WebViews and integrated-GPU
+performance remain unverified. Tests with fakes do not establish those device results.
+
+A clean wheel from `9e155de95` was installed into a new isolated Linux venv in
+a container without a display, graphics GPU, browser or Blender. Its 3,436
+package members matched the wheel and `pip check` passed. Actual HTTP visits,
+occupancy, idempotency, status and clientless progress passed. A separate
+isolated runtime used one existing Gemini key for a real station draft with
+durable task/result references and no tool calls. The result remained after
+clean backend and container exit. Client readiness waited for a live active
+brain from `/api/providers`; early roster readiness alone does not prove it.
+These results cover headless operation and process shutdown. Native desktop
+parity, active-task cancellation in that installed-wheel run, and final visual
+acceptance remain separate checks.
+See [the Mars runtime](agent-society/mars-runtime.md) for current support boundaries.
+
+The route-driven rover increment uses the same SQLite/asyncio owner on Windows,
+macOS and Linux. It requires packaged collision/dock data and an explicit rover
+authorization callback; pedestrian authority alone grants no seat. Agent rides
+need no renderer, GPU, audio or native API. Portable contracts cover exclusive
+seats, safe exits, interrupted travel, graph migration and authenticated HTTP/CLI
+actions. A fresh Linux venv then installed the rover wheel from `ea3aab13a`:
+all 3,439 package members matched, dependency validation passed, and fourteen
+headless checks passed, including real-agent boarding, travel and safe exit.
+A separate runtime in that fresh environment completed a real communication
+draft with one Gemini key and retained its result after clean shutdown. No
+browser, display, graphics GPU or Blender was required. Final rover art, player
+control and native cross-platform presentation remain unverified.
+
+Physical pedestrian visits use the same bounded SQLite/asyncio graph controller
+on Windows, macOS and Linux, with no native graphics requirement. The existing
+world owner resumes either station or navigation journals after boot; no-client
+movement, process-abort recovery, authority checks and repeated-cancellation
+rollback are covered by portable contracts. The ordinary-world HTTP surface is
+pedestrian-only; rover control and per-Swarm adapters remain unfinished. These
+contracts do not establish live native macOS/Linux rendering or fresh-install
+acceptance. Gigi is a client presentation over the existing assistant, not a
+new provider, worker scheduler or audio process.
+
+**Managed agent browser, 2026-09-10:** The Browser-Use environment and browser
+are provisioned per host with one shared installer. The live viewport uses
+CDP pixels over the authenticated app WebSocket, including on headless Linux;
+manual login uses the same streamed surface rather than an OS-specific window.
+Windows native and a real python:3.11-slim browser render probe passed locally.
+The browser-runtime CI passed real installation and browser contracts on
+Linux x64/ARM64, Windows x64/ARM64, and macOS Intel/Apple Silicon
+([run](https://github.com/PersonalJarvis/PersonalJarvis/actions/runs/34451340158)).
+Windows ARM uses the managed x64 helper under emulation. Desktop UI validation
+was performed in Chrome on Windows; UI checks on other hosts are not implied.
+The normal Linux installer and container build provision browser system
+libraries before the non-root app starts. API-key and subscription model
+adapters share the browser protocol; text-only models use DOM observations.
+See [managed browser](browser-use.md) for exact versions and test boundaries.
+
+
+## Routine hooks (2026-09-09)
+
+Webhook ingress, named integration events and their durable task inbox use the
+same Python/SQLite/ASGI code on Windows, macOS and headless Linux. They require
+no native event hook or desktop API. Readiness is gated by the existing task
+store/scheduler capability; credential availability uses the portable
+`get_secret`/`set_secret` path and reports failures in-app. Internal publishers
+retain their existing OS availability rather than gaining fictitious sources.
+
+`tests/contract/test_routine_hooks.py` verifies authentication scope, raw-body
+HMAC, replay protection, persistence, typed filters and API/CLI schemas.
+Windows tests, a single-key Gemini run with isolated stores, and real Chrome
+light/dark UI checks passed. Physical macOS/Linux execution and a clean OS
+installation remain unverified. See [hook configuration](routines.md#webhooks-and-integration-event-hooks).
+
+## Calendar routines (2026-09-08)
+
+Windows, macOS and Linux use the same lazy `zoneinfo` calendar implementation
+with the `tzdata` base dependency, including headless installs without system
+timezone files. `calendar_zone` is the shared timezone capability probe; an
+unknown zone is rejected rather than replaced with the host's zone. Browser
+IANA zones are scoped per chat turn and persisted in routine triggers. Calendar
+rules, event filters, SQL storage, API projection and UI share one contract.
+
+`tests/contract/test_calendar_routines.py` covers DST, calendar filters,
+hydration, migration, event limits and Python/SQL/API/TypeScript parity. Local
+Windows tests and a single-key live Gemini run with fresh isolated stores passed.
+Native macOS/Linux execution and a completely fresh OS installation remain
+unverified. See [routine behavior and examples](routines.md).
+
+**Society coding threads, 2026-10-06:** Agents open coding threads through the
+agent-chat service and the CLI runners the thread layout already uses, so the
+same Windows/macOS/Linux behaviour applies (including the turn host). The
+coordinator is pure asyncio and SQLite; no native API, PTY or boot-time work is
+added, and a headless install keeps the tool usable wherever a coding CLI is
+installed. Tests use the real chat service with a scripted runner; native
+macOS/Linux runs and a fresh single-key install are not established by them.
+
+**Society voice orchestration, 2026-09-07:** Persistent-team inventory,
+contextual assignments, assignment tracking and measured activity reuse the
+existing society roster, board and scheduler. Voice creation and profile/model
+updates use Command Registry tools mapped to the existing Agents REST routes.
+These paths share the same pure Python/SQLite/ASGI implementation on Windows,
+macOS and Linux, including headless installs; no native API, microphone, GPU or
+provider key is needed for roster management. An unavailable runtime/server
+returns an explicit failure. Execution of an assignment still depends on the
+agent's existing configured runner and scheduler policy; no provider is selected
+or changed globally. Contract coverage is in
+`tests/contract/test_society_voice_management.py`, with assignment/readback
+regressions in `tests/unit/plugins/tool/test_delegate_to_agent.py`. These are
+headless tests on the available host, not evidence of native macOS/Linux or
+paid-provider voice execution.
+
+**Binding rule:** [`AGENTS.md`](../AGENTS.md) §3 *"OS feature parity — macOS
+and Linux are first-class"*. Every feature ships working on Windows, macOS,
+and Linux (desktop AND headless) in the same change. A Windows-only
+implementation may land only with a capability gate, honest degradation, and
+an entry in this register.
+
+**Last full audit:** 2026-07-16 — five-agent sweep across the entire feature
+surface (Computer-Use/desktop actions, voice/audio stack, core/launcher/infra,
+data/knowledge features + agent system, full feature inventory).
+
+**Fix pass 2026-07-16 (same day):** P-06/P-08/P-09/P-11 fixed and removed;
+P-02/P-03 implemented for macOS + X11 Linux (rows narrowed to the Wayland
+residual); P-10 fixed on Linux via `PR_SET_PDEATHSIG` (row narrowed to
+macOS). Git history of this file keeps the original entries.
+
+**Fix pass 2026-07-19:** P-01 fixed and removed. Both the Jarvis Bar and the
+mascot now use a main-thread companion-process host on macOS; rendered images
+and bubble fonts are explicitly bound to the overlay's Tcl interpreter so the
+host's Tk bootstrap root cannot steal them.
+
+**Desktop download follow-up 2026-07-19:** saved-file drag-out now has native
+Windows (OLE/WebView2) and macOS (AppKit/WKWebView) sources. P-15 records the
+remaining GTK source gap; reveal/open actions remain available on Linux.
+
+**Voice termination diagnostics (2026-09-07).** The existing
+`VoiceSessionEnded` event accepts optional JSON text in `detail`; omitted
+metadata remains supported for realtime and older publishers. The recorder
+persists the producer and detail in its existing event payload, and plain-text
+and Markdown exports expose the final reason. Pipeline snapshots add control
+and timing evidence without recording raw model output. This uses the same
+stdlib/SQLite path on Windows, macOS and Linux, including headless installs;
+it needs no native capability probe. Contract tests cover serialization,
+persistence and export with and without diagnostics. Live audio and fresh
+single-key install verification are separate from these automated checks.
+
+**Fix pass 2026-07-31:** P-28 fixed and removed. Codex subscription voice now
+uses a parent-lifeline process-group supervisor on macOS and Linux, while
+Windows retains kernel Job Object containment.
+
+**Fix pass 2026-08-03 (subscription realtime voice).** Four defects of the
+same shape as P-29 — the feature was reachable only on the maintainer's OS:
+
+- **Linux login terminals.** The visible `codex login` accepted exactly
+  `gnome-terminal`, `konsole` and literal `xterm`, so XFCE, MATE, Cinnamon and
+  anyone on kitty/alacritty/foot/wezterm could not connect subscription voice
+  AT ALL — while the Providers card still offered an enabled Connect button.
+  `jarvis/codex_auth.py::_LINUX_LOGIN_TERMINALS` now carries fourteen entries
+  with their documented foreground/no-fork forms, and
+  `linux_login_terminal_available()` is the pre-click capability probe so a
+  desktop that genuinely has none reports `lifecycle_unavailable` with an
+  actionable reason instead of an error toast after the click.
+- **Linux browser hand-off.** Windows (ShellExecute) and macOS (`open`) opened
+  the OAuth page themselves; the Linux login child was handed an environment
+  with no `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`, so the user had to copy a
+  device-code URL out of the terminal. Those session handles now reach the
+  child through both allowlists. Deliberately partial: the forced file
+  credential store still strips `DBUS_SESSION_BUS_ADDRESS` and
+  `XDG_RUNTIME_DIR`, so a pure-Wayland session without XWayland keeps the
+  printed URL — the keyring-isolation guarantee outranks the convenience.
+- **POSIX login containment.** Process-tree containment for the login guardian
+  was Windows-only, so a Jarvis crash on macOS/Linux left terminal → guardian
+  → `codex login` alive with the profile lock still held and every later
+  connect reporting a permanent "busy". `make_process_tree` already returns a
+  real POSIX process-group reaper; the login path now uses it, and only the
+  Windows breakaway flag remains Windows-shaped.
+- **POSIX delegate cleanup + macOS PATH.** The Codex CLI that executes
+  subscription-voice actions was tree-killed only on Windows (`taskkill /T`),
+  leaking the real `codex` child on every capped or cancelled turn off
+  Windows; it now leads its own process group and gets the SIGTERM/SIGKILL
+  sibling. It also resolved its binary with a bare `shutil.which`, so a
+  GUI-launched macOS app could show the subscription as connected while every
+  action failed with "Codex CLI not found" — both sites now share
+  `CodexAuthService._resolve_binary` and its `ensure_cli_paths()` repair.
+
+**Fix pass 2026-08-03 (subscription voice, second round).** The 2026-08-03 pass
+above fixed which terminals are offered; this one fixes what happens after one
+is launched. Same shape again — a guarantee that held only on Windows.
+
+- **Login containment now binds to the guardian, not to the launcher.** The
+  previous pass gave the login a POSIX process-group reaper, but on macOS the
+  spawned process is `osascript`, which asks the ALREADY-RUNNING Terminal.app to
+  `do script` — so the guardian is a grandchild of Terminal, in no process group
+  Jarvis owns. GNOME is the same story through `gnome-terminal-server`. The
+  reaper was signalling a group that contained only the launcher, and a Jarvis
+  crash still left the guardian holding the profile lock with every later
+  Connect reporting a permanent "busy". A process tree cannot cross those
+  boundaries and neither can an inherited pipe, so the lifeline is now a
+  **parent-liveness lock file**: Jarvis holds it for the whole login, the kernel
+  drops it on any kind of death, and the guardian polls it and ends the login if
+  it can take it (`jarvis/codex_auth.py::_hold_parent_liveness_lock`,
+  `jarvis/codex_login_guard.py::_parent_liveness_lost`, exit code
+  `EXIT_PARENT_GONE`). The probe is deliberately conservative — anything it
+  cannot read counts as "Jarvis is alive", because ending a healthy login is
+  worse than one stale lock.
+- **`wezterm` released the profile lock mid-write.** Plain `wezterm start` hands
+  the window to a running `wezterm-gui` and returns at once, so `cleanup_login`
+  ran its post-check and released the lock while `codex` was still writing
+  `auth.json` — exactly the hazard the terminal table's own docstring describes.
+  Now `--always-new-process`. Every entry additionally carries the REASON its
+  flags keep it in the foreground, pinned per entry by a test.
+- **Terminal matching is exact, not prefix.** `startswith` accepted Debian's
+  `gnome-terminal.wrapper` for the `gnome-terminal` entry (and handed it flags
+  that wrapper rejects) and accepted anything merely beginning with `st`. Both
+  launched something that could not host the login, and the failure then
+  surfaced as a guardian handshake error. Matching is now exact with a tiny
+  justified alias map, and a login whose guardian never wrote its first
+  acknowledgement names the TERMINAL as the cause instead of the guardian.
+- **The POSIX lifeline no longer swallows a forwarded descriptor.**
+  `child_lifeline.py` re-spawns the real child with `close_fds=True`, so the
+  profile-lock descriptor the caller passes in was dropped at exec and the lock
+  was held by the supervisor rather than by the app-server child it was meant
+  for. The supervisor now accepts `--keep-fd N` and forwards it. Harmless today
+  because the two processes die together — but the caller's guarantee was simply
+  not true, and the first change that lets the supervisor exit first would have
+  turned it into two processes writing one profile.
+- **Checked, not a defect: the macOS Apple-Silicon PyAV pin.** Base pins
+  `av==15.1.0` for that cell with no `python_version` guard while `[local-voice]`
+  and `[tts-eval]` carried `python_version < '3.14'` and a comment claiming
+  wheels only up to 3.13 — which reads as a broken install on macOS arm64 +
+  CPython 3.14. It is not one: the PyPI file list for `av 15.1.0` carries
+  `cp311/cp312/cp313/cp314` `macosx_13_0_arm64` wheels. The base pin was right
+  and the comment was wrong; the comment is corrected and the redundant guard
+  removed. The pin itself stays — `av 16+` raises the Apple-Silicon floor to
+  macOS 14, and 15.1 is what keeps the supported macOS 13 floor.
+
+**Fix pass 2026-08-03 (keyboard + pointer, from live Mac reports).** Three
+defects of one shape — a surface OFFERS something on every OS and only one OS
+can actually deliver it, with nothing raising in between:
+
+- **Keybind picker.** The Quartz keycode table covered letters, digits,
+  F1-F12 and the arrows. The picker also offers the whole nav cluster, the
+  entire numpad and F13-F20, and the Windows backend registers all of them —
+  so on macOS those shortcuts recorded, validated, saved and rendered as
+  bound, then never fired. Fixed in `backends/quartz.py`; a parity test now
+  reads the bindable tokens out of the frontend source, so adding a cap
+  without its keycode fails instead of shipping a dead shortcut.
+- **Event-tap permission probe.** The TCC grant check ran on EVERY reconcile,
+  i.e. two native ObjC calls per keystroke the machine sees, inside the tap
+  callback. macOS DISABLES a tap whose callback overruns its deadline — the
+  "works sometimes, or not at all" report. Now throttled (1 s TTL).
+  **Superseded 2026-10-02:** the tap callback reads only a lock-free cached
+  verdict from the silent `PermissionService.check`, never calls `ensure` and
+  takes no service lock; the tap itself is created only after the Input
+  Monitoring preflight is true (see the 2026-10-02 pass below).
+- **Computer-Use numpad.** `base._NAMED_KEYS` accepts `numpad0`-`numpad9`
+  plus the five operators and Windows maps every one; the POSIX table mapped
+  none, so the identical action died off-Windows with
+  `ValueError: Unknown key: 'numpad5'`. Addressed by raw virtual key
+  (Carbon `kVK_ANSI_Keypad*` / `XK_KP_*`).
+- **Sidebar pointer offset** (macOS only, not previously registered): the
+  `<aside>` carried `backdrop-blur`, making the `backdrop-filter` element an
+  ANCESTOR of the scrolling `<nav>`. WebKit does not reliably invalidate that
+  backdrop snapshot when a descendant scrolls, so the sidebar painted rows at
+  their old offsets while hit-testing them at the new ones. The frosted
+  backing is now its own non-scrolling layer. **Awaiting confirmation on real
+  Mac hardware** — it cannot be reproduced on Windows, where Chromium
+  composites the case eagerly.
+
+P-26 is removed: a Mac user CAN now record a ⌘ shortcut (`metaToken` emits
+`cmd` on darwin, and `KeyboardMap` no longer draws the Meta cap reserved).
+
+**Known, deliberate, and NOT a macOS gap:** the punctuation keys (`- = [ ] \
+; ' , . /` and backtick) plus CapsLock are drawn `dead` in the picker on
+every OS. `event.code` is keyed to US-layout positions, so binding by
+position would record "BracketLeft" while the keycap the user actually
+pressed prints something else entirely on any non-US layout. Reported from a
+Mac as "you cannot pick all the keys"; it is cross-platform by design, not a
+parity defect. Changing it means choosing position- over label-fidelity for
+all three OSes at once.
+
+**Fix pass 2026-08-09 (stable subscription voice).** P-30 is resolved and
+removed. The ChatGPT-subscription card is now a compatibility alias for one
+OS-neutral composition: Jarvis microphone/VAD/STT, streamed Codex App Server
+text, then Jarvis sentence TTS and receipt-backed playback. The selected
+profile therefore no longer depends on WebRTC, `aiortc`, PyAV, ChatGPT-Live
+audio boundaries, or provider-side VAD. Windows, macOS, and graphical Linux
+run the same pipeline; headless hosts report `headless_audio_unavailable`
+instead of advertising a call they cannot play. The capability response also
+reports subscription login, STT, TTS, desktop runtime, and platform readiness
+separately. The old provider id migrates at read time, so existing selections
+enter the stable pipeline without a destructive config rewrite.
+
+**Performance pass 2026-08-10 (Computer-Use).** Stable-frame acquisition and
+visual-effect verification now use the same OS-neutral MSS/Pillow path on
+Windows, macOS and Linux/X11: a call-scoped capture session, deferred BGRX
+conversion, area-filtered thumbnails, and bounded polling with persistent
+effect confirmation. Windows' native window capture remains a capability-
+gated first choice with the shared rectangle path as its fallback. The
+macOS Screen Recording gate (a silent check before the engine acts; the grant
+itself is asked for at the first user-started capture, 2026-10-02 pass below),
+Wayland refusal and headless refusal are unchanged, so an unavailable capture
+backend never becomes permission to act blindly. The cross-platform tkinter engine rig remains the release oracle.
+
+**Fix pass 2026-08-16 (the app is findable as an app).** BUG-138 was a Windows
+defect, but its shape was shared: on all three systems the launcher file was
+written and never announced to the index that answers the user's search, so a
+fresh install sat on disk and appeared only after the next login. Windows now
+publishes the Start-Menu launcher out of the MSIX container a Microsoft-Store
+Python imposes (and reports failure instead of a phantom install); Linux calls
+`update-desktop-database` and ships `Keywords=` so the app search matches the
+half of a two-word product name a user actually types; macOS registers the
+bundle with `lsregister`. Each announcement is capability-probed and degrades
+honestly to "appears after the next rescan" — `desktop-file-utils` is not
+installed everywhere and `lsregister` can be absent from a stripped system —
+so no platform silently claims an entry the shell cannot see. Announcement is
+re-run for an unchanged entry too, which heals an install whose earlier write
+succeeded while its announcement did not.
+
+**Fix pass 2026-09-16 (macOS: registered is not searchable, BUG-216).**
+LaunchServices and Spotlight are separate indexes; `lsregister` alone left the
+bundle out of Spotlight search. macOS now also imports the bundle with
+`mdimport` and checks the indexing switch of the volume that controls it (`/`
+for the APFS data volume), logging the admin repair command when indexing is
+off; `--doctor` (`macos-spotlight`) additionally detects a stalled index by an
+import that never appears. The bundle is also installed into `/Applications`
+(Finder's Applications folder, Launchpad) whenever the account may write there,
+falling back to `~/Applications` for standard accounts; an existing per-user
+install is moved over by rename, keeping its signature and TCC grants, and the
+LaunchAgent is pointed at the new path in the same step (BUG-218). A same-named
+app with another bundle id (the DMG build) is never replaced or removed, and a
+certificate-signed bundle's `Info.plist` version follows source updates. The
+installer adds the app to the Dock once per install (the macOS counterpart of
+the Windows Desktop/Start-menu launcher) and names a stalled Spotlight index
+with its admin repair command. Windows
+and Linux are
+unchanged — their index announcements already feed the search the user types
+into.
+
+**Fix pass 2026-09-16 (macOS: one TCC identity for the life of the install,
+BUG-217).** The source installer creates a per-user code-signing certificate
+("Personal Jarvis Local Signing", login keychain, trusted for code signing in
+the user domain — the one password dialog of the install) and signs the bundle
+with it, so macOS pins privacy grants to `identifier + certificate` instead of
+the per-build CDHash: rebuilds and updates keep every grant. Without a GUI
+session, or if the dialog is declined, signing stays ad-hoc and the previous
+"reset on identity change" behaviour applies. The Music/Spotify Automation
+consent is a permission row of its own (`automation`), read live through
+`AEDeterminePermissionToAutomateTarget` for a running player. **Superseded
+2026-10-02:** the up-front ask with a hidden launch of a closed player, the
+consent file and the **Set up everything** wizard that this pass added are
+removed; Automation is asked when "Mute music while dictating" is switched on
+while a player runs (below). Windows and Linux: no TCC, no signing identity,
+the rows read "not required" as before.
+
+**Fix pass 2026-10-01 (macOS: the downloaded app, and what is worth asking
+for, BUG-222/223/224).** Four findings behind a report of a Mac that asked for
+far too many permissions.
+(1) The `.dmg` app carries its own bundle id (`ai.personaljarvis.desktop`) and
+the permission port accepted only the managed bundle's id, so the downloaded app
+read every grant as unusable: no microphone capture, no hotkeys, no request
+buttons. Both ids are now installed identities (`ACCEPTED_BUNDLE_IDS`), reset
+targets the running app's id (and refuses from any other process), and
+`jarvis permissions` finds either app.
+(2) The published v2.5.0 image — opened and read on Linux, not run on a Mac —
+had no `AVFoundation` module in its frozen archive (the port loads it by name, so
+the microphone permission reads "unavailable" for good) and `LSBackgroundOnly` in
+its `Info.plist` (PyInstaller sets it when the last executable is a console one).
+`jarvis.spec` and the macOS job now cover both, and
+`scripts/ci/check_frozen_macos_app.py` fails a build that regresses. A branch
+dispatch of the installer workflow built the image on the Apple Silicon and the
+Intel runner, the check passed, and the booted app reported a readable
+microphone permission under the `.dmg` bundle id (BUG-222); still not tried on a
+user's Mac.
+(3) The published `.dmg` was ad-hoc signed and not notarized (the v2.5.0 build
+log says so), and the workflow's certificate secrets were never imported by
+`build.sh`: it now imports them into a throw-away keychain, before the long
+freeze, so the Apple secrets (five required, the signing identity optional) are
+what is still missing to attempt a Developer-ID-signed, notarized image — a path
+that has never run; until then the first launch needs **System Settings >
+Privacy & Security > Open Anyway** (macOS 15) and an update can re-ask the
+permissions.
+(4) The snapshot then marked which rows a feature the user turned on needs
+(`wanted`, `features[...].active`), with a banner that skipped optional rows and
+could be put off with "Not now". **Superseded 2026-10-02:** those keys, the
+banner and the wizard are gone; a feature the user has not switched on simply
+never touches its permission (below). **Not verified:**
+all of it ran against faked native frameworks, a `DRY_RUN` rehearsal and a
+stand-in `security` command on Linux; no Mac, no Apple account and no real
+notarization were available. Windows and Linux are unchanged — no TCC, no
+signing identity.
+
+**Fix pass 2026-10-01 (macOS: one table of usage strings).** The two macOS
+bundles declared different, partly wrong `NS...UsageDescription` sets: the
+downloadable `.dmg` app had no screen-capture string, the managed app had no
+Desktop / Documents / Downloads string, and the `.dmg` plist carried
+`NSSystemAdministrationUsageDescription` (the wrong key for Accessibility and
+Input Monitoring, which have none), a speech-recognition string and a camera
+string plus the camera entitlement, for APIs Jarvis never calls. Both bundles now
+load one stdlib-only table, `jarvis/core/macos_privacy_strings.py`, by path (the
+spec runs before the package is importable): microphone, screen capture (kept for
+parity; whether macOS reads that key is unverified), Apple events, Desktop,
+Documents, Downloads, removable and network volumes, and local network (reworded
+to the LAN hosts the person configures). The three unused keys and the camera
+entitlement are gone, `entitlements.plist` carries no XML comments (the reasoning
+moved to `packaging/macos/README.md`), and `scripts/ci/check_frozen_macos_app.py`
+asserts the table on the built app and, on a signed build, the entitlements
+`codesign` reports. The managed bundle's format version is deliberately NOT bumped
+(a bump rebuilds every installed bundle, and an ad-hoc rebuild is a new identity that
+re-asks every permission): an installed app carries the new strings after its next
+rebuild for another reason. **Not verified:** no Mac, no
+hardened signed build and no real `codesign` output were available; the checks
+ran against the real `jarvis.spec` with stand-in PyInstaller names and recorded
+`codesign` output shapes on Linux. Windows and Linux are unchanged — no TCC, no
+usage strings.
+
+**Fix pass 2026-10-02 (macOS: permissions are asked for when a feature needs
+them, BUG-225, AP-35, ADR-0038).** Before this pass every protected macOS
+feature first asked `runtime_access_granted()` (stable identity AND a live
+grant) and refused when it said no, so macOS was never asked from a feature path
+and an app-wide banner, **Set up everything** and an onboarding step stood in
+front of the dialog. Now a feature asks at the user's gesture through
+`jarvis/platform/permission_service.py` and acts only on a live grant; denial
+degrades that one feature (one toast with one click to System Settings, see the UI
+reset below). What changed per surface (Windows and Linux are unchanged: NOT_REQUIRED, nothing
+asked, nothing gated):
+
+- **Microphone.** Dictation, push-to-talk, a voice session, the wake-word switch
+  and the microphone self-test ask. The wake loop stays parked, with no dialog and
+  no input stream, until a grant exists. A denial refuses voice and dictation with
+  the native bar's sentence and the one toast; typed chat is unaffected. A hold key
+  pressed while the dialog is up is not started retroactively. Five seconds of
+  exact zeros while the state claims granted produce one "denied or muted" notice.
+- **Screen and computer use.** The first user-started capture asks for Screen
+  Recording; a flat wallpaper-only frame is refused, never delivered. Accessibility
+  is asked when Jarvis first types, clicks or focuses a window; tools return
+  `[permission_needed:accessibility]`, and the mission ends `blocked_permission`
+  with a Retry, not a model retry loop. AX reads never prompt. The engine keeps one
+  silent Screen Recording gate and dispatches nothing while a macOS consent window
+  is frontmost (an agent never answers a system dialog; the owner-name list is
+  unverified).
+- **Dictation insert.** The first paste asks for Accessibility; until granted the
+  transcript stays on the clipboard (`clipboard_only`) and the bar says so.
+- **Global shortcuts.** The listen-only tap needs Input Monitoring only (it used
+  to need Accessibility too). It is not created at boot unless already granted,
+  never created to provoke a prompt, and re-arms in process when the grant
+  arrives. Saving a shortcut asks for Input Monitoring (below). The Esc-to-cancel pill
+  claims the key only while the tap runs.
+- **Ducking.** Switching "Mute music while dictating" on while a player runs is
+  the only asking path (120 s consent runner, no hidden launch of a player);
+  `mute_others` is non-interactive and skips a player that has not consented. A
+  player that refuses the Apple event with `-1743` although its read says granted
+  is skipped too and reported as one background `needs_settings` episode that
+  names it (`jarvis permissions status`, never a toast); it ends when
+  a later send to that player lands, not because a probe reads granted. Windows
+  and Linux: nothing happens (no TCC, empty call log); the effect on a real Mac is
+  unverified.
+- **Appshot both-Option shortcut.** Not an Input Monitoring row: whether the
+  `CGEventSourceKeyState` read needs a grant is unverified (the repo contradicts
+  itself), so nothing asks or says anything about it.
+- **Boot rule.** With every permission undecided, including the wake word on,
+  launch makes no OS dialog, no input-stream open, no event-tap creation and no
+  capture call; an upgrader with every grant shows zero toasts and zero requests.
+
+The onboarding `permissions` step, the banner, the wizard and the refresh event are
+removed. **Not verified:** all of it ran against a stateful fake of the macOS
+frameworks, vitest and Linux gates; the packaging and frozen-app probes ran on
+macOS runners (which pre-grant TCC to their tools and show no dialog). No Mac
+showed a dialog, a hold-key release, the second dialog of the embedded WebView or
+a grant taking effect in a running process; the rows are in
+`docs/macos-permissions.md` section 7. The Carbon hotkey backend and macOS-specific
+Call/Hangup defaults are follow-ups, not shipped.
+
+**Fix pass 2026-10-02, UI reset (macOS: macOS's own dialog plus one toast,
+ADR-0038 amendment).** The first just-in-time implementation also drew a floating
+card, inline notes, a Shortcuts status note and a Settings > Privacy page around
+macOS's dialog. All of it is deleted. macOS shows its own dialog at first use; the
+app adds ONE short toast with ONE action only when a user-started use failed
+because a permission is off (macOS never asks twice, so nothing else would say
+so). Per surface (Windows and Linux are unchanged: NOT_REQUIRED, nothing asked,
+nothing shown, and the permission UI code paths do nothing off macOS):
+
+- **The toast.** Source: the `PermissionNeeded` / `PermissionResolved` events. Shown
+  only in the owner window (the embedded desktop window on macOS; never a detached
+  window, a remote browser or another OS), for `origin="user"` and `phase="blocked"`,
+  once per episode and again on the person's next try; a background origin never toasts except one toast per session for
+  a denied microphone for the wake word. Actions: Open System Settings, Ask macOS now
+  (not asked yet, or a development run outside the installed app), Quit and reopen
+  (granted but unusable). en, de, es; no pane names. The native bar's dictation text
+  and the spoken computer-use readbacks are unchanged. Unverified: the look in the real
+  web view and that the pane opens on the current macOS.
+- **Global shortcuts.** A global shortcut is a background listener, so nothing at the
+  moment of use can carry a dialog; saving one is the gesture. `PUT
+  /api/settings/keybinds` asks for Input Monitoring after the save on macOS, only
+  while the tap is not listening, never for a clear, never blocking the save; the
+  onboarding Call-shortcut click asks once. Off macOS the permission layer is not
+  touched. `GET /api/settings/keybinds` no longer carries `shortcuts_status`.
+- **Reset.** `jarvis permissions reset <permission>` (macOS only, behind `--yes`) runs
+  `tccutil reset` for the installed app's own bundle id (either bundle id); on
+  Windows and Linux it prints one line and exits 1. The HTTP reset route is unchanged
+  and still refuses scripts.
+- **Dialog text.** The Apple Events usage string is target-neutral and the folder
+  strings are shorter. German and Spanish `InfoPlist.strings` and
+  `CFBundleLocalizations` ship in both bundles (the `.dmg` app writes the files before
+  signing, the managed bundle when it lays out the app); the bundle format version is
+  not bumped. Not verified on a Mac: that the localized strings appear in the dialogs.
+
+## Audit verdict summary
+
+**No hard breakers found.** No feature crashes on macOS or headless Linux;
+no ungated Windows module-level import exists anywhere in `jarvis/`; no
+runtime code path hardcodes a Windows path. The platform seams
+(`jarvis/cu/actuate/`, `jarvis/vision/tree_factory.py`,
+`jarvis/platform/probes.py`, `jarvis/missions/isolation/job_object.py`,
+`config._ensure_keyring_backend`) all carry real macOS and Linux
+implementations, not stubs.
+
+| Area | Verdict |
+|---|---|
+| Computer-Use / desktop actions (click, type, hotkey, scroll, drag, windows, apps, screenshots, UI trees) | Full per-OS backends (Win32/UIA, Quartz/AX, xdotool/AT-SPI); honest degradation on Wayland/headless/missing TCC grants. macOS: Accessibility is asked when Jarvis first types, clicks or focuses a window, Screen Recording at the first user-started capture; AX reads never prompt, and nothing is asked at launch |
+| On-demand Screen Context | One-shot capture is wired into the production brain on Windows, macOS, and Linux/X11; UIA/AX/AT-SPI text is source-filtered, the indicator precedes capture, and Wayland/headless/missing grants refuse honestly (on macOS a flat wallpaper-only frame is refused, never delivered) |
+| Appshots (front-window capture on a shortcut, button or request) | Capture, privacy and delivery are OS-neutral (Screen Context engine, `jarvis/appshot`). The two-sided shortcuts (both Alt, both Shift, both Ctrl) read key state per OS: Windows `GetAsyncKeyState`, macOS `CGEventSourceKeyState` (whether this read needs the Input Monitoring grant is UNVERIFIED; the repo contradicts itself and no Mac measured it, so it is not an Input Monitoring row — see `docs/macos-permissions.md`), Linux/X11 `XQueryKeymap`; Wayland/headless report it unavailable on the Appshots page. The flash and the area picker (both Shift keys, drag a rectangle) are PySide6 overlays where one can run; Wayland/headless report the area picker unavailable. Verified live on Windows only; see `docs/appshots.md` |
+| Voice / audio (capture, playback, VAD, wake, STT, TTS, realtime) | Clean; a headless host has no local voice stack, so the browser that presses Start holds the call over `/ws/audio` (realtime, or the classic STT → brain → TTS bridge while `[browser_voice].enabled`, the default — issue #399); WASAPI logic is inert-by-data off Windows. macOS microphone: asked at the first dictation, push-to-talk, voice session, wake-word switch or mic self-test, never at launch (2026-10-02 pass) |
+| macOS privacy permissions (TCC) | One just-in-time service (`jarvis/platform/permission_service.py`, AP-35, ADR-0038): `check` is silent, `ensure` asks only from a user gesture and only from the installed app (or after a confirmation naming the grantee); Windows and Linux return NOT_REQUIRED before touching anything. The app draws nothing around macOS's dialog; after a denied user-started use it shows one toast with one action. Verified against fake frameworks and runner packaging probes only, not on a physical Mac (`docs/macos-permissions.md` section 7) |
+| Computer-Use / desktop actions (click, type, hotkey, scroll, drag, windows, apps, screenshots, UI trees) | Full per-OS backends (Win32/UIA, Quartz/AX, xdotool/AT-SPI); honest degradation on Wayland/headless/missing TCC grants |
+| On-demand Screen Context | One-shot capture is wired into the production brain on Windows, macOS, and Linux/X11; UIA/AX/AT-SPI text is source-filtered, the indicator precedes capture, and Wayland/headless/missing grants refuse honestly |
+| Appshots (front-window capture on a shortcut, button or request) | Capture, privacy and delivery are OS-neutral (Screen Context engine, `jarvis/appshot`). The two-sided shortcuts (both Alt, both Shift, both Ctrl) read key state per OS: Windows `GetAsyncKeyState`, macOS `CGEventSourceKeyState` (Input Monitoring grant), Linux/X11 `XQueryKeymap`; Wayland/headless report it unavailable on the Appshots page. The flash and the area picker (both Shift keys, drag a rectangle, then mark it up with its toolbar) are PySide6 overlays where one can run; the markings are burnt into the capture with Pillow on every OS (`jarvis/appshot/markup.py`); Wayland/headless report the area picker unavailable. The appshot editor is web code and behaves the same everywhere; its Copy, and every shortcut or button appshot, writes the picture natively in several formats (`jarvis/platform/clipboard_image.py`): Windows the registered PNG format + `CF_DIB`, macOS `public.png` + `public.tiff` via `osascript -l JavaScript`, Linux `wl-copy` or `xclip`; the editor falls back to the browser clipboard without them. Save goes to `~/Downloads` on every OS. Verified live on Windows only; see `docs/appshots.md` |
+| Voice / audio (capture, playback, VAD, wake, STT, TTS, realtime) | Clean; a headless host has no local voice stack, so the browser that presses Start holds the call over `/ws/audio` (realtime, or the classic STT → brain → TTS bridge while `[browser_voice].enabled`, the default — issue #399); WASAPI logic is inert-by-data off Windows |
+| Appshots (front-window capture on a shortcut, button or request) | Capture, privacy and delivery are OS-neutral (Screen Context engine, `jarvis/appshot`). The two-sided shortcuts (both Alt, both Shift, both Ctrl) read key state per OS: Windows `GetAsyncKeyState`, macOS `CGEventSourceKeyState` (Input Monitoring grant), Linux/X11 `XQueryKeymap`; Wayland/headless report it unavailable on the Appshots page. The flash and the area picker (both Shift keys, drag a rectangle, then mark it up with its toolbar) are PySide6 overlays where one can run. The main instance prepares their runtimes after wake-ready without capturing pixels; selections reuse Qt but release all screen images and windows after completion. The markings are burnt into the capture with Pillow on every OS (`jarvis/appshot/markup.py`); Wayland/headless report the area picker unavailable. The appshot editor is web code and behaves the same everywhere; its Copy, and every shortcut or button appshot, writes the picture natively in several formats (`jarvis/platform/clipboard_image.py`): Windows the registered PNG format + `CF_DIB`, macOS `public.png` + `public.tiff` via `osascript -l JavaScript`, Linux `wl-copy` or `xclip`; the editor falls back to the browser clipboard without them. Save goes to `~/Downloads` on every OS. Verified live on Windows only; see `docs/appshots.md` |
+| Voice / audio (capture, playback, VAD, wake, STT, TTS, realtime) | Clean; headless disables voice honestly; WASAPI logic is inert-by-data off Windows |
+| Core (launcher, config, keyring, restart, autostart, tray, elevation, paths) | Clean; per-OS autostart (Registry / LaunchAgent / XDG `.desktop`), keyring falls back to a 0600 file on headless hosts |
+| Data / agents (wiki, contacts, telephony, sessions, missions, skills, self-mod, channels, MCP) | Clean; mission workers run on POSIX with a real process-group reaper |
+| Agent society hands (own shell, browser via browser-use, learned skills) | Shell: local subprocess in the agent's workspace on every OS (Git Bash/PowerShell/bash/sh pick as the chat's folder tools), no container by decision. Browser: browser-use lives in a managed venv under the data dir (its pins collide with the app's), installed on demand — `uv`/`venv`, a 3.11–3.13 interpreter preferred, Chromium downloaded once; headless runs need no display, so a headless Linux box runs agents' browsers; the headed login session needs a display (409 without one is the follow-up); attach mode needs a running Chrome with `--remote-debugging-port`. Learning is pure files + the brain, OS-neutral |
+| Agent society substrate (roster, typed board, scheduler, rooms, mission bridge, `/api/society`) | Clean; pure asyncio + SQLite (`data/society.db`, WAL) and FastAPI, no OS API, no GPU, no audio. Full REST parity from a headless `python:3.11-slim` (`tests/contract/test_society_substrate.py` covers messages, rename with stable agent/chat IDs, and archive). The agent sidebar's hide choice is a browser-local display preference on every desktop OS; it does not change roster state. The dynamic `jarvis api society …` CLI layer covers every route. FTS5 over knowledge summaries is optional — a SQLite without it degrades to plain reads (same class as P-05). Per-agent screens (`agent_screen`) are M6 and keep their own per-OS probes |
+
+| Typed chat on the Jarvis surface (brain runner, folder tools, approval card, CLI seats as Jarvis) | Clean; pure asyncio + SQLite, no OS API. Every CLI spawn keeps `NO_WINDOW_CREATIONFLAGS` and UTF-8 stdio. The identity for a Claude Code seat travels as a FILE under the app data dir (`jarvis_harness.write_identity_file`, removed after the turn) because Windows caps a command line at 32 767 characters; Codex and agy take it on stdin (no limit), Grok Build a compact cut on argv (`COMPACT_MAX_CHARS`). The MCP session header and the approval bridge are transport-level and OS-neutral |
+
+Persistent Society agent teams use the same SQLite and FastAPI capability on Windows, macOS, and Linux. Membership lives in `society.db`; the frontend opens two existing canonical agent chats side by side with separate socket stores. Grouping never changes agent permissions, routing, or chat history. Headless membership persistence is covered by `tests/contract/test_society_substrate.py::test_persistent_group_membership_headless`.
+
+## Open parity gaps
+
+Ordered by user impact. "Behavior" describes what a macOS/Linux user actually
+experiences today.
+
+| # | Impact | Area | Gap | Evidence | Behavior off-Windows |
+|---|---|---|---|---|---|
+| P-29 | Low | Subscription voice | The dedicated ChatGPT-subscription voice login is an interactive browser flow, so a headless Linux host — and a graphical Linux desktop that ships no terminal emulator able to host the login for its full lifetime — can never CONNECT the profile there (an existing login still reports ready and calls work through the browser voice bridge) | `jarvis/codex_app_server.py::_login_required_state`, `_linux_login_terminal_missing`, `start_codex_subscription_login`, `jarvis/codex_auth.py::_LINUX_LOGIN_TERMINALS` | Both cases report the same `lifecycle_unavailable` truth on every surface (card, activation, voice-mode, Test), each with its own actionable reason — "run Jarvis on a desktop" or "install one of these terminals" — and never an enabled Connect button that can only produce an error toast |
+| P-24 | Medium | Dictation shortcut | The global dictation/call shortcut needs `pynput` on Linux/X11, and `pynput` hard-requires `evdev` — which is published **source-only** (verified on PyPI 2026-07-28: evdev 1.9.3 ships an sdist and no wheels) and compiles against the kernel headers. Putting it in `[full]` would break the one advertised install path on a stock `python:3.11-slim`, so it is the opt-in `[desktop-linux]` extra instead. Wayland is a separate, unfixable-by-install case: the compositor owns global shortcuts by design (the XDG `GlobalShortcuts` portal lets the *compositor* assign the keys, and no wlroots compositor implements it at all) | `pyproject.toml` (`desktop-linux`), `jarvis/platform/probes.py::has_hotkey`, `jarvis/trigger/backends/noop.py::explain_unavailable` | X11 without the extra: no global shortcut, and the log/UI now names the actual cause and the exact `pip install` that fixes it (it used to blame Wayland unconditionally). Wayland: no global shortcut at all — bind a compositor shortcut to `jarvis api dictation start`. On both, dictation still works from the Jarvis Bar, the Dictation view and the CLI, and voice still works via the wake word |
+| P-25 | Medium | Dictation insertion | Pasting the transcript into another application is blocked, silently, in three OS-specific situations: Windows UIPI when the foreground window is elevated and Jarvis is not (`SendInput` reports success and the input is discarded), macOS Secure Input while a password field is focused, and Wayland outright (no synthetic input). Detection exists for the first two; Wayland is refused up front. Two further silent failures are Windows-only in their FIX: a chord the target does not bind as "paste" (an xterm.js terminal in a Tauri/Electron app swallows Ctrl+V as `^V`), and a target that reads the clipboard late (an async WebView bridge on a busy machine) after the 120 ms restore timer had already put the previous clipboard back | `jarvis/dictation/insert.py::describe_target`, `_insert_windows_verified`, `jarvis/platform/clipboard_offer.py`, `jarvis/platform/input_isolation.py::windows_foreground_window_is_elevated`, `macos_secure_input_enabled` | All three blocks degrade to the SAME honest outcome instead of silence: the transcript is left on the clipboard, the result is reported as `clipboard_only`, and the bar plus the Dictation view say why and that Ctrl+V will paste it. **Windows** offers the text with delayed rendering and sends exactly one configured paste shortcut. Only a render requested by the captured target process confirms clipboard consumption; merely opening the clipboard or a watcher reading it is not confirmation. A missing acknowledgement never triggers another shortcut, character typing, or an executable-wide learned route. Unconfirmed delivery reports `paste_sent` and leaves the transcript on the clipboard for a late or manual paste, without a restore timer. Focus changes or held modifiers before key emission leave the text available as `clipboard_only`. Confirmed reads may restore the previous clipboard only while the offer still owns it. The explicit typing setting remains available. Regression tests cover delayed readers, watchers, focus changes, and offer shutdown; these checks do not establish compatibility with every third-party editor. **macOS / Linux X11**: plain chord + 120 ms timer restore, unchanged — on macOS the first paste asks for Accessibility (`dictation_insert`, at the gesture), without it the result is `clipboard_only` with the reason, and the first paste after an in-process grant reports `paste_sent` until delivery is observed (unverified on a Mac) — no delayed-rendering equivalent exists there (NSPasteboard promises and X11 selections notify the owner too, but are a follow-up). macOS Secure Input detection is implemented but has not been verified on real hardware from this machine |
+| P-25 | Medium | Dictation insertion | Pasting the transcript into another application is blocked, silently, in three OS-specific situations: Windows UIPI when the foreground window is elevated and Jarvis is not (`SendInput` reports success and the input is discarded), macOS Secure Input while a password field is focused, and Wayland outright (no synthetic input). Detection exists for the first two; Wayland is refused up front. Two further silent failures are Windows-only in their FIX: a chord the target does not bind as "paste" (an xterm.js terminal in a Tauri/Electron app swallows Ctrl+V as `^V`), and a target that reads the clipboard late (an async WebView bridge on a busy machine) after the 120 ms restore timer had already put the previous clipboard back | `jarvis/dictation/insert.py::describe_target`, `_insert_windows_verified`, `jarvis/platform/clipboard_offer.py`, `jarvis/platform/input_isolation.py::windows_foreground_window_is_elevated`, `macos_secure_input_enabled` | All three blocks degrade to the SAME honest outcome instead of silence: the transcript is left on the clipboard, the result is reported as `clipboard_only`, and the bar plus the Dictation view say why and that Ctrl+V will paste it. **Windows** offers the text with delayed rendering and sends exactly one configured paste shortcut. Only a render requested by the captured target process confirms clipboard consumption; merely opening the clipboard or a watcher reading it is not confirmation. A missing acknowledgement never triggers another shortcut, character typing, or an executable-wide learned route. Unconfirmed delivery reports `paste_sent` and leaves the transcript on the clipboard for a late or manual paste, without a restore timer. Focus changes or held modifiers before key emission leave the text available as `clipboard_only`. Confirmed reads may restore the previous clipboard only while the offer still owns it. The explicit typing setting remains available. Regression tests cover delayed readers, watchers, focus changes, and offer shutdown; these checks do not establish compatibility with every third-party editor. **macOS / Linux X11**: plain chord + 120 ms timer restore, unchanged — no delayed-rendering equivalent exists there (NSPasteboard promises and X11 selections notify the owner too, but are a follow-up). macOS Secure Input detection is implemented but has not been verified on real hardware from this machine |
+| P-04 | Medium | CU typing | Linux desktop Unicode text input needs the system `xdotool` binary (pip cannot install it); the pyautogui fallback used on Linux drops non-ASCII chars (umlauts, CJK, emoji) without it | `jarvis/cu/actuate/posix.py::type_text`, `jarvis/plugins/tool/type_text.py` | With `xdotool` (installer provisions it since 2026-07-15): fine. Without, the drop is now reported HONESTLY (2026-07-23): an all-non-ASCII text fails with an actionable "install xdotool" error, and a mixed text types its ASCII portion and warns that the rest was dropped — no more silent success |
+| P-05 | Low | Wiki | Wiki search hard-fails (RuntimeError with actionable apt/pysqlite3 remediation) on distros whose system SQLite lacks FTS5 | `jarvis/memory/wiki/fts_index.py:279` | `python:3.11-slim` and macOS ship FTS5 — only exotic/old distros affected; message is honest. Decision 2026-07-16: kept as honest hard error — a pysqlite3 shim would rewire seven wiki modules for an exotic audience |
+| P-07 | Low | Audio | No macOS/Linux host-API preference exists (the Windows-name-driven tables are intentionally inert off Windows — documented in-code since 2026-07-16), and headset-name heuristics are Windows-centric | `jarvis/audio/player.py`, `jarvis/audio/capture.py` | Device auto-pick falls back to OS default order — works, less clever than on Windows |
+| P-10 | Low | Missions | macOS worker reaper: a hard SIGKILL of the orchestrator reparents the worker tree to init (Linux covered via `PR_SET_PDEATHSIG` since 2026-07-16; Windows covered by the kernel Job Object; macOS needs a kqueue `EVFILT_PROC` watcher) | `jarvis/missions/isolation/job_object.py:327-350` | macOS only, and only on orchestrator SIGKILL; normal cancel/kill paths reap correctly |
+| P-12 | Info | CU legacy | Frozen legacy CU loops are Windows-only, but NOT on the live path (harness force-routes to v2); imports are lazy | `jarvis/cu/loops/screenshot_only_loop.py` et al. | None at runtime |
+| P-13 | Info | Wiki | Wiki DB/vault anchor at `repo_root()` — read-only *wheel* installs would fail writes (not OS-specific; `JARVIS_DATA_DIR` override exists) | `jarvis/memory/wiki/db_path.py:9`, `vault_root.py:59` | None on the advertised install paths |
+| P-14 | Info | CU extras | macOS/Linux actuation and UI trees depend on optional extras (pynput, pyobjc, pyatspi); without them everything degrades honestly to screenshot + pixel-click | `jarvis/cu/actuate/posix.py`, `jarvis/vision/tree_factory.py` | By design (§3); bare install keeps the CU loop functional |
+| P-15 | Low | Desktop downloads | Native drag-out has Windows OLE and macOS AppKit sources but no GTK/WebKitGTK source yet | `jarvis/ui/native_drag.py` | Linux desktop: the saved-file toast keeps reliable **Show in folder** and **Open** actions but is not itself a drag handle; headless: the normal browser download path remains available |
+| P-18 | Low | Overlay drop | Dropping a file ONTO the floating bar/mascot uses two backends: tkdnd on the Tk surfaces (Windows/Linux) and native Qt drag events on the macOS Qt bar (added 2026-07-27 — before that, dropping on the bar did nothing at all on a Mac). The bundled `libtkdnd*.so` links against X11 libs, so a Linux host without them registers no drop target | `jarvis/overlay/drop_target.py`, `jarvis/ui/jarvisbar/qt_overlay.py::dropEvent` | macOS and Windows: full parity. Linux desktop: needs `libxcursor1 libxrender1 libxext6` + `python3-tk` (otherwise `register()` returns False and it is a logged no-op). Headless: no overlay exists — the in-app dock (`POST /api/chat/drop`) carries the feature on every OS |
+| P-19 | — | Overlay drop | RESOLVED 2026-07-27. The macOS bar runs in a companion process, whose drop bridge had no handler — the parent's is the real one. A file dropped on the macOS bar was accepted by the window (the OS even showed the "copy" cursor) and then silently discarded; it never became conversation context. Windows/Linux were unaffected (their bar is in-process). Fixed by forwarding the drop over the existing host protocol and returning the intake's verdict as `drop_result` | `jarvis/ui/jarvisbar/host.py::_wire_drop_forwarding`, `jarvis/ui/jarvisbar/subprocess_overlay.py::_dispatch_drop_event` | All three OSes deliver a dropped file into the conversation context and confirm it on the bar. Guards: `tests/unit/ui/jarvisbar/test_host_drop_roundtrip.py` |
+| P-16 | Low | Wiki | `VaultLock` dead-owner fast-steal is POSIX-only (`os.kill(pid, 0)` liveness probe; on Windows `os.kill` cannot probe — a non-CTRL signal terminates the target) | `jarvis/memory/wiki/lock.py::_pid_alive` | Windows: a lock left by a crashed/restarted process is stolen only after the `stale_after_seconds` wall-clock window (300 s) — the pre-fix behavior everywhere; a Win32 `OpenProcess` probe could close this |
+| P-17 | Low | JarvisBar | "Follow the mouse to the active monitor" has per-OS monitor backends (Windows `MonitorFromPoint`+`rcWork`, macOS Qt available-geometry / Quartz, Linux X11 `xrandr`) but no Wayland backend — Wayland exposes no reliable global monitor geometry without portal support | `jarvis/platform/monitors.py::work_area_at`, `jarvis/ui/jarvisbar/overlay.py`, `qt_overlay.py` | Wayland: `work_area_at` returns `None`, so the bar keeps the single-monitor behaviour (it does not migrate; a cross-monitor drag pins to the primary work area). The feature is a graceful no-op there, never a crash |
+| P-18 | Low | Agent accounts | Multi-subscription switching gives each account its own CLI config directory (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`) — the CLIs' own documented override. On macOS, Claude Code keeps its credentials in the **Keychain** rather than in that directory, and whether a second config dir earns a second Keychain entry is UNVERIFIED on this hardware (everything here was measured on Windows) | `jarvis/agent_accounts.py::describe`, `env_overrides` | Windows/Linux: a second Claude seat works as designed (its `.credentials.json` lives in its own folder). macOS: the added account may come back reporting **"Not signed in"** after a completed sign-in — which is the honest outcome, not a crash: the switcher never claims a login it cannot read, so a pane is never silently routed to the first account's credentials. Codex is unaffected on all three OSes (`auth.json` is a plain file). Next Mac session: add a second Claude account, sign in, and check whether `describe()` reports it connected |
+
+| P-20 | Low | Coding-CLI panes | Kimi Code panes deliberately ship WITHOUT multi-subscription switching, unlike Claude Code and Codex. Three independent reasons, all recorded on the registry entry: the wound-down Python generation ignores `KIMI_CODE_HOME` entirely, so seats created on a machine that has it would all silently resolve to one login; its configuration and its credentials share a single `config.toml`, so no setup can be carried to a new seat without carrying the key with it; and its credential layout is unverified against a live install of the current generation | `jarvis/workspace/agents.py` (the `kimi` entry), `jarvis/agent_accounts.py::platforms` | All OSes: one Kimi login, and the account switcher honestly does not offer the CLI at all rather than showing a switch that does nothing. Unblocked by verifying the current generation's credential layout and gating the override on the generation probe |
+| P-22 | Low | Orb window | The floating orb window (both looks: the Gigi mascot and the procedural **voice orb**) is a Tk window whose transparency comes from a colour key. Windows keys it out natively; macOS uses Aqua-Tk's `-transparent` in the companion host; on Linux the attribute is accepted only under a **compositing** window manager, and not at all on Wayland | `ui/orb/overlay.py::_apply_color_key`, `_build_renderer`, `jarvis/ui/jarvisbar/host.py::_build_surface` | Windows/macOS: full parity, including drag-to-any-monitor and the live mascot↔voice-orb switch. Linux with a compositor (GNOME/KDE/picom): works. Linux without one, and Wayland: the window would be an opaque magenta square, so it is NOT shown — the surface logs one actionable English line and stays hidden; voice, tray and the app window are unaffected. Note the Jarvis Bar degrades DIFFERENTLY on such a session (it keeps drawing and shows its key colour — pre-existing, the `transparentcolor unsupported` branch in `jarvis/ui/jarvisbar/overlay.py::JarvisBarOverlay.start`), so "None (hidden)" is the honest display style on a non-compositing Linux desktop until the bar adopts the same gate |
+| P-44 | Low | Desktop pet | The `pet` display style (an animated pixel-art companion with a control strip and a status bubble, `docs/pets.md`) is a third look of the same orb window, so it inherits P-22's transparency rules. Pixel art has hard edges, so the colour key leaves no fringe. Its shortcut (`[trigger] hotkey_pet_toggle`, default `alt+win+p`, which macOS reads as Cmd+Option+P) goes through the shared hotkey backends. The topmost re-assert and the capture exclusion are Windows-only calls behind a platform check | `ui/orb/overlay.py` (pet style), `ui/orb/pet_renderer.py`, `ui/orb/controls.py` (pet strip), `jarvis/ui/jarvisbar/host.py` / `subprocess_overlay.py` (pet commands), `jarvis/ui/pets/` | Windows: verified live. macOS: the pet runs in the companion host over the existing protocol (contract-tested, not run live). Linux with a compositor: expected to work (not run live); without one, and Wayland: hidden like P-22, and the shortcut is a no-op on Wayland. Headless: no window; the Pets settings page and `/api/pets` still work |
+| P-21 | Low | Coding-CLI panes | OpenCode panes ship single-login for the same class of reason: the only variable that moves its credentials and session database is `XDG_DATA_HOME`, which is a SHARED variable rather than a dedicated override — redirecting it per pane would also redirect any other XDG-aware tool the agent spawns inside that pane | `jarvis/workspace/agents.py` (the `opencode` entry) | All OSes: one OpenCode login. Verified on Windows that `XDG_DATA_HOME` does move `auth.json` and the session database; the blast radius on macOS and Linux has not been measured, which is why it is not wired up |
+| P-38 | Low | Coding-CLI panes | Antigravity (`agy`) panes ship single-login. `GEMINI_HOME` would move the login, but it is a shared variable (the Gemini CLI, mission workers and the pane would all follow it), and `agy` has no `login` subcommand to point at an account directory — sign-in lives on the API-Keys page. The installer is OS-split (`install.ps1` on Windows, `install.sh` elsewhere); the binary also lands in `%LOCALAPPDATA%\agy\bin` on Windows, which `path_augment` already probes | `jarvis/workspace/agents.py` (the `antigravity` entry), `jarvis/google_cli/auth_service.py`, `jarvis/core/path_augment.py` | All OSes: one Google login, and the account switcher does not offer the CLI. Unblocked by a dedicated override that does not also redirect the Gemini CLI |
+| P-39 | Low | Coding-CLI panes | Cursor CLI panes ship single-login. Sign-in is `agent login` (browser) or `CURSOR_API_KEY`; the on-disk layout of that store has not been verified against a live install, so a seat switcher would report switches that did not happen. The installer is OS-split (`https://cursor.com/install?win32=true` on native Windows, `https://cursor.com/install` on macOS/Linux/WSL); the binary lands in `~/.local/bin` as `agent`, with `cursor-agent` as the unambiguous Windows alias | `jarvis/workspace/agents.py` (the `cursor` entry) | All OSes: one Cursor login, and the account switcher does not offer the CLI. Unblocked by verifying the login store and a dedicated override |
+| P-22 | Low | Coding-CLI panes | Kimi Code uses the bundled Git Bash as its shell environment on Windows, so without Git for Windows installed the binary answers `--version` correctly and the agent then cannot run a single shell command | Kimi vendor docs; `jarvis/workspace/agents.py` (the `kimi` entry) | Windows without Git for Windows: the pane opens, the CLI reports a healthy version, and shell commands fail inside it. macOS/Linux unaffected. `KIMI_SHELL_PATH` points at a non-standard `bash.exe`. An install check that only runs `--version` cannot see this |
+| P-23 | Info | Coding-CLI panes | Kimi Code's alternate screen cannot be disabled (an open upstream request notes it is the outlier versus Claude Code, Codex and the Gemini CLI), so it may conflict with the pane's own scrollback the way a Claude Code pane once did | Upstream issue; `jarvis/agentic_ide/screen.py` | All OSes equally — not an OS gap, recorded here because it is the same class of pane defect and is expected to need the same kind of fix |
+| P-27 | Low | Mouse-button shortcuts | A shortcut may now be a MOUSE BUTTON (middle, and the two side buttons — `mouse_middle` / `mouse_x1` / `mouse_x2`). All three OSes are implemented in the same change and share one token vocabulary, but the delivery is not uniform: Windows needs nothing extra (the backend polls `GetAsyncKeyState`, which reports mouse buttons); macOS needs pyobjc `Quartz` plus the Input Monitoring grant, the one requirement of the listen-only tap (it was Accessibility and Input Monitoring before 2026-10-02), asked when the user enables global shortcuts and never at launch; Linux/X11 needs `pynput`, which is the opt-in `[desktop-linux]` extra for the reason recorded in P-24 (`evdev` is source-only). Wayland cannot do it at all — no global button grab exists, the same design reason keyboard shortcuts degrade there. The left and right buttons are deliberately not bindable on any OS: their meaning follows the system "swap mouse buttons" setting, so a shortcut recorded as "left" would fire on the physical right button for a left-handed user | `jarvis/trigger/hotkey.py::mouse_hotkeys_available`, `backends/global_hotkeys.py::_MOUSE_TOKEN_TO_VK`, `backends/pynput.py::_start_mouse_listener`, `backends/quartz.py::_MOUSE_BUTTON_TO_TOKEN` | Every host answers the capability question BEFORE offering the control: `mouse_hotkeys_available()` returns an English sentence naming what is missing and what still works, and a backend that cannot start its mouse hook logs the same thing and keeps the KEYBOARD shortcuts alive rather than failing the whole binding. macOS/Linux desktop with the extras: parity with Windows once the macOS grant exists (not exercised on a Mac). Wayland and headless: key combinations only |
+| P-43 | Low | Keybind recorder modifiers | The settings recorder used to trust only DOM keydown/keyup. On macOS WKWebView a lone Option/Command/Control can arrive as `flagsChanged` (not a DOM event) or as a keydown whose keyup never comes, so the recorder previewed the key and then hung (GitHub #98). The recorder now (a) syncs the modifier flag word from every keyboard and mouse event, and (b) while capturing, polls `GET /api/settings/keybinds/held`, which is a capability probe (`modifier_snapshot`): Windows `GetAsyncKeyState` for Shift/Ctrl/Alt/Win; macOS `CGEventSourceFlagsState` (no event tap and no Accessibility grant); Linux/X11 falls back to the running pynput held-set when the listener is up; Wayland/headless/missing extras answer `available: false` and the on-screen picker still works. A lagging first poll that says "nothing held" does not commit a chord the user just pressed — the snapshot may only DROP a modifier it has already seen down | `jarvis/trigger/hotkey.py::modifier_snapshot`, `jarvis/ui/web/settings_routes.py::get_keybind_held`, `jarvis/ui/web/frontend/src/views/settings/KeybindRow.tsx` | Windows: live modifier snapshot, no extra packages. macOS with pyobjc Quartz: live snapshot even when the hotkey tap is not running. macOS without Quartz / Wayland / headless: honest `available: false`, click-to-assign and letter+modifier chords still record. Linux/X11 with pynput running: snapshot from the listener held-set. Fn is still not a portable key (the OS often swallows it) and is not offered |
+
+| P-28 | Low | Local realtime | The one-click managed install AND the 2026-08-08 supervisor (prewarm, pidfile ownership, start/stop routes, Ollama keep-alive warm ping) are built cross-platform — pathlib, `os.name` venv layout with a POSIX `lib/python*/site-packages` glob, per-hardware torch flavor, `start_new_session` + `killpg` SIGTERM→SIGKILL escalation on POSIX, `HF_HUB_DISABLE_SYMLINKS` Windows-only — but have only been RUN on the Windows dev box. The preflight narrows the SHARED accelerator probe to the two sources this stack can drive -- NVIDIA VRAM (nvidia-smi) and Apple-Silicon unified memory (total RAM), which the derived launch command maps to `cuda`/`mps`. The shared probe itself also reads AMD and Intel cards now (BUG-206), for the local-model fit verdicts; the preflight deliberately drops those to `(0.0, "none")` via `_DRIVEABLE_SOURCES`, because clearing the memory floor and then launching with a torch device the box does not have is worse than the refusal. An AMD/Intel/no-nvidia-smi host therefore still gets the honest "no supported accelerator" blocker (unit-tested) | `jarvis/realtime/local_server/{preflight,install,supervisor}.py` | Any host under 12 GB usable accelerator memory (including every GPU-less/headless box) gets the honest blocker with a cloud pointer instead of an install — verified by unit tests. macOS Apple-Silicon: preflight and install should work but the smoke boot (`--qwen3_tts_device mps`) is UNVERIFIED on real hardware; a failure is honest (install ends in an error state naming the smoke log, readiness stays fail-closed). Linux+NVIDIA: expected to work via the same cu130 wheel index, unverified; the supervisor's POSIX kill/spawn branches are unit-tested but not live-run. The bring-your-own-server URL socket keeps full parity everywhere |
+| P-30 | Medium | Local STT on the GPU | The on-device CTranslate2 recognizer (faster-whisper) needs the cuBLAS 12 / cuDNN 9 runtime wheels, which the `[full]` profile deliberately does not carry. Without them the engine self-heals onto the CPU and, until 2026-08-22, nothing but a log line said so (36 silent fallbacks in one live log; the cloud fallback then ran at ~1× realtime). The wheels are now the opt-in `[cuda]` extra, the provider card reports the accelerator truth (`accelerator_status`: requested device, effective device, reason code) and offers the install from inside the app (`POST /api/local-gpu/libraries`), and the library probe is a pure on-disk look — the out-of-process inference probe (AP-25) remains the only verdict on whether the GPU WORKS | `jarvis/plugins/stt/fwhisper.py::cuda_runtime_libraries_present`, `GPU_LIBRARY_PACKAGES`, `jarvis/speech/local_models.py::accelerator_status`, `jarvis/speech/local_install.py::start_gpu_libraries_install` | Windows: verified live on the dev box (install → `ctranslate2.get_cuda_device_count() == 1`, base/cuda decode). Linux: the same wheels land in `nvidia/cublas/lib`; the probe also accepts a system-wide CUDA via `ctypes.util.find_library("cublas")` — expected to work, UNVERIFIED on real hardware. macOS: no CUDA exists; the card says `unsupported_os` and the recognizer runs on the CPU with no install offered. Headless/GPU-less Linux: libraries absent → honest `cuda_libraries_missing` when the config asks for `cuda`, silent when it asks for `cpu` |
+
+| P-32 | Low | Local models | The in-app Ollama runtime install (the plug-and-go path for local models: detect → install → start → pull, no terminal) has one silent path per OS and an honest refusal elsewhere: Windows uses winget or the official per-user OllamaSetup.exe (built, not yet live-run on a machine WITHOUT Ollama); macOS automates only Homebrew — a dmg drag cannot be scripted honestly, so brew-less Macs get the download pointer; Linux runs the official install.sh only when non-interactive sudo exists (the script escalates internally; without it the refusal names the one terminal command instead of hanging on an invisible password prompt). Detection and start are cross-platform. **Stop** (2026-08-24) touches only the pid Jarvis itself spawned, recorded in `DATA_DIR/ollama_server.pid` beside the log: psutil `terminate` then `kill` after 8 s on all three OSes; a tray-app / terminal / systemd server gets the sentence "not started by Jarvis — stop it where you started it", a recycled pid is never signalled. **Log** = the last N lines of `DATA_DIR/ollama_server.log` (UTF-8, lossy-safe) — the file exists only for a server Jarvis started, identical on every OS. **Test** = `probe_host(base_url)` GET `/api/version` with a 3 s budget → version + latency, pure HTTP, any OS, any remote host. `runtime_status` adds `host_kind` (local vs remote by loopback / own hostname), `models_dir` (`OLLAMA_MODELS`, else Windows `%USERPROFILE%\.ollama\models`, macOS `~/.ollama/models`, Linux `/usr/share/ollama/.ollama/models` when present else `~/.ollama/models`) and `version`. The env guide is copyable text per OS (Windows `setx`, macOS `launchctl setenv`, Linux `systemctl edit ollama.service` drop-in) — the app never edits the OS environment. The voice brain (`brain_link`) and the ack brain fall back to the one configured Ollama address (`resolve_provider_endpoint("ollama")` → `OLLAMA_HOST` → localhost) when their own key is empty, so a remote host is set once | `jarvis/brain/ollama_runtime.py`, `jarvis/ui/web/provider_routes.py` (ollama-runtime routes), `jarvis/realtime/local_server/install.py::_setup_local_brain`, `jarvis/realtime/local_server/brain_link.py::_ollama_base`, `jarvis/brain/ack_brain/config.py::OllamaAckProviderConfig.resolved_endpoint` | Every OS gets the same three-state truth (not installed / stopped / running) and the same buttons; only the INSTALL leg differs. Refusals are one honest sentence with the exact fixing action. All install legs are unit-tested with fakes; no leg has been live-run on a machine without Ollama yet — the cold-machine drill is the recorded release gate. Stop / log / test / env guide / models_dir are unit-tested per OS with fakes (`tests/unit/brain/test_ollama_runtime.py`); a remote `host_kind` hides the local-only controls, so a LAN GPU box is managed on its own machine |
+| P-32 | Info | Local models | Per-model options (a derived profile alias via `/api/create` carrying `num_ctx`, placement and sampling; a `keep_alive` warm ping via `/api/generate`; `think` as `reasoning_effort` on `/v1`) are pure HTTP against the Ollama server root — no OS-specific leg, no subprocess, identical on Windows, macOS, Linux (headless included) and against a remote host | `jarvis/brain/ollama_profiles.py`, `jarvis/plugins/brain/ollama.py`, `jarvis/core/config_writer.py::set_ollama_model_options` | Same behaviour everywhere; the server does the work, Jarvis only names the alias. Unit-tested with an `httpx.MockTransport` fake server; `reasoning_effort` -> `think` verified live on Ollama 0.32.15 |
+| P-31 | Low | Detached views | The "own window" detach (Agentic IDE / Voice into a second pywebview window) creates the window at RUNTIME, after `webview.start()`. pywebview documents runtime multi-window, and the code path is OS-neutral (worker-thread create, distinct title, shared backend), but it has only been RUN against the Windows/WebView2 backend; whether the cocoa and GTK backends accept a runtime `create_window` is unverified from this machine. Browser-lock auth in the second window additionally relies on a shared cookie jar, which is verified for WebView2 only | `jarvis/ui/desktop_app.py::open_detached_window`, `jarvis/platform/probes.py::webview_backend_available`, `jarvis/ui/web/desktop_routes.py` | Every failure is honest and keeps the feature usable: a shell whose backend refuses the runtime create answers `ok: false` with the solo URL and the frontend opens it in the user's real browser tab (via open-external); plain-browser clients open the tab directly; headless answers `no_desktop_shell` the same way. macOS/Linux desktop live check pending: detach, close main, reattach, tray-reopen — on success this row shrinks to the cookie-jar note or disappears |
+| P-33 | Low | Music control (YouTube Music) | With the default **background player** (`jarvis/platform/music_player.py` + `music_player_host.py`: a pywebview companion window with its own persistent profile, driven over stdin/stdout JSON lines) pause / resume / next / previous / volume / "what is playing" go through the player's page directly and need only a display plus the `[desktop]` extra (pywebview) — verified live on Windows/WebView2 (a hidden window does NOT start media; minimized does, hence the minimized start); macOS WKWebView and Linux GTK/Qt WebKit are the same code, unverified from this machine, and autoplay policy there may need one press of play (the tool shows the window and says so). In **browser mode**, and wherever the player cannot run, the same verbs go through the OS media session — the registry the keyboard's media keys use — because Google publishes no remote-playback API. Windows reads and steers it through WinRT (`winrt-Windows.Media.Control`, in the `[desktop]` extra; measured live 2026-08-18 against YouTube Music in Chrome, including the two-tabs-same-app-id case) and falls back to blind media keys without the extra. Linux has no binding in the base install and needs the `playerctl` CLI (MPRIS); macOS has no public API at all and needs the Homebrew `nowplaying-cli`, whose MediaRemote access Apple has been narrowing on recent releases | `jarvis/platform/media_session.py::make_media_session_controller`, `WindowsMediaSession`, `LinuxMediaSession`, `MacMediaSession`, `jarvis/plugins/tool/youtube_music_rest.py::_control` | Playing (search + open the `music.youtube.com` deep link) works on every desktop OS. Without the CLI, `now_playing` and the transport verbs answer with the exact install command instead of a fake success, and the play deep link plus the library actions (like, playlists) stay fully usable. Headless: no player exists, so the tool returns the link and says so. Linux `playerctl` and macOS `nowplaying-cli` backends are unit-tested with fake CLI output, not live-run from this machine |
+| P-34 | Low | Drop-path bridge | The desktop shell reports the REAL path of a file or folder dropped onto the UI (`jarvis-native-drop` DOM event from `jarvis/ui/native_drop.py`, consumed by `src/lib/nativeDrop.ts` in the Agentic IDE folder picker). Built on pywebview's own cross-platform drop handling (`pywebviewFullPath` — WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux); live-verified for a dropped FOLDER on Windows/WebView2 only | `jarvis/ui/native_drop.py::register_native_drop`, `jarvis/ui/desktop_app.py::_register_native_drop`, `jarvis/ui/web/frontend/src/lib/nativeDrop.ts` | Honest degradation everywhere: without the announcement (plain browser, headless, a shell whose backend does not resolve paths) the picker falls back to searching for the dropped NAME after 2 s, exactly as before. macOS/Linux live check pending: drop a folder onto the folder step and confirm the exact path is used without a candidate list |
+| P-35 | Low | Desktop shell | The embedded browser's profile is PERSISTENT (`webview.start(private_mode=False, storage_path=<data>/webview)`) so the frontend's `localStorage` — deck/classic surface, pane sizes, favourites, theme cache — survives a restart (2026-08-18: pywebview's default private mode parked the WebView2 profile in a fresh `%TEMP%` folder per launch and the interface forgot every pick). The same call is honoured by every pywebview backend (Edge `UserDataFolder`, WebKitGTK `WebsiteDataManager`, Qt profile path, Cocoa's default persistent data store) but has only been RUN against Windows/WebView2 | `jarvis/ui/desktop_app.py::webview_storage_dir` | Honest everywhere: a checkout without a writable data directory falls back to the per-user directory, then to private mode with a logged warning — the interface still works, it only forgets its cosmetic picks. macOS/Linux live check pending: resize a pane, restart, confirm the size is still there |
+| P-36 | Low | Coding-CLI panes | DeepSeek Harness is the one registered CLI whose interface is NOT the terminal. Upstream removed its terminal front door and publishes no `@deepseek-ai/dsh-tui*` bundle (checked 2026-08-22), so the two shipped profiles are `web` — a server the pane boots, whose UI opens in the default browser — and `headless`, which answers one task and exits. The pane therefore runs and is detected like every other entry, but declines the keystroke channel (`accepts_typed_prompts=False`), so the prompt bar, voice fan-out and CLI never type into it, and it has no transcript, recap or conversation resume | `jarvis/workspace/agents.py` (the `deepseek-harness` entry), `jarvis/agentic_ide/session.py::accepts_prompts`, upstream `apps/cli/README.md` | Identical on all three OSes — one npm package, one Node entrypoint, no native binary and no OS-specific installer. The one difference is not ours: on a host with no browser (headless Linux, an SSH launch) the harness prints its URL instead of opening it, which is the honest degradation and leaves the pane usable over a forwarded port |
+
+| P-37 | Low | Dev instance | A second desktop app from the same checkout (`--instance dev` / `JARVIS_INSTANCE=dev`, see `docs/dev-instance.md`) is built OS-neutral — own `data-dev/`, ports +100, own single-instance lock, window title, DEV-badged icon, no wake word / global hotkeys / chat channels / autostart / on-screen overlay (the dev app boots the NullOverlay at runtime and its overlay-style route answers 409, so a pick there can never rewrite the shared `jarvis.toml`) — but only the WINDOWS identity layer has been run live: AUMID `PersonalJarvis.PersonalJarvis.Dev`, Start-Menu shortcut `Personal Jarvis Dev.lnk`, branded `PersonalJarvisDev.exe`, tray tooltip. Linux gets its own `.desktop` entry + `StartupWMClass` through the same code path (unverified live). macOS has NO separate bundle for the dev instance: the dock shows the default app's bundle icon, and an in-app restart of the dev instance re-enters through the interpreter directly (`build_launch_command` skips the LaunchServices bundle for a non-default instance, because `open -a` would not carry `JARVIS_INSTANCE` and would bring it back as a second default app) — so the restarted dev app has no TCC attachment of its own | `jarvis/core/instance.py`, `jarvis/ui/icon_utils.py` (instance-bound constants), `jarvis/ui/relauncher.py::build_launch_command` | Windows: full parity, verified live. Linux desktop: expected parity (title, icon, tray, data, ports), entry unverified. macOS: functional (data, ports, title, ambient duties, in-app restart), dock icon degrades as described — the dev window is still told apart by its title and the DEV tag in the sidebar |
+
+| P-40 | Low | Local realtime | The spawn-time FREE-accelerator-memory gate (2026-09-01, BUG-204's unfixed half) reads free VRAM only through NVIDIA tooling (NVML, else `nvidia-smi memory.free`). Apple unified memory and ROCm have no cheap free-memory reading here, so those hosts answer `(0.0, "none")` = *unknown* — and an unknown reading deliberately ALLOWS the spawn (AP-22: refusing on a number nobody can read would brick every non-NVIDIA box; the install preflight already vouched for the hardware class) | `jarvis/hardware/detection.py::free_accelerator_gb`, `jarvis/realtime/local_server/supervisor.py::_accelerator_memory_refusal`, `tests/contract/test_accelerator_memory_probe.py` | NVIDIA hosts (all OSes): a card provably too full refuses with one honest log line and the hosted fallback takes the call. macOS/ROCm: unchanged behaviour — the gate is a no-op there by design, recorded here so nobody "fixes" the asymmetry by inventing a free-memory number |
+| P-41 | Info | Process priority | Autostart process priority is a WINDOWS-only defect class: Task Scheduler's default (7) started the whole tree BelowNormal (BUG-210); the fix (`-Priority 5` + raise-only `ensure_normal_process_priority`) is capability-gated and a quiet no-op elsewhere. macOS LaunchAgents already run `ProcessType=Interactive` (`jarvis/autostart/macos.py`) and Linux XDG autostart is not niced — neither OS needs, nor gets, a priority write. The JarvisBar loop-waker (BUG-202) stays Windows-only for the same shape of reason: the lost-timer sleep is a Tcl *Windows notifier* failure mode; X11/Aqua notifiers wait on a socket/run loop and have never shown it (`jarvis/core/process_utils.py::thread_message_loop_wake_supported`) | `jarvis/autostart/windows.py`, `jarvis/core/process_utils.py::ensure_normal_process_priority` | macOS/Linux: nothing to repair, nothing written. A future report of a frozen Linux bar should be diagnosed fresh (py-spy), never "fixed" by porting the WM_NULL waker to a platform whose notifier cannot lose timers that way |
+
+## Native installers (added 2026-08-25)
+
+Personal Jarvis is downloadable as a native installer on all three systems,
+next to the one-line installer and pipx. Every artifact comes out of the same
+PyInstaller freeze of `jarvis.spec` and is published on the GitHub Release for
+the tag together with `installers-SHA256SUMS.txt`, which the in-app updater
+verifies against before it replaces anything.
+
+| OS | Artifact | Built by | Native window | Signing | Shell registration | Where it has actually run |
+|---|---|---|---|---|---|---|
+| Windows 10/11 x64 | `PersonalJarvis-Setup-x64.exe` (Inno Setup, per-user, no admin prompt, fixed AppId for in-place upgrades) | `packaging/windows/build.ps1` | Yes — WebView2, the shipping desktop window | Owned by the Windows packaging work; see `packaging/windows/` | The installer creates and removes the Start-Menu / Desktop entries | Owned by the Windows packaging work — not verified from here |
+| macOS 12+, arm64 and x64 | `PersonalJarvis-macOS-arm64.dmg`, `PersonalJarvis-macOS-x64.dmg` (`Personal Jarvis.app` + an `/Applications` symlink) | `packaging/macos/build.sh` | Yes — WKWebView through pywebview | Developer ID + Hardened Runtime + notarization when `APPLE_SIGNING_IDENTITY`/`APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_SPECIFIC_PASSWORD` are set; ad-hoc signing and a printed notice otherwise (as of v2.5.0 every published image is the ad-hoc one; the certificate itself comes from the `APPLE_CERTIFICATE_P12_BASE64` / `APPLE_CERTIFICATE_PASSWORD` secrets, which `build.sh` imports into a temporary keychain) | The user drags the app to `/Applications`; the app registers nothing | The ad-hoc path runs for real on the macOS runners (every published image comes from it). The signed/notarized path has **never run**: only `bash -n`, ShellCheck 0.11.0 `-S style` (zero findings), a `DRY_RUN=1` rehearsal of both paths and the certificate import against a stand-in `security` command. A Mac with the Apple secrets is the outstanding gate |
+| Linux x86_64 | `PersonalJarvis-Linux-x86_64.AppImage`, `personal-jarvis_<version>_amd64.deb` | `packaging/linux/build.sh` | **No** — serves its interface over loopback HTTP and opens the default browser (P-38) | None. AppImage has no signing story in this project; the release's SHA-256 sums are the integrity check | `.deb` installs a `.desktop` entry, the hicolor icon, `/usr/bin/jarvis` and `/usr/bin/personal-jarvis`. The AppImage carries its `.desktop` inside itself for AppImageLauncher/`appimaged` | Full build proven in a `python:3.12-bookworm` container on 2026-08-25 (~2 min, 156 MB AppImage + 172 MB `.deb`): `appimagetool` digest check, `desktop-file-validate`, both executables out of one freeze, `--version` through the packaged AppImage and through `AppRun`, `AppRun serve` answering `/api/health` in 1-3 s, and the browser hand-off calling the opener with the right URL. Not run on a real desktop distribution or with FUSE |
+
+**Frozen builds register nothing themselves.** For a native install the
+installer owns every shell artifact, so `jarvis/setup/desktop_integration.py`
+and the writers in `jarvis/ui/icon_utils.py` (`ensure_start_menu_shortcut`,
+`ensure_desktop_shortcut`, `ensure_linux_desktop_entry`) return a logged no-op
+under `jarvis.core.frozen.is_frozen()`, on all three systems. Without that
+guard the app would rewrite the installer's working launcher with one shaped
+for a source install (`<interpreter> -m jarvis.ui.web.launcher`) — a command
+line a frozen executable cannot run at all, and inside an AppImage a path in a
+mount that disappears when the app exits — and the uninstall path would delete
+shortcuts it never created. Covered by
+`tests/unit/setup/test_desktop_integration.py`.
+
+**In-app update of a native install (2026-10-01).** The new version may only
+start once the running app is gone (the single-instance lock), so every
+handover ends with the update route quitting the app, and each OS brings the
+new version back its own way: Windows runs the Inno installer with
+`/SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /NORESTART /RELAUNCH=1`, and the
+installer's own `[Run]` entry (`Check: RelaunchRequested`, not `skipifsilent`)
+starts the app again; macOS swaps the `.app` and Linux the AppImage, then a
+detached POSIX `sh` waiter (`relaunch_after_exit_command`) starts the new
+version once the old PID has exited. The plain Restart button of a frozen
+build re-enters its own executable with `--relauncher` (a frozen build has no
+`python -m`), and relaunches through `$APPIMAGE` on Linux and `open -n` on
+macOS. A frozen apply runs the mission guard before downloading. A host with
+no desktop window (`jarvis serve`) keeps running and is told to restart by
+hand.
+
+Hardening (2026-10-02): Windows also passes `/WAITPID=<pid>` and
+`/LOG=<user logs>/update-installer.log`; the installer's `InitializeSetup`
+waits up to 120 s for that process before touching a file, because a silent
+install that meets the still-running app answers "Abort" and the app never
+comes back (reproduced by the real-installer test). Every handover child gets
+`PYINSTALLER_RESET_ENVIRONMENT=1`, and on Linux the user's `LD_LIBRARY_PATH`
+(from `LD_LIBRARY_PATH_ORIG`) instead of the old AppImage mount. A preflight
+(`update_blocker`) refuses BEFORE downloading when the install cannot replace
+itself: a macOS app run from App Translocation, a disk image or an unwritable
+folder, or a Linux process not started from a writable AppImage; the status
+route reports it as `blocked_reason`. An Intel build under Rosetta updates to
+the arm64 DMG. Downloads only follow https redirects, are size-capped while
+streaming and time out as a whole after 30 minutes; Windows installer
+downloads left in the temp folder are reclaimed on the next run.
+
+Covered by `tests/unit/core/test_installer_update.py` (the waiter is executed
+for real on macOS and Linux), `tests/unit/core/test_installer_update_http.py`
+(the real httpx client against a scripted GitHub),
+`tests/unit/ui/test_relauncher_frozen.py`,
+`tests/unit/ui/web/test_update_routes_frozen.py` and
+`tests/integration/test_update_handover_real_os.py`: a real AppImage swap and
+relaunch on macOS/Linux, a real `.dmg` on macOS, and on Windows the real Inno
+script compiled twice and upgraded over a running install
+(`JARVIS_INSTALLER_E2E=1`). The CI `updater` lane runs all of it on Linux,
+Windows, Apple Silicon and Intel macOS. Still not run against a real released
+build: the first release with this code needs one live update per OS.
+
+| # | Impact | Area | Gap | Evidence | Behavior off-Windows |
+|---|---|---|---|---|---|
+| P-38 | Medium | Native installer / desktop window | The Linux AppImage and `.deb` have **no native desktop window**. Windows (WebView2) and macOS (WKWebView) get one from the frozen bundle; Linux does not, because pywebview's GTK backend needs PyGObject and a frozen interpreter can never import the distribution's `python3-gi` (it is compiled against the system CPython), while bundling GTK 3 + WebKit2GTK portably means shipping its helper processes, GIO modules, pixbuf loaders, GSettings schemas and typelibs. The Qt route is also closed today: the `[desktop]` extra installs `pyside6-essentials`, which has no QtWebEngine, and `jarvis.spec` excludes PySide6 outright. Adding `pyside6-addons` and dropping that exclusion is the realistic fix, at roughly +400 MB | `packaging/linux/README.md` ("The window question"), `jarvis/ui/desktop_app.py::_degrade_to_browser_ui`, `jarvis.spec` `excludes`, `pyproject.toml` `[desktop]` | Linux: honest degradation, verified against a real build — the app catches pywebview's `WebViewException`, keeps the backend serving, and `AppRun` waits for `/api/health` and opens the interface with `xdg-open`. Everything except the window frame works, including the whole CLI. A source/pipx install on a Linux desktop with `python3-gi` + `gir1.2-webkit2-4.1` still gets the native window; only the frozen build does not. Sub-gap: the app's fallback message advises installing those system packages, which does not help a frozen build |
+
+| P-39 | Medium | Dictation hold-key watchdog | A HOLD-started dictation is owed a release edge, and that edge can be lost between the OS hotkey listener and the pipeline (a checker restart mid-hold, a re-arm, a handler that raised). The recording then ran to its 30-minute cap with the bar's X dead and every key press refused (BUG-191). The repair asks the keyboard instead of trusting edges: `HotkeyBackend.chord_is_down(combo)` is a three-way capability — `True`/`False` when the backend can see the keyboard, `None` when it cannot — and the recording finishes itself once the chord has read "up" for one second. The three OS backends can see different amounts: Windows reads `GetAsyncKeyState` (ground truth, the poller's own source); macOS answers from the event tap's held-set, whose modifier half is re-synced from every event's flags word, and answers `None` while the tap is not running (a normal fresh-Mac state until Input Monitoring is granted), so the watchdog stands down instead of trusting a stale view; Linux/X11 answers from pynput's held-set, which is edge-fed like the matcher itself | `jarvis/trigger/backends/__init__.py::HotkeyBackend.chord_is_down`, `backends/global_hotkeys.py::chord_is_down`, `backends/quartz.py::chord_is_down`, `backends/pynput.py::chord_is_down`, `backends/noop.py`, `jarvis/speech/pipeline.py::_watch_dictation_hold_key`, `tests/contract/test_hotkey_backend_protocol.py` | Windows: the watchdog sees the physical key and ends a lost-release recording within ~1 s. macOS / Linux-X11: the watchdog runs on the listener's own bookkeeping — it catches a release the pipeline missed, not one the listener itself missed. Wayland / no listener: the backend answers `None`, the watchdog stands down, and the other stop gestures carry alone — the key (a press during a running dictation is its stop), the bar's X, the Dictation view, `jarvis api dictation stop`. On no host does `None` ever read as "up": a phantom release is the one failure this must never produce |
+| P-40 | Low | JarvisBar | The Prompt Mode switch (`[dictation].prompt_mode`, every dictation comes out as a written prompt) is a control on the native bar since 2026-08-28: a sparkle in the resting pill's left slot, drawn ONLY while the SETTING is on (visible without a hover — the pill opens as it does for mute). A click PAUSES the rewriting rather than changing the setting: the mark goes red with a slash through it, jarvis.toml is untouched, and the same click brings it back. The pause is runtime-only and clears on restart or on any write of the setting. With the setting off nothing is drawn there and the spot starts a session as before. The glyph mirrors the mic's inset rather than the close-X's, which is left untouched on a live bar. The switch has ONE writer (`jarvis/dictation/prompt_mode_switch.py`) and one broadcast (`DictationPromptModeChanged`) that the bar, the front-page pill and the settings card all redraw from | `jarvis/ui/jarvisbar/renderer.py::_draw_sparkle`, `interaction.py::resolve_click` (`prompt_mode_toggle`), `overlay.py` / `qt_overlay.py` / `subprocess_overlay.py` (`set_prompt_mode`, `set_on_prompt_mode_toggle`), `host.py` (op `set_prompt_mode`, event `prompt_mode_toggle`), `ui/orb/bus_bridge.py` | Windows/Linux (Tk bar, in-process) and macOS (Qt bar in the companion host, over the existing IPC protocol): the same sparkle, the same click, the same event. Headless / `orb_style = none`: the NullOverlay accepts both methods as no-ops; the pill on the front page and the settings card remain the switch. Guards: `tests/unit/ui/jarvisbar/test_prompt_mode_button.py`, `test_prompt_mode_bridge.py`, `test_surface_contract.py`, `test_host_protocol.py` |
+| P-41 | Medium | Dictation final pass | The dictation lane reads its final pass on the machine, in front of any configured cloud provider, through the same out-of-process worker the live preview uses (`jarvis.dictation.preview_worker`) with a stronger checkpoint (`[dictation].local_model`, default `large-v3-turbo`, `int8_float16`, beam 5). 2026-09-02 forensics: 220 of 220 dictations had run on a cloud recognizer the settings did not name, because the VOICE lane had been moved there to keep CUDA out of the desktop process, and the dictation lane inherited the move — round-trips as lag, near-empty answers on 25 s windows as "truncated window" repairs. The provider declines itself with a CROSSABLE failure (HTTP-503-shaped, `LocalEngineUnavailable`) so the configured provider is one step behind on every press and never a restart away: too little free accelerator memory (`[dictation].local_min_free_gb`, default 1.5; an UNKNOWN reading never blocks), a worker that only comes up on the CPU, a missing local runtime, a worker that died. A call abandoned at its ceiling leaves its answer in the pipe, so the next call kills that worker instead of reading it (AP-24) | `jarvis/dictation/local_final.py::LocalFinalSTT`, `jarvis/speech/pipeline.py::_dictation_local_final`, `_dictation_stt`, `jarvis/dictation/local_preview.py::_spawn_worker_model` (`compute`), `preview_worker.py` (`beam_size`, `segments`), `jarvis/hardware/detection.py::free_accelerator_gb` | Windows/Linux with an NVIDIA card and the local runtime: the final pass runs locally when ≥ 1.5 GB is free, else the cloud chain. macOS: no NVIDIA reading → the memory gate passes as unknown, and the worker's own device ladder decides; a CPU-only worker is declined for the final pass (a beam decode of a 25 s window on a CPU is slower than the cloud it would replace), so Apple Silicon stays on the configured provider until a Metal-backed runtime exists. Headless `python:3.11-slim` (no `faster-whisper`): the provider is never built and the chain is exactly what it was. Switch: `[dictation].local_engine = false`. Guards: `tests/unit/dictation/test_local_final.py`, `test_preview_worker.py` |
+| P-41 | Low | CLI install / connect terminal | Pressing **Install** or **Connect** in the CLI section opens a REAL terminal window and runs the command there, because an interactive OAuth login belongs in a shell the user can see and type into. That spawn was Windows-only until 2026-08-28 (`wt` -> `pwsh` -> `powershell`), so on macOS and Linux the two buttons reported "No external terminal available" and no CLI could be installed from the app at all. macOS now goes through `osascript` to Terminal.app, Linux through the first of seven emulators that exists (Debian's `x-terminal-emulator` alternative first, so the user's own default wins), and the window is held open afterwards the way `-NoExit` holds it on Windows. One install click now carries all the way to signed in: the terminal runs the install, refreshes PATH in that same shell, and continues into the CLI's login command, stopping at the first step that fails. The chain operator differs per OS on purpose — Windows PowerShell 5.1 is a possible fallback shell and `&&` is a parser error there, so the Windows spelling nests `if ($?)` instead | `jarvis/clis/external_terminal.py` (`_spawn_windows`, `_spawn_macos`, `_spawn_linux`, `chain_commands`, `path_refresh_command`), `jarvis/ui/web/cli_routes.py::spawn_external`, `tests/unit/clis/test_install_path.py` | Windows: verified live (wt path, composed install+login command). macOS/Linux: same code path, the branch itself unverified from this machine. A box with no screen has no window to open, so there the endpoint falls back to the in-app streaming install job and the UI says so instead of claiming a terminal appeared — a headless server can still install a CLI, it just cannot run an interactive login |
+| P-42 | High | Outbound sockets (every lane) | Every connection borrows an ephemeral port from a pool the OS owns, and a closed one keeps that port through TIME_WAIT. The ceiling and the linger differ per OS, and so does what gives out first: **Windows** 16 384 ports / 120 s — the tightest by far, and the port pool is what empties, which stops EVERY process on the machine from connecting (the desktop appears frozen, then heals itself when TIME_WAIT expires); **Linux** 28 232 ports / 60 s, but `RLIMIT_NOFILE` is normally the tighter of the two (1024 on a stock `python:3.11-slim`), so the backend dies of EMFILE while the desktop around it is fine; **macOS** 16 384 ports / 15 s, so it recovers fastest. BUG-215 was the Windows shape: an unjittered wake storm (one socket per pane, per window, per instance, all on one `visibilitychange`) on top of a standing per-call-client burn. The rule that follows is to cap the burst, never to widen a limit — code that fits the Windows budget fits everywhere | `jarvis/ui/web/frontend/src/lib/connectBudget.ts` (`jitteredDelay`, `spreadDelay`, `requestConnect`), `jarvis/core/http_pool.py` (`HttpClientPool`, `SyncHttpClientPool`, `default_limits`), `jarvis/core/socket_budget.py` (`read_platform_limits`, `take_census`, `SocketBudgetWatchdog`), `jarvis/realtime/local_server/supervisor.py::_port_open` (`SO_LINGER`) | Identical on all three: one shared connect budget in the frontend, pooled keep-alive clients in Python, and a watchdog armed by BOTH entry points (desktop shell and `--headless`) that reads the ceiling per platform — `netsh` on Windows (parsed as integers, because it translates its own field names), `/proc/sys/net/ipv4/ip_local_port_range` plus `RLIMIT_NOFILE` on Linux, `sysctl net.inet.ip.portrange.*` on macOS. A host that answers none of them falls back to the documented default and says the number was assumed; a host with no ceiling at all logs one line and throttles nothing, because a watchdog that cannot see must never be what stops the app working. macOS additionally refuses the system-wide socket table to an unprivileged process, so the census there counts this process only and labels the number a floor. Guards: `tests/contract/test_socket_budget.py` (all three hosts faked, plus a German and a Japanese `netsh`), `tests/unit/core/test_socket_budget_watchdog.py`, `jarvis/ui/web/frontend/src/lib/connectBudget.test.ts` |
+| P-45 | Medium | Hermes / OpenClaw agent runtimes | A society agent can run on Hermes or OpenClaw instead of Jarvis' own loop (docs/agent-runtimes.md), driven over ACP: Hermes as one `hermes acp` process per turn, every agent a profile of one Jarvis-owned Hermes data root (`<runtimes_root>/hermes-home/profiles/<agent>`, one shared dependency environment, prepared by the setup job); OpenClaw through `openclaw acp` against a supervised per-agent Gateway. Setup goes to the pinned `tested` release (`runtime-versions.json`) per OS: Hermes' `install.ps1` / `install.sh` at the pinned commit without browser tools or desktop control; OpenClaw as Jarvis' own copy with a private Node.js — `install.ps1 -NodeOnly` plus that Node's npm on Windows (no winget/UAC), `install-cli.sh --prefix` on macOS/Linux (no sudo). POSIX installer scripts are downloaded first and run under `set -euo pipefail`, so a missing `curl`/`git` or a failed download fails the job with a plain reason. Containment differs per OS exactly as for every CLI seat: a Job Object on Windows; a process group on POSIX plus a descendant tracker that also reaps children started under `setsid` (Hermes runs shell commands that way), found by tree walks and by a per-turn environment mark every descendant inherits, and a `gateway.pid` sweep that stops a Gateway a crashed app left behind (POSIX only — the Job Object already reaps it on Windows). Hermes' Windows home maintenance would register its data root's `bin` on the user's PATH; a `bin` file blocks that, POSIX uses `cli.expose_on_path: false`, and stale entries from older builds are removed once per run. Stop sends ACP `session/cancel` before any kill, and a stall watchdog ends a turn whose runtime stopped responding | `jarvis/agent_runtimes/` (`hermes.py`, `openclaw.py`, `base.py` (`which`, `RuntimeGate`, `HomeFileLock`, `posix_installer`, `windows_installer`), `manager.py`, `versions.py`, `runtime-versions.json`, `path_cleanup.py`), `jarvis/agent_chat/runner_cli.py` (ACP cancel + stall watchdog), `jarvis/core/process_tree.py::DescendantTracker`, `jarvis/core/path_augment.py::refresh_from_persistent_path` | Windows: verified 2026-10-07 with Hermes 0.21.5 and OpenClaw 2026.9.8 through the replay e2e spikes (both model-gateway protocols; Hermes prepare 37–45 s once, first turn 6.8–8.3 s; OpenClaw first turn 31–55 s including the Gateway cold start; the user PATH unchanged, checked against the registry), and through `tests/unit/agent_runtimes/` (fake ACP agent, fake OpenClaw CLI, injected registry). macOS/Linux: the same code paths; the setsid reaping, `flock` locks, `install-cli.sh` and `pipefail` wrapper run only on POSIX CI runners (unit tests, `agent-runtimes-canary.yml`), not verified on a real Mac or Linux desktop from this machine. Headless `python:3.11-slim`: nothing is installed or started unless an agent is switched to a runtime; without `curl`/`git` the setup fails with that reason instead of reporting success. Guards: `tests/unit/agent_runtimes/`, `tests/unit/society/test_agent_runtime_field.py` |
+
+## Agent conversation continuity and learning (2026-09-07)
+
+Windows, macOS and Linux use the same lazy Society lifecycle. Persistent
+conversation search probes SQLite FTS5; installations without it use bound
+text queries over the same archive. Neither path imports native desktop APIs.
+Memory entries retain stable ids across corrections, and context checkpoints
+are persisted only after a nonempty, completed model response. Original events
+remain available through the agent-scoped recall tool.
+
+Direct chats and scheduled work share the completion hook and durable review
+queue. Explicit current-user configuration requests can apply through the
+existing executor; internal messages and scheduled turns cannot authorize that
+path. Routines resolve the owner's current briefing and permissions at execution.
+
+`tests/contract/test_society_continuity.py` covers archive reopening, isolation,
+text-search fallback, memory corrections, compaction failure, direct-turn
+learning, configuration provenance, routine updates and skill revisions.
+The contract was executed on Windows and headless Linux. Physical macOS
+execution remains an external CI validation requirement; portable source and
+passing tests on another OS are not represented as a native macOS test.
+
+A newly installed package in an isolated Linux container with empty app state
+and one Gemini key passed live role persistence, rule replacement and identity
+recall after reopening. The isolated headless boot measured 896 ms against the
+8,000 ms window budget; audio was unavailable and the voice measurement skipped.
+Generated procedures remain drafts, including private revisions. Reading a
+procedural draft grants no tool permission and activates no registry triggers.
+
+## Maintenance
+
+- Fixing a gap: remove its row (git history keeps the record).
+- Landing a new Windows-only implementation: add a row (required by
+  AGENTS.md §3) with impact, evidence, and off-Windows behavior.
+- Re-audit cadence: rerun the five-area sweep after any release that touches
+  platform seams (`jarvis/platform/`, `jarvis/cu/actuate/`, `jarvis/vision/`,
+  `jarvis/audio/`, `jarvis/missions/isolation/`).
+
+## Chat Add menu and per-message tool selections (2026-09)
+
+Windows, macOS and Linux share the same lazy Python catalog and React picker.
+The capability probe is the live tool registry, active skill registry and
+connector availability. Headless servers expose the same REST endpoints;
+clients render bundled logos without external image requests. Missing tools
+are unavailable, and a missing search model explicitly falls back to text
+search. Existing native-tool OS limitations remain unchanged.
+
+`tests/contract/test_chat_tool_choices.py` verifies the message/SQLite/Pydantic/
+TypeScript contract, read-only plan filtering and isolated one-key fake-provider
+turns. Tests run locally on Windows; physical macOS/Linux and live-provider fresh
+install verification are not claimed. See [the inventory and design](chat-tool-picker.md).
+
+
+## Internal agent messaging — RUB-14 (2026-09-07)
+
+### Contextual communication and reply expectations (2026-09-23)
+
+The lead, realtime directive and teammate briefings share the same guidance:
+compose an actionable objective with known context, scope and completion evidence.
+The existing envelope JSON carries optional `reply_policy` metadata
+(`none`, `on_error`, `always`). Questions require an answer; answers close the
+exchange. Delivery receipts remain separate from task outcomes. Legacy assignments
+keep completion reporting. No SQL status, REST field or frontend enum is added:
+SQLite and Pydantic preserve the payload and TypeScript exposes it as an opaque
+record; the UI continues to render message text and existing delivery states.
+
+Windows, macOS and Linux use identical pure Python, asyncio and SQLite paths,
+behind the existing runtime/chat-service capability boundary. No native, GPU or
+audio dependency is added. API and CLI seats receive the same guidance. The chat
+completion hook sends one correlated answer when a receiver only writes its final
+response. Explicit answers suppress that fallback. Task completion remains in the
+board even when notifications are suppressed. An explicit blocker is reflected in
+the assignment outcome, and the runtime alone forwards that outcome.
+
+The legacy mission runner retains its existing reporting for `always`; it refuses
+quiet policies when no agent chat service is available instead of promising silence
+it cannot enforce. `tests/contract/test_society_communication.py` covers the reporting
+matrix, scheduler delivery, durable reply identity, terminal answers, semantic
+blockers and compatibility. Windows execution does not establish native macOS/Linux
+or a fresh single-key live-provider qualification; those require separate evidence.
+
+The message tool, durable SQLite queue, task-local sender provenance, and chat
+receipts use the same Python/React implementation on Windows, macOS and Linux.
+There are no native imports, GPU requirements, or provider-name gates. The
+capability boundary is an available society runtime and receiving chat service;
+unavailable services retain queued messages, while an unavailable agent model
+reports delivery failure. Initialization remains lazy and serialized.
+
+`tests/contract/test_internal_messages.py` covers receipt replay, busy-recipient
+FIFO, restart recovery, sender identity, failure projection and SQL/Python/TS
+status parity. Realtime confirmation/echo cases use fakes with no microphone
+or provider account. Native macOS execution and a fresh single-key live-provider
+run remain release validation requirements; running this portable contract on
+one operating system does not establish those results.
+
+## Routine trigger sources (2026-09-10, T3)
+
+Human, time, API, provider callbacks, streams, file polling and workflow chains
+share the same Python/SQLite implementation on Windows, macOS and headless Linux.
+The catalogue probes optional protocol clients without importing or connecting
+them. Missing clients and unreachable services have explicit in-app states.
+No Win32 event hook or other native watcher is required. File access remains
+subject to each host's permissions and available paths.
+
+Windows contract tests cover all seven groups, DST, source lifecycle, typed
+forms, queue durability, provider signatures and trusted workflow ancestry.
+Real Kafka, RabbitMQ, MQTT and Redis instances passed admission/acknowledgement
+checks. A fresh `python:3.11-slim` container installed the built wheel and all
+base dependencies, then used one Gemini key for actual model-driven chat creation
+and canonical agent-chat execution of a manually submitted routine. A duplicate
+input was suppressed. Provider account subscriptions were not created.
+Chrome checks cover the shared editor in light and dark mode. Native macOS
+execution and provider-account provisioning remain unverified; portable contract
+coverage is not a claim of physical hardware testing.
+See [source configuration and delivery limits](trigger-sources.md).
+
+## Chat slash commands and persistent goals (2026-09-10)
+
+The Jarvis text chat and society cards share a command catalog, typed control
+state, SQLite receipts and an independent goal supervisor. Windows, macOS and
+Linux use the same implementation. Opening a menu performs no model call.
+`/clear` and `/history` change browser presentation only; neither clears a
+provider conversation, goal, archive or pending task.
+
+| Capability | Windows | macOS | Linux / headless |
+|---|---|---|---|
+| Command API, state, receipts and search | Supported | Supported | Supported |
+| API-backed goal execution and separate verification | Supported | Supported | Supported |
+| Native Codex App Server goals | Runtime schema probe | Same probe | Same probe |
+| Native Claude Code goals | Version and command probe | Same probe | Same probe |
+| Plan-mode tool execution gate | Supported | Supported | Supported |
+| Native CLI availability and permissions | Installed runner contract | Same contract | Same contract |
+
+Only one goal engine owns a session. Native adapters reuse the selected account
+and vendor conversation, never the ephemeral voice transport. Goal recovery
+pauses work after an app restart, and clears residual native goal state before
+an ordinary user message can resume that vendor conversation. A closed browser
+does not stop backend work. `/stop` cancels work without rolling back effects.
+
+Modes based only on a prompt are not advertised as an enforced read-only mode.
+The current Kimi and DSH print runners therefore cannot run plan, review or
+goal verification through this interface; their API-backed alternatives use the
+portable implementation. Antigravity, Grok, OpenCode and Cursor use their native
+plan flags for independent verification; Codex and Claude verifiers disable tools.
+
+Contracts in `test_chat_controls.py` and `test_native_chat_goals.py` cover API and
+SQL/TypeScript parity, evidence, idempotency, read-only execution, native terminal
+states and final-output ordering. The OS cases emulate capability selection;
+they do not claim physical macOS/Linux execution. Live native transport and
+fresh-install checks are recorded separately from these portable contracts.
+
+CLI access: `jarvis sessions control SESSION` reads state; `jarvis sessions
+command SESSION goal --arguments "..." --request-id ID --yes` submits a durable
+command. Reuse the request id after an uncertain response. The dynamic
+`jarvis api agent-chat` group exposes the same mounted endpoints.
+
+## Plugin browser authorization (RUB-94)
+
+| Capability | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Device, PKCE and DCR login | System browser and loopback callback | Same portable implementation | Loopback, or configured HTTPS hosted callback |
+| Home Assistant login | Instance address and browser approval | Same | Same; reachable instance required |
+| Credential lifecycle | Platform vault with encrypted fallback | Platform vault with encrypted fallback | Platform vault with encrypted fallback |
+| AMD telemetry | Intentionally unavailable | Intentionally unavailable | Compatible AMD hardware and supported AMD SMI required |
+
+Optional AMD availability is exposed before Connect. No native inference or GPU
+library is imported for catalog listing. Empty, invalid and unavailable telemetry
+never becomes a zero reading. Driver/tool installation is a host prerequisite;
+this change does not claim that an unsupported operating system gains telemetry.
+
+Portable contracts exercise all three OS availability outcomes, actual ephemeral
+loopback binding and cleanup, confidential/public DCR credentials, Home Assistant
+callback/resource verification, cancellation and safe errors. The macOS/Linux
+availability cells are emulated on the audit host, not physical-device evidence.
+The live Windows browser observations and outstanding provider/installation
+requirements are recorded in `marketplace/plugin-auth-audit.md` and its JSON
+companion. No fresh-install or provider PASS may be inferred from unit tests.
+
+OAuth completion verifies resource access before storing and publishing a new
+connection. Failed reconnects preserve the previous stored grant; a newly issued
+provider authorization may remain at the provider because revoking it could also
+invalidate a shared existing grant. Users can revoke it in the provider's app
+settings. The release audit separately requires a real safe action, disconnect,
+reconnect and persistence after restart.
+
+## Routine model seat pinning (2026-09-20, T2)
+
+| Capability | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Routine runs on its pinned seat (or the owner's live seat) | Same portable resolution | Same portable resolution | Same portable resolution |
+| No silent reroute onto an API-key chain | Fails honestly with a readable error | Same | Same |
+| Per-routine seat picker in the routine editor | Same React component | Same | Same |
+
+One surface (society routine execution); the shared `AgentAction` contract gains
+four optional seat fields that default empty, so stored rows from before this
+change still validate and behave as before (follow the owner). Seat kinds are
+decided by asking the runner/catalog (AP-21), never by provider name; a vendor
+CLI that is not installed on the host fails the run honestly instead of billing
+a key. Portable contracts: `tests/unit/society/test_routines.py` (pin, inherit,
+update), `tests/unit/tasks/test_runner_agent_result.py` (no API fallback for
+society tags, generic fallback kept), `tests/unit/ui/web/test_routine_editor.py`.
+Physical macOS/Linux runs and a fresh-install end-to-end check remain open
+acceptance and must not be inferred from these tests.
+
+## Browser media presentation (T3)
+
+| Surface | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Browser microphone and audible-output meters | Shared Web Audio measurement | Same browser adapter | Same adapter; remote browser owns headless audio |
+| Native bar state and amplitude | Existing bus and level channels | Existing companion bridge | Existing overlay; no native window on headless hosts |
+| Unsupported media capability | Existing browser capability check | Same check | Same check |
+
+The `media_levels` control is a frozen, validated, transient snapshot: normalized
+input/output levels and input/playback activity. It carries no PCM or text and
+is never written to SQL, usage records, or the event journal. The existing
+`AudioOutFirst` event is emitted after the speaking state on an actual playback
+edge; generated text and backend completion do not prove audible playback.
+Microphone activity outranks background thinking; audible output takes priority.
+Close and a 1.5-second measurement expiry clear stale meters. Legacy clients
+retain the existing `playback_state` edge contract.
+
+`tests/contract/test_live_media_feedback.py` covers both Live session families,
+the real native bridge with a recording surface, invalid snapshots, cleanup,
+and Python/TypeScript field parity without opening a device. Browser tests
+cover level forwarding, word-gap hysteresis and stale thinking messages.
+Physical macOS/Linux device verification remains pending; portable contracts
+and headless tests must not be reported as physical-device acceptance.
+
+## Agent profile companions (T3)
+
+| Capability | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Companion settings in existing avatar JSON | Portable Pydantic + SQLite | Same implementation | Same; no GPU or credentials required |
+| Character and companion editor | Shared React UI | Same browser UI | Same browser UI |
+| In-map follower | Existing WebGL capability probe | Same capability probe | Available in a WebGL browser; headless API still works |
+| No WebGL / lost context | Profile stays SVG/PNG; existing context recovery | Same fallback | Same fallback |
+
+`avatar.companion` stores shape, colour, eye style and visibility independently
+of the preserved character recipe. Companions use a fixed 0.50 m size and 1 m
+following distance; earlier saved slider values normalize to these constants. No additional SQL
+column, provider setting, inference request or credential is required. Old avatars
+retain deterministic identity defaults. Per-agent settings survive reload and
+world changes; hidden followers still retain their profile identity.
+
+`tests/contract/test_agent_companion.py` exercises a fresh, credential-free,
+headless API/database through creation, edit, rejection and reopening. A shared
+JSON corpus is accepted/rejected by Python and TypeScript. Browser verification
+on Windows covers real creation, appearance editing and rendering; physical
+macOS/Linux verification is not inferred from this portable implementation.
+Follower tests cover route corners, following gaps, height changes, bounded
+history and background-tab catch-up. Existing WebGL lifecycle hooks own context
+release/recovery; each follower shares the map canvas and cached geometry.
+
+
+## Wake-to-browser startup audio (T3)
+
+| Capability | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Wake microphone handoff | Existing capture lease, kept until browser capture | Same portable lease | Same; no native lease in headless mode |
+| Retained first sentence | Web Audio worklet feeds the negotiated RTP track | Same browser capability probe | Same browser path, including remote clients |
+| Gemini/local input | Prefix precedes existing PCM stream | Same adapter | Same adapter |
+| Missing Web Audio capability | Existing explicit unsupported-browser result | Same result | Same result |
+
+The one-use `input_prefix` message carries bounded mono PCM16 and its sample
+rate. Python validates its typed envelope; TypeScript decodes and resamples it
+before browser input. The desktop cuts the prefix at `capture_started_at_ms`,
+a wall-clock estimate of browser capture start, to exclude overlapping audio.
+Capture clocks are not sample-synchronized: device/graph latency can affect
+this boundary and requires physical-device acceptance. The source is released
+on its owning event loop. Audio is memory-only; no SQL, transcript or journal
+field is added. Closing or cancelling clears the offered lease, and no prefix
+or captured audio is retained through reconnection.
+
+GPT-Live input stays on RTP. The startup worklet emits silence until
+`session.started`, then drains retained speech once. Only excess near-digital
+silence is skipped to catch up; quiet speech is preserved. The native meter
+continues receiving wake levels during connection and browser levels before
+the RTP handshake completes. No billed idle session or extra provider call is
+introduced.
+
+`test_live_startup_audio.py`, `test_live_media_feedback.py`, capture-first
+pipeline tests and the browser audio tests cover overlap trimming, once-only
+consumption, cross-thread release, cancellation, PCM ordering and RTP startup.
+Windows Chrome verification supplied a synthetic sentence entirely before
+readiness with an extra three-second handshake delay: its complete transcript
+arrived and assistant playback followed. This does not establish physical
+wake/microphone acceptance or physical macOS/Linux acceptance.
+
+A fresh Linux wheel installation passed all eight startup handoff contracts and
+a one-key synthetic Live speech/tool proof (one tool receipt, spoken result, no
+session failure). This checks the installed package without native audio devices.
+
+
+## Continuous voice conversation history (T3)
+
+| Surface | Windows | macOS | Linux / headless |
+| --- | --- | --- | --- |
+| Speaker segments | Portable Live adapter projection | Same implementation | Same; no audio device required by projection |
+| Live conversation and trace | Shared React voice stage and existing theme tokens | Same browser surface | Same surface in a remote browser |
+| Persisted history | Existing session event JSON in SQLite | Same schema | Same schema |
+| Legacy Live conversations | Read-only projection of existing transcript fragments | Same projection | Same projection |
+
+`VoiceTranscriptUpdated` is a frozen, revisioned snapshot identified by session
+and segment. Python, recorded JSON, API serialization and the TypeScript field
+contract are exercised together by `test_live_conversation.py`. Independent
+speaker rows allow overlapping audio and repeated phrases without overwriting
+previous turns. Presentation grouping does not send model turn-control events.
+Gemini/local snapshots and final markers use the same projection; older voice
+adapters keep their existing final-transcript path.
+
+Responses delegation publishes its real model-start event and exposes only
+provider-supplied public reasoning summaries as `ReasoningSummaryUpdated`.
+Raw/private reasoning and encrypted reasoning payloads are never projected.
+The existing tool-execution events continue to supply tool progress/results.
+Models that emit no summary still show their observable model/tool steps.
+Configured reasoning backends request the provider's automatic summary format;
+the selected model and credential stay unchanged.
+
+The session recorder stores both event types in its existing event table. The
+conversation API reconstructs the latest snapshot of each segment, with traces
+attached to the corresponding answer interval. Pre-fix Live fragment history
+is read without changing the original database. Physical OS audio acceptance
+is separate from this portable presentation/storage contract.
+
+Browser-owned calls also hold the native activation gate. A competing wake or
+card start must not publish a replacement session and erase the active
+conversation. This ownership is released with the Live runtime lease.
+
+Validation includes a real GPT-Live browser session with synthetic speech and
+a read-only test tool: three user segments, four assistant segments and two
+stored trace intervals survived retrieval after restart. Both light and dark
+voice-stage rendering were inspected. The fresh Linux backend installation
+passed all seven conversation contracts; physical macOS/Linux audio behavior
+is not inferred from these checks.
+
+
+## Managed browser sign-in (T2)
+
+The managed browser's explicit **Sign in** action uses installed regular Google
+Chrome on Windows with the existing Jarvis-owned persistent profile. It closes
+Playwright/CDP first, retains native window capture and person-controlled input,
+and restores agent automation only after explicit handover and clean Chrome
+shutdown. The selected Chrome executable remains pinned to that profile across
+restarts; missing binaries and profile downgrades fail closed.
+
+The Windows browser worker retains one COM MTA usage cookie across capture
+sessions and releases it when the worker exits. This prevents the capture
+library's cached WinRT factories from outliving their apartment during manual
+handover. Each window still stops its capture and event threads on close.
+
+The shared turn-host client accepts a replacement reader's output only after
+the host acknowledges attachment. Earlier live frames remain in the host's
+replay buffer, so a fast process cannot displace the first replayed line.
+Failed attachments release their local reader and can retry with the host's
+authoritative process metadata. Socket tests exercise both paths without
+depending on Windows, macOS, or Linux scheduling speed.
+
+A stopped Windows popup capture discards its stale pixels and retries once while
+the same owned popup remains visible. Parked owned windows remain fully
+transparent and mouse-transparent. They clear the tool-window, app-window,
+and no-activate extended styles: native capture rejects the no-activate style
+when the app-window style is absent. Positioning still uses SWP_NOACTIVATE
+and keeps the owned window behind the application, including popup recovery.
+Input waits for the replacement's first
+frame. A repeated failure, failed restart, or unfinished capture cleanup reports
+an error instead of retaining an unusable preview or starting overlapping captures.
+Closing the popup resets its retry allowance. Regression tests use native-window
+fakes; this recovery does not establish a successful live Chrome sync or sign-in.
+
+macOS and Linux keep their existing managed browser behavior. They do not expose
+this sign-in capability because the current native capture/input implementation
+is Windows-only. The module imports without Win32 dependencies on those systems;
+native libraries load only within Windows-specific calls. Headless boot does not
+launch Chrome. No background login or provider call is added.
+
+Focused tests cover the platform boundary, process arguments, executable/version
+checks, ownership, viewer loss, stale frames and failed transitions using fakes.
+Real provider sign-in and light/dark desktop acceptance remain separate checks;
+passing these tests does not prove that Google accepted an account login.
+
+## Startup audio catch-up (T2)
+
+The existing WebRTC input worklet now repays startup audio delay with bounded
+waveform-aligned overlap-add processing. It no longer depends on digitally
+silent microphone samples, which left the previous queue permanently behind
+in rooms with background noise. Quiet input is retained without an amplitude
+speech gate. After catch-up, microphone samples pass through unchanged.
+The native prefix shares the existing memory bound; reconnection clears both
+queued audio and a partly rendered overlap grain. Assistant playback is not
+processed by this input queue.
+
+This changes the shared Web Audio implementation on Windows, macOS and Linux;
+Gemini/local PCM adapters and headless boot are unchanged. No provider session,
+credential setting or always-on billed connection is added. Tests cover 16,
+24, 44.1 and 48 kHz, low amplitudes, waveform gain/pitch, noise/hum, prefix
+ordering and cancellation. An actual Chrome AudioWorklet comparison with the
+same two-second setup delay and background noise removed the old two-second
+steady input lag. Paired GPT-Live probes retained the same recognized words in
+German and English, including a quieter English sample. First response text
+arrived 0.4–1.4 seconds earlier in those three comparisons; these small
+synthetic comparisons are not a physical-device latency guarantee.
+
+## AppShot permission lifecycle
+
+AppShot follows AP-35: startup, settings reads and helper processes never request
+macOS access. A user-started area selection asks for Screen Recording before the
+picker starts or reads any preview pixels. The picker silently checks its own
+usable grant and falls back to a live dim layer when it cannot capture. The final
+capture still checks permissions and applies the existing privacy filters.
+
+Saving a changed tap-based AppShot shortcut, or enabling AppShots with one already
+configured, asks for Input Monitoring on macOS through the shared permission
+service. Clearing a shortcut, saving an unchanged value, disabling AppShots and
+ordinary startup never ask. Listener status follows actual readiness and later
+grant changes; disabling AppShots stops its listeners. Both-modifier polling
+retains its existing behavior without inventing an unverified permission need.
+
+Windows and Linux/X11 retain their existing capture backends. Headless Linux and
+Wayland report unavailable support; Jarvis does not yet implement the Wayland
+Screenshot portal. Installing a portal package alone does not enable AppShots.
+Backend availability never substitutes for a macOS grant and does not disable a
+supported Mac's first-use action merely because consent has not been requested.
+
+Validation uses platform fakes, AppShot entry-point and listener lifecycle tests,
+and frontend action-state tests. Actual macOS dialogs and helper attribution,
+physical modifier gestures, and Linux desktop sessions remain unverified here.
+
+## GPT-Live subscription access (experimental)
+
+The optional subscription provider uses the selected Codex account for native
+Live audio and delegated reasoning. API-key mode remains independently saved.
+Subscription authentication, quota or transport failures never switch to an
+API-key provider. Jarvis retains tool execution, confirmations and cancellation.
+
+Sign-in reuses an existing Codex CLI. When none is present, the user can prepare
+a private native login helper from settings without Node.js or npm. The helper
+uses the pinned OpenAI binary for the current Windows, macOS or Linux target,
+verifies its SHA-256 before atomic installation, and stays outside global PATH
+and coding-agent discovery. Unsupported targets report that setup is unavailable.
+The existing guided login owns account isolation and process cleanup. Downloads
+and login start only after user interaction; importing the provider does neither.
+
+Fake transport, authentication, installer and account-flow contracts run in the
+strict realtime CI lane on all three operating systems and in the Linux slim
+container. Windows additionally has real subscription audio/delegation evidence
+with project API credentials disabled, and a native login-binary check with Node
+absent. These checks do not establish physical-device or latency parity on other
+platforms. The private upstream voice protocol remains experimental.
+
+## Profile locks and notebook migration
+
+On macOS and Linux, closing the parent's profile-lock descriptor retains the
+lock while a live child still owns an inherited descriptor. Windows retains
+its existing process-lock implementation.
+
+Agent notebook migration explicitly normalizes the final `USER.md` and
+`MEMORY.md` filename spelling on case-insensitive filesystems. The migration
+journal and backups continue to preserve the original content on every OS.
+The inherited-lock and migration recovery contracts run in the OS test shards.
+
+## Independent agent server and clients
+
+The opt-in independent server uses the existing headless backend on Windows,
+macOS and Linux. Its lifetime no longer depends on a desktop client, an idle
+timer or a desktop handover. Windows runs it in the user session rather than
+as a SYSTEM service. The client uses pywebview where installed; the same server
+also serves ordinary browsers. Remote origins require HTTPS or a local tunnel.
+
+Windows evidence covers the real headless process, readiness and explicit stop,
+the startup budget, and scripted disconnect/reconnect contracts for Jarvis,
+Hermes and OpenClaw. The shared lifecycle and configuration tests are portable;
+native macOS/GTK client windows and live remote-host/provider execution have
+not been verified by these checks. Device capture, wake word and overlays keep
+their existing device and permission requirements; opening a client does not
+grant the server access to that client's desktop.

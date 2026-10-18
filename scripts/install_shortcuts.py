@@ -1,0 +1,392 @@
+"""Creates the Jarvis icon + desktop shortcut + autostart shortcut.
+
+Run once:
+
+    python scripts/install_shortcuts.py
+
+Result:
+  1. assets/icons/jarvis.ico — multi-size Windows icon (black + signal yellow)
+  2. Desktop\\Personal Jarvis.lnk — double-click opens the window
+  3. shell:startup\\Personal Jarvis.lnk — starts Jarvis at Windows login
+
+Both shortcuts point to run.bat in the project folder. run.bat uses
+pythonw.exe, so no console window pops up.
+
+Dev instance (a second, freely restartable desktop app — see
+``jarvis/core/instance.py``):
+
+    python scripts/install_shortcuts.py --dev
+
+  → Desktop\\Personal Jarvis Dev.lnk (DEV-badged icon, ``--instance dev``);
+    never touches autostart.
+
+Uninstall:
+    python scripts/install_shortcuts.py --uninstall        (also removes the Dev link)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFilter
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from jarvis.core.branding import (  # noqa: E402 - script source path above
+    PRODUCT_NAME,
+    WINDOWS_APP_USER_MODEL_ID,
+    WINDOWS_SHORTCUT_FILE_NAME,
+)
+from jarvis.core.instance import (  # noqa: E402 - script source path above
+    DEV_INSTANCE_NAME,
+    InstanceIdentity,
+)
+
+ICON_DIR = PROJECT_ROOT / "assets" / "icons"
+ICON_PATH = ICON_DIR / "jarvis.ico"
+DEV_INSTANCE = InstanceIdentity(DEV_INSTANCE_NAME)
+DEV_ICON_PATH = ICON_DIR / DEV_INSTANCE.icon_file_name
+DEV_SHORTCUT_NAME = DEV_INSTANCE.windows_shortcut_file_name
+DEV_DESCRIPTION = f"{DEV_INSTANCE.display_name} — second, restartable instance"
+RUN_BAT = PROJECT_ROOT / "run.bat"
+
+SHORTCUT_NAME = WINDOWS_SHORTCUT_FILE_NAME
+APP_USER_MODEL_ID = WINDOWS_APP_USER_MODEL_ID
+DESCRIPTION = f"{PRODUCT_NAME} — voice-controlled meta-orchestrator"
+
+# Jarvis launcher module (pywebview window, no console)
+LAUNCHER_MODULE = "jarvis.ui.web.launcher"
+
+
+def desktop_path() -> Path:
+    return Path(os.environ["USERPROFILE"]) / "Desktop" / SHORTCUT_NAME
+
+
+def dev_desktop_path() -> Path:
+    return Path(os.environ["USERPROFILE"]) / "Desktop" / DEV_SHORTCUT_NAME
+
+
+def startup_path() -> Path:
+    return (
+        Path(os.environ["APPDATA"])
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+        / SHORTCUT_NAME
+    )
+
+
+def generate_icon() -> None:
+    """Jarvis icon: matte black circle, yellow signal sparkle, soft glow.
+
+    The design matches the frontend theme (#0A0A0A + #FFD60A).
+    """
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+
+    size = 512
+    master = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    # Glow layer (separate canvas, then blur and place beneath the icon)
+    glow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
+    glow_draw.ellipse((40, 40, size - 40, size - 40), fill=(255, 214, 10, 90))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=24))
+    master.paste(glow, (0, 0), glow)
+
+    draw = ImageDraw.Draw(master)
+
+    # Main circle: matte black with a yellow ring.
+    pad = 32
+    draw.ellipse(
+        (pad, pad, size - pad, size - pad),
+        fill=(10, 10, 10, 255),
+        outline=(255, 214, 10, 255),
+        width=8,
+    )
+
+    # Sparkle: vier Rauten-artige Spitzen (vertikal + horizontal)
+    cx, cy = size // 2, size // 2
+    r_long = 140
+    r_short = 24
+
+    yellow = (255, 214, 10, 255)
+
+    # Vertikale Spitze
+    draw.polygon(
+        [(cx, cy - r_long), (cx + r_short, cy), (cx, cy + r_long), (cx - r_short, cy)],
+        fill=yellow,
+    )
+    # Horizontale Spitze
+    draw.polygon(
+        [(cx - r_long, cy), (cx, cy - r_short), (cx + r_long, cy), (cx, cy + r_short)],
+        fill=yellow,
+    )
+    # Heller Kern
+    draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 240, 140, 255))
+
+    sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+    master.save(ICON_PATH, format="ICO", sizes=sizes)
+    print(f"[ok] Icon written: {ICON_PATH}")
+
+
+def _detect_pythonw() -> Path:
+    """Finds pythonw.exe — prefers a venv in the project, else sys.executable.
+
+    Why pythonw instead of python: python.exe shows a black console
+    window for the lifetime of the process. pythonw.exe is a Windows
+    GUI-subsystem binary → no console window, just the pywebview window.
+    """
+    # 1. Venv in the project
+    venv_pyw = PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    if venv_pyw.exists():
+        return venv_pyw
+
+    # 2. System Python next to sys.executable
+    sys_py = Path(sys.executable)
+    candidate = sys_py.with_name("pythonw.exe")
+    if candidate.exists():
+        return candidate
+
+    # 3. Last fallback: PATH search via where.exe
+    try:
+        result = subprocess.run(
+            ["where", "pythonw.exe"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+        if first:
+            return Path(first)
+    except Exception:  # noqa: BLE001
+        pass
+
+    raise RuntimeError(
+        "pythonw.exe not found. The shortcut would show a console window. "
+        "Install Python with the 'tcl/tk and IDLE' option or use a .venv.",
+    )
+
+
+def _set_shortcut_app_id(link: Path, app_id: str = APP_USER_MODEL_ID) -> bool:
+    """Best-effort: writes the AppUserModelID into the .lnk property store."""
+    try:
+        import pywintypes  # type: ignore[import-not-found]
+        from win32com.propsys import propsys, pscon  # type: ignore[import-not-found]
+
+        store = propsys.SHGetPropertyStoreFromParsingName(
+            str(link),
+            None,
+            2,  # GPS_READWRITE
+            pywintypes.IID("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}"),
+        )
+        store.SetValue(
+            pscon.PKEY_AppUserModel_ID,
+            propsys.PROPVARIANTType(app_id),
+        )
+        store.Commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] Shortcut AppID not set: {exc}")
+        return False
+
+
+def create_shortcut(
+    link: Path,
+    *,
+    target: Path,
+    args: str,
+    working_dir: Path,
+    icon: Path,
+    description: str,
+    window_style: int = 1,
+    app_id: str = APP_USER_MODEL_ID,
+) -> None:
+    """Creates a .lnk shortcut via PowerShell/WScript.Shell.
+
+    No pywin32 needed — WScript.Shell has been built in since Windows 2000.
+    WindowStyle=1 = normal, 7 = minimized (autostart-/tray-friendly).
+    """
+    link.parent.mkdir(parents=True, exist_ok=True)
+
+    # PowerShell script as a heredoc — paths are inserted via PS string quoting
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$ws = New-Object -ComObject WScript.Shell\n"
+        f"$sc = $ws.CreateShortcut('{link}')\n"
+        f"$sc.TargetPath = '{target}'\n"
+        f"$sc.Arguments = '{args}'\n"
+        f"$sc.WorkingDirectory = '{working_dir}'\n"
+        f"$sc.IconLocation = '{icon}'\n"
+        f"$sc.Description = '{description}'\n"
+        f"$sc.WindowStyle = {window_style}\n"
+        "$sc.Save()\n"
+    )
+
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=True,
+    )
+    _set_shortcut_app_id(link, app_id)
+    print(f"[ok] Shortcut: {link}")
+
+
+def _enable_autostart_via_port() -> None:
+    """Delegate login-autostart to the cross-platform ``jarvis.autostart`` port.
+
+    Collapses the two historical Windows autostart mechanisms (this script's own
+    ``create_shortcut(startup_path())`` + the wizard's ``Jarvis.bat`` hack) into
+    the single port implementation, and persists ``[autostart].enabled = true``.
+    """
+    from jarvis.autostart import make_autostart_manager, resolve_launch_spec
+    from jarvis.core import config_writer
+    from jarvis.platform.capabilities import detect_capabilities
+
+    try:
+        config_writer.set_autostart(True)
+    except Exception as exc:  # noqa: BLE001 — persistence best-effort
+        print(f"[warn] could not persist [autostart].enabled: {exc}")
+
+    status = make_autostart_manager(detect_capabilities()).install(
+        resolve_launch_spec(None), interactive=True
+    )
+    if status.installed:
+        print(f"\n[ok] Autostart enabled at login: {status.entry_path}")
+    else:
+        print(f"\n[warn] Autostart not installed: {status.detail}")
+
+
+def _disable_autostart_via_port() -> None:
+    from jarvis.autostart import make_autostart_manager
+    from jarvis.core import config_writer
+    from jarvis.platform.capabilities import detect_capabilities
+
+    try:
+        config_writer.set_autostart(False)
+    except Exception as exc:  # noqa: BLE001 — persistence best-effort
+        print(f"[warn] could not persist [autostart].enabled: {exc}")
+    make_autostart_manager(detect_capabilities()).uninstall(interactive=True)
+
+
+def install_dev_shortcut() -> int:
+    """Desktop shortcut for the DEV instance — icon with the DEV tag, launcher
+    argument ``--instance dev``, its own AUMID; never touches autostart."""
+    try:
+        pythonw = _detect_pythonw()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    if not DEV_ICON_PATH.is_file():
+        print(
+            f"Error: {DEV_ICON_PATH} is missing — run scripts/make_dev_icon.py first.",
+            file=sys.stderr,
+        )
+        return 2
+    create_shortcut(
+        dev_desktop_path(),
+        target=pythonw,
+        args=f"-m {LAUNCHER_MODULE} {' '.join(DEV_INSTANCE.launcher_args)}",
+        working_dir=PROJECT_ROOT,
+        icon=DEV_ICON_PATH,
+        description=DEV_DESCRIPTION,
+        window_style=1,
+        app_id=DEV_INSTANCE.windows_aumid,
+    )
+    print(
+        f"\nDouble-clicking '{DEV_SHORTCUT_NAME}' on the desktop starts the dev "
+        "instance beside the regular app (own data dir, ports +100, no wake word)."
+    )
+    return 0
+
+
+def uninstall() -> None:
+    # Desktop double-click shortcuts — this script owns them.
+    for dp in (desktop_path(), dev_desktop_path()):
+        if dp.exists():
+            dp.unlink()
+            print(f"[rm] {dp}")
+        else:
+            print(f"[--] not present: {dp}")
+    # Autostart entry — delegate to the port (also clears the persisted toggle
+    # and any legacy .bat/.lnk names).
+    _disable_autostart_via_port()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Install Jarvis shortcuts")
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Removes the desktop and autostart shortcut",
+    )
+    parser.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="Desktop shortcut only, no autostart",
+    )
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=(
+            "Create the 'Personal Jarvis Dev' desktop shortcut (second, restartable "
+            "instance) instead of the regular one; never touches autostart"
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.uninstall:
+        uninstall()
+        return 0
+
+    if sys.platform != "win32":
+        print("Error: only Windows is supported.", file=sys.stderr)
+        return 1
+
+    if args.dev:
+        return install_dev_shortcut()
+
+    try:
+        pythonw = _detect_pythonw()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"[ok] Launcher: {pythonw}")
+
+    generate_icon()
+
+    shortcut_args = f"-m {LAUNCHER_MODULE}"
+
+    create_shortcut(
+        desktop_path(),
+        target=pythonw,
+        args=shortcut_args,
+        working_dir=PROJECT_ROOT,
+        icon=ICON_PATH,
+        description=DESCRIPTION,
+        window_style=1,
+    )
+
+    if not args.no_autostart:
+        # Delegate to the cross-platform autostart port (single source of truth),
+        # instead of writing a second, divergent startup .lnk here.
+        _enable_autostart_via_port()
+    else:
+        _disable_autostart_via_port()
+        print("\nAutostart skipped — desktop shortcut created only.")
+
+    print(f"\nDouble-clicking '{SHORTCUT_NAME}' on the desktop starts Jarvis.")
+    print("(pythonw.exe -> no console window, just the Jarvis app)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

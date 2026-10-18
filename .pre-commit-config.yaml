@@ -1,0 +1,41 @@
+# Pre-commit hooks for Personal Jarvis.
+#
+# Setup (run once after clone):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually against all files:
+#   pre-commit run --all-files
+#
+# Run only the secret scanner:
+#   pre-commit run gitleaks --all-files
+
+repos:
+  # ------------------------------------------------------------------
+  # Secret scanning — gitleaks scans every staged diff for API keys,
+  # tokens, and other credentials before they enter history. This is
+  # the automated gate that replaces the previous discipline-only model
+  # ("no secret was ever committed" relied on .gitignore + care alone).
+  #
+  # Rev pinned to the latest stable release as of 2026-05-31.
+  # To update: pre-commit autoupdate --repo https://github.com/gitleaks/gitleaks
+  # ------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.27.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      # Plan §6.6 — quick subset (max 5 queries) of the review-pipeline eval.
+      # Default: mock mode (no claude spawn, no cost, < 5s).
+      # Threshold 60% — laxer than the full suite (80%) because the quick
+      # subset is narrow and needs to tolerate a small sampling bias.
+      - id: review-eval-quick
+        name: review-pipeline eval (quick subset, mock)
+        entry: jarvis-review-eval --quick --mock --threshold 0.6
+        language: system
+        pass_filenames: false
+        always_run: false
+        # Only triggers when review-relevant files are touched.
+        files: ^(jarvis/core/review/|jarvis/plugins/tool/dispatch_with_review\.py|tests/eval/review_quality/queries\.json)

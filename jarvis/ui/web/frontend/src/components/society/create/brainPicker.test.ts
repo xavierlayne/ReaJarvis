@@ -1,0 +1,224 @@
+import { describe, expect, it } from "vitest";
+
+import type { SocietyAccount, SocietyProviderRow } from "@/lib/societyApi";
+import type { ProviderOption } from "@/store/agentChat";
+
+import { accountChoice, brainSeats, defaultSeat, effortsFor } from "./brainPicker";
+
+function option(over: Partial<ProviderOption>): ProviderOption {
+  return {
+    id: "openai",
+    label: "OpenAI",
+    family: "openai",
+    runner: "brain",
+    models_source: "live",
+    curated_models: [],
+    default_model: "",
+    keyless: false,
+    native_resume: false,
+    effort_levels: [],
+    default_effort: "",
+    permission_modes: [],
+    default_permission_mode: "",
+    cli_installed: null,
+    connected: true,
+    active: false,
+    ...over,
+  };
+}
+
+function account(id: string, connected = true, email: string | null = null): SocietyAccount {
+  return { id, label: id, connected, mode: "subscription", message: "", email, tier: null, warning: null };
+}
+
+function societyRow(over: Partial<SocietyProviderRow>): SocietyProviderRow {
+  return {
+    id: "openai",
+    label: "OpenAI",
+    family: "openai",
+    runner: "brain",
+    subscription: false,
+    keyless: false,
+    platform: null,
+    accounts: [],
+    ...over,
+  };
+}
+
+describe("brainSeats", () => {
+  it.each(["claude-api", "gemini", "grok"])("%s uses its actual API transport even when account metadata describes a subscription", (id) => {
+    const [seat] = brainSeats([option({ id, runner: "brain" })],
+      [societyRow({ id, subscription: true, accounts: [account("subscription-login")] })]);
+    expect(seat.kind).toBe("api");
+    expect(seat.accounts).toEqual([]);
+  });
+
+  it.each(["claude-api", "gemini", "grok", "openrouter", "nvidia"])("%s does not resurrect fallback models after a successful empty live catalog", (id) => {
+    const [seat] = brainSeats([option({ id, curated_models: [{ id: "retired", label: "Retired" }] })], [], { [id]: [] });
+    expect(seat.provider.curated_models).toEqual([]);
+  });
+
+  it("lists only connected rows, subscriptions first, then keys, then local", () => {
+    const seats = brainSeats(
+      [
+        option({ id: "ollama", label: "Ollama", runner: "api", keyless: true }),
+        option({ id: "gemini", label: "Google Gemini", connected: false }),
+        option({ id: "openai", label: "OpenAI" }),
+        option({ id: "claude-api", label: "Anthropic Claude", runner: "claude-cli", cli_installed: true }),
+      ],
+      [
+        societyRow({
+          id: "claude-api",
+          runner: "claude-cli",
+          subscription: true,
+          platform: "claude",
+          accounts: [account("artner")],
+        }),
+        societyRow({ id: "ollama", runner: "brain", keyless: true }),
+      ],
+      { ollama: [{ id: "qwen3:8b", label: "qwen3:8b" }] },
+    );
+    expect(seats.map((s) => `${s.kind}:${s.provider.id}`)).toEqual([
+      "subscription:claude-api",
+      "api:openai",
+      "local:ollama",
+    ]);
+  });
+
+  it("lists a keyless row only when it answers with models, and offers those models", () => {
+    const rows = [
+      option({ id: "ollama", label: "Ollama", runner: "api", keyless: true }),
+      option({ id: "local-openai", label: "Local OpenAI-compatible", runner: "api", keyless: true }),
+      option({ id: "openai", label: "OpenAI" }),
+    ];
+    // Nothing fetched yet: no local seat is listed, the keyed one is.
+    expect(brainSeats(rows, []).map((s) => s.provider.id)).toEqual(["openai"]);
+    const seats = brainSeats(rows, [], {
+      ollama: [{ id: "qwen3:8b", label: "qwen3:8b" }],
+      "local-openai": [],
+      openai: [{ id: "gpt-5", label: "GPT-5" }],
+    });
+    expect(seats.map((s) => s.provider.id)).toEqual(["openai", "ollama"]);
+    expect(seats[1].provider.curated_models.map((m) => m.id)).toEqual(["qwen3:8b"]);
+    expect(seats[0].provider.curated_models.map((m) => m.id)).toEqual(["gpt-5"]);
+  });
+
+  it("decides the kind from the runner when the society route is missing", () => {
+    const seats = brainSeats(
+      [option({ id: "openai-codex", label: "Codex", runner: "codex-cli", cli_installed: true })],
+      [],
+      {},
+      new Set(["openai-codex"]),
+    );
+    expect(seats[0].kind).toBe("subscription");
+  });
+
+  it("lists a subscription seat only with a signed-in account or an Agents-tab card", () => {
+    const rows = [
+      option({ id: "opencode", label: "OpenCode", runner: "opencode-cli", cli_installed: true }),
+      option({ id: "openai-codex", label: "Codex", runner: "codex-cli", cli_installed: true }),
+      option({ id: "grok-build", label: "Grok Build", runner: "grok-cli", cli_installed: true }),
+    ];
+    const society = [
+      societyRow({ id: "grok-build", runner: "grok-cli", subscription: true, platform: "grok", accounts: [account("g")] }),
+    ];
+    // Installed but unreadable and uncarded: not offered here.
+    expect(brainSeats(rows, society, {}, new Set(["openai-codex"])).map((s) => s.provider.id)).toEqual([
+      "openai-codex",
+      "grok-build",
+    ]);
+  });
+
+  it("keeps only signed-in logins and offers a choice only when there are two", () => {
+    const rows = [
+      societyRow({
+        id: "claude-api",
+        subscription: true,
+        platform: "claude",
+        accounts: [account("a", true, "a@x.de"), account("b", false), account("c", true)],
+      }),
+    ];
+    const [seat] = brainSeats([option({ id: "claude-api", runner: "claude-cli", cli_installed: true })], rows);
+    expect(seat.accounts.map((a) => a.id)).toEqual(["a", "c"]);
+    expect(accountChoice(seat).length).toBe(2);
+    const [single] = brainSeats(
+      [option({ id: "claude-api", runner: "claude-cli", cli_installed: true })],
+      [{ ...rows[0], accounts: [account("a")] }],
+    );
+    expect(accountChoice(single)).toEqual([]);
+  });
+
+  it("starts on a subscription, else the active brain, else the first seat", () => {
+    const seats = brainSeats(
+      [option({ id: "openai" }), option({ id: "grok", label: "xAI Grok", active: true })],
+      [],
+    );
+    expect(defaultSeat(seats)?.provider.id).toBe("grok");
+    const withSeat = brainSeats(
+      [
+        option({ id: "grok", label: "xAI Grok", active: true }),
+        option({ id: "openai-codex", label: "Codex", runner: "codex-cli", cli_installed: true }),
+      ],
+      [],
+      {},
+      new Set(["openai-codex"]),
+    );
+    expect(defaultSeat(withSeat)?.provider.id).toBe("openai-codex");
+    expect(defaultSeat(brainSeats([option({ id: "openai" })], []))?.provider.id).toBe("openai");
+    expect(defaultSeat([])).toBeNull();
+  });
+
+  it("narrows the effort ladder to the picked model's own", () => {
+    const [seat] = brainSeats(
+      [
+        option({
+          id: "agy",
+          runner: "agy-cli",
+          cli_installed: true,
+          effort_levels: ["low", "medium", "high"],
+          curated_models: [
+            { id: "pro", label: "Pro", efforts: ["low", "high"] },
+            { id: "flash", label: "Flash" },
+          ],
+        }),
+      ],
+      [],
+      {},
+      new Set(["agy"]),
+    );
+    expect(effortsFor(seat, "pro")).toEqual(["low", "high"]);
+    expect(effortsFor(seat, "flash")).toEqual(["low", "medium", "high"]);
+    expect(effortsFor(null, "pro")).toEqual([]);
+  });
+});
+
+describe("brainSeats — the API Keys page's choices", () => {
+  it("leaves out a provider turned off for the agents", () => {
+    const seats = brainSeats(
+      [option({ id: "openai", label: "OpenAI", enabled: false }), option({ id: "gemini", label: "Google Gemini" })],
+      [],
+    );
+    expect(seats.map((s) => s.provider.id)).toEqual(["gemini"]);
+  });
+
+  it("leaves out hidden models, and the provider once every model is hidden", () => {
+    const seats = brainSeats(
+      [
+        option({ id: "openai", curated_models: [{ id: "a", label: "A" }, { id: "b", label: "B" }], hidden_models: ["a"] }),
+        option({ id: "gemini", label: "Google Gemini", curated_models: [{ id: "g", label: "G" }], hidden_models: ["g"] }),
+      ],
+      [],
+    );
+    expect(seats.map((s) => s.provider.id)).toEqual(["openai"]);
+    expect(seats[0].provider.curated_models.map((m) => m.id)).toEqual(["b"]);
+  });
+
+  it("hides models in a live list too", () => {
+    const seats = brainSeats(
+      [option({ id: "openai", hidden_models: ["old"] })],
+      [],
+      { openai: [{ id: "old", label: "Old" }, { id: "new", label: "New" }] },
+    );
+    expect(seats[0].provider.curated_models.map((m) => m.id)).toEqual(["new"]);
+  });
+});
