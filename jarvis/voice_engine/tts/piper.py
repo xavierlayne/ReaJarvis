@@ -15,7 +15,11 @@ import numpy as np
 from jarvis.voice_engine.models import is_present, model_path
 from jarvis.voice_engine.stt import default_threads
 
-VOICES = {"de": "piper-de-thorsten-medium", "en": "piper-en-ryan-medium"}
+VOICES = {
+    "de": "piper-de-thorsten-medium",
+    "en": "piper-en-ryan-medium",
+    "tr": "piper-tr-dfki-medium",
+}
 
 
 class PiperTts:

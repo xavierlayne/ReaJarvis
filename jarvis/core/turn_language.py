@@ -55,7 +55,7 @@ DEFAULT_LOCALE = "en"
 
 #: The codes an explicit ``brain.reply_language`` pin may carry (``"auto"`` is
 #: deliberately absent — it means "no pin, mirror the input").
-_REPLY_PINS: frozenset[str] = frozenset({"de", "en", "es"})
+_REPLY_PINS: frozenset[str] = frozenset({"de", "en", "es", "tr"})
 
 #: A turn with at most this many word tokens is a "thin" turn — a one- or
 #: two-word interjection ("Now", "Stop now", "jetzt", a lone loanword). A thin
@@ -83,9 +83,9 @@ _LANGUAGE_REQUEST_RE = re.compile(
     r"(?:(?:always|from now on|immer|ab jetzt|siempre|a partir de ahora)\s+)?"  # i18n-allow
     r"(?:(?:in|auf|en|to|zu|a)\s+)?"  # i18n-allow
     r"(?P<language>deutsch|german|alemán|aleman|english|englisch|inglés|ingles"  # i18n-allow
-    r"|español|espanol|spanish|spanisch)"  # i18n-allow
+    r"|español|espanol|spanish|spanisch|türkçe|turkce|turkish)"  # i18n-allow
     r"(?:\s+(?:antworten|sprechen))?"  # i18n-allow
-    r"(?:[\s,]+(?:please|bitte|por favor|now|jetzt|ahora))?"  # i18n-allow
+    r"(?:[\s,]+(?:please|bitte|por favor|now|jetzt|ahora|lütfen))?"  # i18n-allow
     r"[\s.!?]*",
     re.IGNORECASE,
 )
@@ -93,6 +93,7 @@ _REQUEST_LANGUAGE_CODES = {
     "deutsch": "de", "german": "de", "alemán": "de", "aleman": "de",  # i18n-allow
     "english": "en", "englisch": "en", "inglés": "en", "ingles": "en",  # i18n-allow
     "español": "es", "espanol": "es", "spanish": "es", "spanisch": "es",  # i18n-allow
+    "türkçe": "tr", "turkce": "tr", "turkish": "tr",
 }
 
 # Output validation deliberately ignores code and links. They frequently carry
@@ -155,6 +156,7 @@ class OutputLanguageValidation:
 # accented vowels (minus the pan-European acute-e) are useful hints.
 _DE_SCRIPT_RE = re.compile(r"[äöüÄÖÜß]")  # i18n-allow: German-script regex
 _ES_SCRIPT_RE = re.compile(r"[áíóúñÁÍÓÚÑ¿¡]")
+_TR_SCRIPT_RE = re.compile(r"[çğıöşüÇĞİÖŞÜ]")
 
 # Function-word sets, kept mutually disjoint. Words common to more than one of
 # the three languages are excluded on purpose (see module docstring).
@@ -190,20 +192,29 @@ _ES_TOKENS: frozenset[str] = frozenset({
     "puedo", "quiero", "necesito", "dime", "dame", "abre", "muestra", "lee",
     "escribe", "y", "pero", "con", "del", "al", "muy", "bien", "clima",
 })
+_TR_TOKENS: frozenset[str] = frozenset({
+    "ve", "ile", "için", "bir", "bu", "şu", "ne", "nasıl", "neden",
+    "nerede", "kim", "lütfen", "evet", "hayır", "tamam", "merhaba", "selam",
+    "teşekkürler", "teşekkür", "sağol", "günaydın", "iyi", "bugün", "yarın",
+    "şimdi", "hava", "durumu", "yap", "et", "aç", "kapat", "başlat", "durdur",
+    "ben", "sen", "biz", "bana", "sana", "var", "yok", "istiyorum", "göster",
+})
 
 _SETS: tuple[tuple[str, frozenset[str]], ...] = (
     ("de", _DE_TOKENS),
     ("en", _EN_TOKENS),
     ("es", _ES_TOKENS),
+    ("tr", _TR_TOKENS),
 )
 
 # Whisper cloud APIs return language NAMES; local faster-whisper returns ISO
-# codes; some TTS configs use BCP-47. All collapse to de/en/es here.
+# codes; some TTS configs use BCP-47. All collapse to de/en/es/tr here.
 _TAG_TO_CODE: dict[str, str] = {
     "de": "de", "deu": "de", "ger": "de", "german": "de", "deutsch": "de",
     "en": "en", "eng": "en", "english": "en", "englisch": "en",
     "es": "es", "spa": "es", "spanish": "es", "spanisch": "es",
     "espanol": "es", "español": "es", "castellano": "es",
+    "tr": "tr", "tur": "tr", "turkish": "tr", "türkçe": "tr", "turkce": "tr",
 }
 
 
@@ -231,6 +242,8 @@ def detect_text_language(text: str) -> str:
         scores["de"] += 2
     if _ES_SCRIPT_RE.search(t):
         scores["es"] += 2
+    if _TR_SCRIPT_RE.search(t):
+        scores["tr"] += 2
     best_code, best = max(scores.items(), key=lambda kv: kv[1])
     if best == 0 or sum(1 for s in scores.values() if s == best) > 1:
         return "unknown"

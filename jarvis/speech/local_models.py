@@ -581,6 +581,12 @@ SHERPA_BUNDLES: dict[str, SherpaBundle] = {
         language="en",
         gender="feminine",
     ),
+    "vits-piper-tr_TR-dfki-medium": _piper_bundle(
+        "vits-piper-tr_TR-dfki-medium",
+        label="DFKI (Turkish)",
+        language="tr",
+        gender="masculine",
+    ),
     "vits-piper-es_ES-sharvard-medium": _piper_bundle(
         "vits-piper-es_ES-sharvard-medium",
         label="Sharvard (Spanish)",
@@ -593,6 +599,7 @@ SHERPA_BUNDLES: dict[str, SherpaBundle] = {
 #: the same gender. Anything less would leave the assistant mute in a language
 #: the rest of the app fully supports.
 PIPER_DEFAULT_VOICES: tuple[str, ...] = (
+    "vits-piper-tr_TR-dfki-medium",
     "vits-piper-de_DE-thorsten-medium",
     "vits-piper-en_US-ryan-medium",
     "vits-piper-es_ES-davefx-medium",

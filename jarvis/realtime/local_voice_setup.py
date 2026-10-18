@@ -824,6 +824,6 @@ def real_deps(*, loop: asyncio.AbstractEventLoop | None,
         machine=machine_class,
         configured_llm=lambda: str(getattr(section(), "llm_model", "") or ""),
         configured_voice=lambda: str(getattr(section(), "tts", "") or "pocket"),
-        languages=lambda: list(getattr(section(), "languages", None) or ["de", "en"]),
+        languages=lambda: list(getattr(section(), "languages", None) or ["tr", "de", "en"]),
         selftest=selftest,
     )

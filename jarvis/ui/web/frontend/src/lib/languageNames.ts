@@ -53,6 +53,7 @@ export const COMMON_LANGUAGE_CODES: readonly string[] = [
   "en",
   "de",
   "es",
+  "tr",
   "zh",
   "fr",
   "it",

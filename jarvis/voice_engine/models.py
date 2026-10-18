@@ -99,6 +99,14 @@ REGISTRY: dict[str, ModelSource] = {
             unpacks_to="vits-piper-en_US-ryan-medium",
             licence="CC-BY-4.0 voice; Apache-2.0 runtime",
         ),
+        ModelSource(
+            name="piper-tr-dfki-medium",
+            url=f"{_GH_SHERPA}/tts-models/vits-piper-tr_TR-dfki-medium.tar.bz2",
+            size=67_201_221,
+            sha256="b63babaefcdd63202c7079aba25b72a2013825ad5895e2aeff03d1ae5a5b3bbf",
+            unpacks_to="vits-piper-tr_TR-dfki-medium",
+            licence="CC0-1.0 voice; Apache-2.0 runtime",
+        ),
     )
 }
 

@@ -26,12 +26,13 @@ Progress = Callable[[str, float], None]
 SELFTEST_PHRASES = {
     "de": "Hallo, ich bin bereit.",  # i18n-allow: German readiness phrase
     "en": "Hello, I am ready.",
+    "tr": "Merhaba, ben hazırım.",
 }
 
 
 @dataclass
 class RuntimeConfig:
-    languages: list[str] = field(default_factory=lambda: ["de", "en"])
+    languages: list[str] = field(default_factory=lambda: ["tr", "de", "en"])
     tts: str = "pocket"
     tts_options: dict[str, Any] = field(default_factory=dict)
     llm_model: str = "qwen3.5:4b-voice-8k"

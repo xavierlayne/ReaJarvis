@@ -21,7 +21,7 @@
  * target row. HTML5 drag events and Alt + Arrow keys stay as fallbacks.
  */
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
-import { Eye, Loader2, Plus, Search, UsersRound } from "lucide-react";
+import { Eye, Plus, Search, UsersRound } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -79,6 +79,29 @@ const STATE_DOT: Record<AgentRunState, string> = {
   waiting: "bg-warning",
   paused: "bg-muted-foreground/30",
 };
+
+function getAgentAction(agent: SocietyAgent, t: ReturnType<typeof useT>): string {
+  if (agent.tier === "lead") {
+    return t("society.action.lead_working");
+  }
+  switch (agent.checkpoint) {
+    case "hub:cli":
+      return t("society.action.coding");
+    case "hub:web":
+      return t("society.action.researching");
+    case "hub:desktop":
+    case "desk":
+      return t("society.action.inspecting");
+    case "hub:plugins":
+    case "hub:skills":
+    case "hub:mcp":
+      return t("society.action.executing");
+    case "hub:models":
+      return t("society.action.analyzing");
+    default:
+      return t("society.action.working");
+  }
+}
 
 export interface RosterRailProps {
   agents: SocietyAgent[];
@@ -556,14 +579,18 @@ export function RosterRail({
                     title={t("society.roster.thinking")}
                     className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-sidebar ring-2 ring-sidebar"
                   >
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" aria-hidden />
+                    <span className="absolute inset-0.5 rounded-full border border-dashed border-amber-500/90 animate-[spin_3s_linear_infinite]" aria-hidden />
+                    <span className="absolute inset-1 rounded-full border border-amber-400/60 animate-ping opacity-60" aria-hidden />
+                    <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.95)]" aria-hidden />
                   </span>
                 ) : unread.has(lead.agentId) ? (
                   <span
                     aria-label={t("society.roster.unread")}
                     title={t("society.roster.unread")}
-                    className="absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full bg-sky-400 ring-2 ring-sidebar"
-                  />
+                    className="absolute -right-0.5 -top-0.5 grid h-3.5 w-3.5 place-items-center rounded-full bg-sidebar ring-2 ring-sidebar"
+                  >
+                    <span className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)]" />
+                  </span>
                 ) : null}
               </button>
               <button type="button" onClick={() => openAgent(lead.agentId)} aria-current={lead.agentId === activeAgentId ? "true" : undefined} className="flex max-w-full items-center justify-center gap-1.5 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
@@ -571,6 +598,12 @@ export function RosterRail({
                 <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-xs">
                   {t("society.tier.lead")}
                 </Badge>
+                {lead.state === "working" ? (
+                  <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500 border border-amber-500/20 animate-pulse">
+                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500 shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
+                    {getAgentAction(lead, t)}
+                  </span>
+                ) : null}
               </button>
             </div>
           </div>
@@ -645,8 +678,27 @@ export function RosterRail({
                         {t("society.tier.lead")}
                       </Badge>
                     ) : null}
+                    {agent.state === "working" ? (
+                      <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500 border border-amber-500/20 animate-pulse">
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-500 shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
+                        {getAgentAction(agent, t)}
+                      </span>
+                    ) : unread.has(agent.agentId) ? (
+                      <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500 border border-amber-500/20">
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)]" />
+                        {t("society.action.completed")}
+                      </span>
+                    ) : null}
                   </span>
-                  <span className="block truncate text-xs text-muted-foreground">{agent.title}</span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {agent.state === "working" ? (
+                      <span className="font-medium text-amber-500/90 dark:text-amber-400/90">
+                        {getAgentAction(agent, t)} · {agent.title}
+                      </span>
+                    ) : (
+                      agent.title
+                    )}
+                  </span>
                 </span>
                 <RowStatus agent={agent} hasUnread={unread.has(agent.agentId)} />
                 </button>
@@ -690,9 +742,20 @@ function RowStatus({ agent, hasUnread }: { agent: SocietyAgent; hasUnread: boole
         role="status"
         aria-label={label}
         title={label}
-        className="grid h-4 w-4 shrink-0 place-items-center"
+        className="relative grid h-4 w-4 shrink-0 place-items-center"
       >
-        <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" aria-hidden />
+        <span
+          className="absolute inset-0 rounded-full border border-dashed border-amber-500/80 animate-[spin_3s_linear_infinite]"
+          aria-hidden
+        />
+        <span
+          className="absolute inset-0.5 rounded-full border border-amber-400/60 animate-ping opacity-60"
+          aria-hidden
+        />
+        <span
+          className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.95)]"
+          aria-hidden
+        />
       </span>
     );
   }
@@ -700,10 +763,19 @@ function RowStatus({ agent, hasUnread }: { agent: SocietyAgent; hasUnread: boole
     const label = t("society.roster.unread");
     return (
       <span
-        className="h-2 w-2 shrink-0 rounded-full bg-sky-400"
+        className="relative grid h-4 w-4 shrink-0 place-items-center"
         title={label}
         aria-label={label}
-      />
+      >
+        <span
+          className="absolute inset-0.5 rounded-full border border-amber-400/60 animate-ping opacity-50"
+          aria-hidden
+        />
+        <span
+          className="h-2 w-2 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)] ring-1 ring-amber-300"
+          aria-hidden
+        />
+      </span>
     );
   }
   return (

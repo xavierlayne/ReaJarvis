@@ -436,3 +436,15 @@ it("shows and finds the lead by the wake-word name", () => {
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "hanna" } });
   expect(screen.getByText("Hanna")).toBeTruthy();
 });
+
+it("shows active task badge and subtitle when an agent is working", () => {
+  render(
+    <RosterRail
+      {...baseProps}
+      agents={[agent({ agentId: "scout", name: "Scout", state: "working", checkpoint: "hub:web" })]}
+      activeAgentId={null}
+    />,
+  );
+  expect(screen.getAllByText(/society\.action\.researching/).length).toBeGreaterThan(0);
+  expect(screen.getByRole("status", { name: "society.roster.thinking" })).toBeTruthy();
+});
