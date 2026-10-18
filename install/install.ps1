@@ -198,14 +198,14 @@ Write-Banner
 # Standalone bootstrap projections of jarvis/core/branding.py. The branding
 # contract test rejects drift because this script runs before Python is installed.
 $OfficialRepoSlug = "$env:JARVIS_OFFICIAL_REPO_SLUG"
-if (-not $OfficialRepoSlug) { $OfficialRepoSlug = 'PersonalJarvis/PersonalJarvis' }
+if (-not $OfficialRepoSlug) { $OfficialRepoSlug = 'xavierlayne/ReaJarvis' }
 if ($OfficialRepoSlug -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw 'JARVIS_OFFICIAL_REPO_SLUG must be an exact owner/repository slug'
 }
 $RepoUrl    = if ($env:JARVIS_INSTALL_REPO) { $env:JARVIS_INSTALL_REPO } else { "https://github.com/$OfficialRepoSlug.git" }
 $ConfigFileName = 'jarvis.toml'
 $Branch     = if ($env:JARVIS_INSTALL_REF)  { $env:JARVIS_INSTALL_REF }  else { 'main' }
-$InstallDir = if ($env:JARVIS_INSTALL_DIR)  { $env:JARVIS_INSTALL_DIR }  else { Join-Path $env:USERPROFILE '.personal-jarvis' }
+$InstallDir = if ($env:JARVIS_INSTALL_DIR)  { $env:JARVIS_INSTALL_DIR }  else { Join-Path $env:USERPROFILE '.reajarvis' }
 $PrerequisiteMode = if ($env:JARVIS_INSTALL_PREREQS) { $env:JARVIS_INSTALL_PREREQS.ToLowerInvariant() } else { 'ask' }
 $InitialPath = $env:Path
 

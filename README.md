@@ -141,13 +141,13 @@ and [privacy and local data](https://github.com/PersonalJarvis/PersonalJarvis/bl
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/PersonalJarvis/PersonalJarvis/main/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/xavierlayne/ReaJarvis/main/install/install.ps1 | iex
 ```
 
 **macOS and Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PersonalJarvis/PersonalJarvis/main/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xavierlayne/ReaJarvis/main/install/install.sh | bash
 ```
 
 The installer checks for Python 3.11 or newer and Git, offers to install
