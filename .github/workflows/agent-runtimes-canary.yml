@@ -11,8 +11,6 @@ name: Agent runtimes canary
 #   * red on a schedule -> an issue, and the pin stays where it is.
 # See docs/agent-runtimes.md ("CI and release gates").
 on:
-  schedule:
-    - cron: '17 5 * * 1'
   workflow_dispatch:
 permissions:
   contents: read
